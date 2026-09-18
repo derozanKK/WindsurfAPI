@@ -5418,7 +5418,9 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     if (!s) { el.innerHTML = `<div class="text-sm text-muted">${I18n.t('overview.rankings.empty')}</div>`; return; }
     const top = (obj) => Object.entries(obj || {}).sort(([, a], [, b]) => (b.requests || 0) - (a.requests || 0)).slice(0, 5);
     const models = top(s.modelCounts);
-    const accts = top(s.accountCounts);
+    // Account rows get a display label when the backend resolved one (the
+    // account's email field); legacy/unresolvable keys show the raw id.
+    const accts = top(s.accountCounts).map(([k, v]) => [v?.label ? `${v.label} · ${k}` : k, v]);
     if (models.length === 0 && accts.length === 0) { el.innerHTML = `<div class="text-sm text-muted">${I18n.t('overview.rankings.empty')}</div>`; return; }
     const maxM = models.length ? (models[0][1].requests || 0) : 0;
     const maxA = accts.length ? (accts[0][1].requests || 0) : 0;
@@ -8105,7 +8107,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       acctBody.innerHTML = sortedAccts.map(([aid, s]) => {
         const rate = s.requests > 0 ? ((s.success/s.requests)*100).toFixed(1) : '0.0';
         return `<tr>
-          <td><code>${this.esc(aid)}</code></td>
+          <td><code>${this.esc(aid)}</code>${s.label ? ` <span class="text-muted">${this.esc(s.label)}</span>` : ''}</td>
           <td>${s.requests}</td>
           <td style="color:var(--success)">${s.success}</td>
           <td style="color:${s.errors > 0 ? 'var(--error)' : 'inherit'}">${s.errors}</td>

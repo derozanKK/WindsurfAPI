@@ -3622,6 +3622,11 @@ export function getAccountInternal(id) {
   return accounts.find(a => a.id === id) || null;
 }
 
+/** apiKey → account id, or null. Used by the stats account-ref resolver. */
+export function getAccountIdByApiKey(apiKey) {
+  return accounts.find(a => a.apiKey === apiKey)?.id || null;
+}
+
 /**
  * Run one upstream web search on a named account.
  *

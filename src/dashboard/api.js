@@ -1644,7 +1644,17 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
   // ─── Stats ────────────────────────────────────────────
   if (subpath === '/stats' && method === 'GET') {
-    return json(res, 200, getStats());
+    const stats = getStats();
+    // Annotate per-account rows with the operator label (the account's email
+    // field) so the stats table shows WHO served, not just the 8-char id.
+    // Keys that don't resolve to a live account (e.g. a legacy collapsed
+    // 'devin-se' bucket from the pre-resolver apiKey-prefix era, or a deleted
+    // account) get label:null and the UI shows the raw key.
+    const labelById = new Map(getAccountList({ view: 'summary' }).map(a => [a.id, a.email || '']));
+    const accountCounts = Object.fromEntries(
+      Object.entries(stats.accountCounts || {}).map(([id, s]) => [id, { ...s, label: labelById.get(id) || null }]),
+    );
+    return json(res, 200, { ...stats, accountCounts });
   }
 
   if (subpath === '/stats' && method === 'DELETE') {

@@ -3311,6 +3311,7 @@ const App = {
 
     const accountEntries = Object.entries(r.accountCounts || {}).map(([id, s]) => ({
       id,
+      label: s.label || null,
       requests: s.requests || 0,
       success: s.success || 0,
       errors: s.errors || 0,
@@ -3318,7 +3319,7 @@ const App = {
     })).sort((a, b) => b.requests - a.requests);
     const tbody2 = document.querySelector('#account-stats-table tbody');
     tbody2.innerHTML = accountEntries.map(a => `<tr>
-      <td><code>${this.esc(a.id.slice(0,8))}</code></td>
+      <td><code>${this.esc(a.id.slice(0,8))}</code>${a.label ? ` <span class="text-mute">${this.esc(a.label)}</span>` : ''}</td>
       <td>${a.requests}</td><td>${a.success}</td><td>${a.errors}</td>
       <td>${a.successRate}%</td>
     </tr>`).join('') || `<tr class="empty-row"><td colspan="5">no account data yet</td></tr>`;

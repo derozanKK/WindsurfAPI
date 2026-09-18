@@ -5,14 +5,14 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
-import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, ensureDeviceSeed } from '../auth.js';
+import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, ensureDeviceSeed, getAccountIdByApiKey } from '../auth.js';
 import { isStickyEnabled, setStickyBinding, peekStickyBinding } from '../account/sticky-session.js';
 import { resolveModel, getModelInfo, pickRateLimitFallback, isModelDisabledUpstream, getModelCaps } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from '../leak-trace.js';
 import { safeAccountRef, safeKeyRef, safeLogValue } from '../log-safety.js';
-import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited } from '../dashboard/stats.js';
+import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited, setAccountRefResolver } from '../dashboard/stats.js';
 import { extractIntentFromNarrative, detectToolIntentInNarrative, maskNonActionableRegions } from './intent-extractor.js';
 import { isModelAllowed } from '../dashboard/model-access.js';
 import { cacheKey as computeCacheKey, cacheGet, cacheSet, isCacheEnabled } from '../cache.js';
@@ -81,6 +81,13 @@ import {
   recordNativeBridgeRequest,
   recordNativeBridgeUnmappedCascadeToolCall,
 } from '../native-bridge-stats.js';
+
+// Per-account stats bucketing: several call sites below pass an apiKey where
+// recordRequest expects an account ref. Every devin-session-token$ key shares
+// the "devin-se" 8-char prefix, which collapsed the whole pool into one stats
+// bucket. Resolve apiKey → account.id centrally so accountCounts keys are real
+// account ids regardless of which call site fired.
+setAccountRefResolver(getAccountIdByApiKey);
 
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;

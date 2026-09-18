@@ -23,6 +23,24 @@ const MAX_MODELS = (() => {
   return Number.isFinite(raw) && raw >= 0 ? raw : 500;
 })();
 
+// Account-ref translator. Callers historically passed an apiKey where an
+// account id was intended, and every `devin-session-token$<JWT>` shares the
+// same "devin-se" 8-char prefix — so per-account stats collapsed the whole
+// pool into one bucket. chat.js registers an apiKey→account.id resolver here
+// (same injection pattern as auth.js setDroughtRestrictResolver) so
+// accountCounts keys are real account ids. No resolver → raw ref, pre-fix
+// behaviour preserved for tests that import this module directly.
+let _accountRefResolver = null;
+export function setAccountRefResolver(fn) {
+  _accountRefResolver = typeof fn === 'function' ? fn : null;
+}
+
+function accountStatKey(accountId) {
+  if (!accountId) return null;
+  const resolved = (_accountRefResolver && _accountRefResolver(accountId)) || accountId;
+  return typeof resolved === 'string' ? resolved.slice(0, 8) : String(resolved);
+}
+
 // Monotonic recency counter for LRU eviction. Wall-clock time ties within a
 // single millisecond (many requests can land there), which would make
 // eviction fall back to insertion order and starve hot-but-old keys; a
@@ -189,8 +207,8 @@ export function recordRequest(model, success, durationMs, accountId) {
   }
 
   // Per-account stats
-  if (accountId) {
-    const aid = typeof accountId === 'string' ? accountId.slice(0, 8) : String(accountId);
+  const aid = accountStatKey(accountId);
+  if (aid) {
     if (!_state.accountCounts[aid]) {
       _state.accountCounts[aid] = { requests: 0, success: 0, errors: 0 };
     }
@@ -238,7 +256,7 @@ export function recordRequest(model, success, durationMs, accountId) {
   if (!Array.isArray(_state.recentRequests)) _state.recentRequests = [];
   _state.recentRequests.push({
     ts: Date.now(), model, success: !!success, ms: durationMs || 0,
-    account: accountId ? (typeof accountId === 'string' ? accountId.slice(0, 8) : String(accountId)) : null,
+    account: aid,
     credit,
   });
   if (_state.recentRequests.length > RECENT_REQ_CAP) {
