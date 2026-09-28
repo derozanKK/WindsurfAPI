@@ -220,7 +220,9 @@
     "dailyNA": "Windsurf returned no daily-quota data",
     "weeklyNA": "Windsurf returned no weekly-quota data",
     "promptNA": "No prompt-credit data for this account",
-    "noResetTime": "reset time unknown"
+    "noResetTime": "reset time unknown",
+    "resetDone": "reset",
+    "resetLabel": "reset:"
   },
   "section": {
     "settings": {
@@ -1098,12 +1100,16 @@
         "periodEnd": "Period end",
         "start": "Start",
         "end": "End",
-        "overage": "Overage balance"
+        "overage": "Overage balance",
+        "periodLeft": "{{days}}d left"
       },
       "quota": {
         "title": "Quota Usage",
         "daily": "Daily",
         "weekly": "Weekly",
+        "dailyUsed": "Daily quota used",
+        "weeklyUsed": "Weekly quota used",
+        "extraBalance": "Extra usage balance",
         "promptCredits": "Prompt credits",
         "flexCredits": "Flex credits",
         "used": "used",

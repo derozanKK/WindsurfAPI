@@ -6704,7 +6704,20 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
         const planName = cr.planName || '-';
         const fetchedAgo = cr.fetchedAt ? Math.round((Date.now() - cr.fetchedAt) / 60000) + 'm ago' : '-';
         const barColor = (v) => v == null ? 'var(--text-dim)' : v <= 10 ? 'var(--error)' : v <= 30 ? 'var(--warn)' : 'var(--success)';
-        const bar = (label, pct, detail) => {
+        // cockpit-style reset label: "5d 23h (10/04 16:00)" — relative first,
+        // absolute in parens, so "how long until reset" needs no mental math.
+        const fmtReset = (unix) => {
+          if (!unix) return I18n.t('creditsBar.noResetTime');
+          const abs = new Date(unix * 1000);
+          const pad = (n) => String(n).padStart(2, '0');
+          const absText = `${pad(abs.getMonth() + 1)}/${pad(abs.getDate())} ${pad(abs.getHours())}:${pad(abs.getMinutes())}`;
+          const diffMin = Math.floor((unix * 1000 - Date.now()) / 60000);
+          if (diffMin <= 0) return `${I18n.t('creditsBar.resetDone')} (${absText})`;
+          const d = Math.floor(diffMin / 1440), h = Math.floor((diffMin % 1440) / 60), m = diffMin % 60;
+          const rel = d > 0 ? `${d}d ${h}h` : (h > 0 ? `${h}h ${m}m` : `${m}m`);
+          return `${rel} (${absText})`;
+        };
+        const bar = (label, pct, detail, resetUnix) => {
           const noData = pct == null;
           const v = noData ? 0 : Math.max(0, Math.min(100, pct));
           const c = noData ? 'var(--text-dim)' : barColor(v);
@@ -6714,15 +6727,19 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
           // to mistake for a refresh failure. Print "N/A" with a
           // dashed bar so it's visually distinct from a 0% / failure
           // state, and mirror the explanation into the tooltip.
-          return `<div style="display:flex;align-items:center;gap:3px;margin-top:2px" title="${detail}">
-            <span class="text-xs" style="width:14px;flex-shrink:0;color:var(--text-dim);font-size:10px;font-weight:600">${label}</span>
-            <div style="flex:1;height:4px;background:var(--surface-3);border-radius:2px;overflow:hidden;min-width:40px${noData ? ';outline:1px dashed var(--text-dim);outline-offset:-1px' : ''}">
-              <div style="height:100%;width:${noData ? 0 : v}%;background:${c};border-radius:2px;transition:width .4s ease"></div>
+          // Reset time sits under the bar (cockpit layout), always visible —
+          // no hover needed.
+          return `<div style="margin-top:2px" title="${detail}">
+            <div style="display:flex;align-items:center;gap:3px">
+              <span class="text-xs" style="width:14px;flex-shrink:0;color:var(--text-dim);font-size:10px;font-weight:600">${label}</span>
+              <div style="flex:1;height:4px;background:var(--surface-3);border-radius:2px;overflow:hidden;min-width:40px${noData ? ';outline:1px dashed var(--text-dim);outline-offset:-1px' : ''}">
+                <div style="height:100%;width:${noData ? 0 : v}%;background:${c};border-radius:2px;transition:width .4s ease"></div>
+              </div>
+              <span class="text-xs" style="width:28px;text-align:right;color:${c};font-size:10px;font-style:${noData ? 'italic' : 'normal'}">${noData ? 'N/A' : v.toFixed(0)+'%'}</span>
             </div>
-            <span class="text-xs" style="width:28px;text-align:right;color:${c};font-size:10px;font-style:${noData ? 'italic' : 'normal'}">${noData ? 'N/A' : v.toFixed(0)+'%'}</span>
+            ${resetUnix ? `<div style="margin:2px 0 0 17px;font-size:12px;color:var(--text-dim);font-variant-numeric:tabular-nums;white-space:nowrap">⟳ ${I18n.t('creditsBar.resetLabel')}${fmtReset(resetUnix)}</div>` : ''}
           </div>`;
         };
-        const fmtReset = (unix) => unix ? new Date(unix * 1000).toLocaleString() : I18n.t('creditsBar.noResetTime');
         const dailyTip = cr.dailyPercent != null
           ? I18n.t('creditsBar.dailyDetail', { pct: cr.dailyPercent.toFixed(0), reset: fmtReset(cr.dailyResetAt) })
           : I18n.t('creditsBar.dailyNA');
@@ -6733,8 +6750,8 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
         const shortW = I18n.t('creditsBar.weeklyShort');
         creditCell = `<div style="min-width:120px;max-width:160px">
             <div class="text-xs" style="margin-bottom:2px"><b>${this.esc(planName.slice(0, 12))}</b> <span style="color:var(--text-dim)">${fetchedAgo}</span></div>
-            ${bar(shortD, cr.dailyPercent, dailyTip)}
-            ${bar(shortW, cr.weeklyPercent, weeklyTip)}
+            ${bar(shortD, cr.dailyPercent, dailyTip, cr.dailyResetAt)}
+            ${bar(shortW, cr.weeklyPercent, weeklyTip, cr.weeklyResetAt)}
             ${a.balance != null ? `<div class="text-xs" style="margin-top:3px;color:var(--success);font-weight:700" title="${this.esc(I18n.t('account.balance.tip'))}">$${Number(a.balance).toFixed(2)} <span style="color:var(--text-dim);font-weight:400;font-size:10px">${I18n.t('account.balance.label')}</span></div>` : ''}
           </div>`;
       }
@@ -6894,6 +6911,18 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       if (s < 86400) return `${Math.floor(s/3600)}h ${T('ago')}`;
       return `${Math.floor(s/86400)}d ${T('ago')}`;
     };
+    // cockpit parity: upstream sends REMAINING percent; its UI shows USED
+    // percent ("每日额度用量 100%"). Compute the used side client-side so even
+    // snapshots persisted before the backend added dailyUsedPercent render it.
+    const usedPct = (remaining) => remaining == null ? null
+      : Math.max(0, Math.min(100, Math.round(100 - remaining)));
+    // "配额周期剩余 N 天" suffix for the plan-period end row.
+    const periodLeftHtml = (endMs) => {
+      const ms = endMs ? new Date(endMs).getTime() : NaN;
+      if (!Number.isFinite(ms)) return '';
+      const days = Math.max(0, Math.ceil((ms - Date.now()) / 86400000));
+      return ` <span style="color:${days <= 3 ? 'var(--error)' : 'var(--text-dim)'};font-size:11px">(${T('plan.periodLeft', { days })})</span>`;
+    };
     const renderBar = (label, pct, resetAt, noDataText) => {
       const isN = pct == null;
       const v = isN ? 0 : Math.max(0, Math.min(100, pct));
@@ -6968,8 +6997,9 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
             <span class="k">${T('plan.tier')}</span><span class="v"><span class="tier ${this.esc(a.tier || 'unknown')}" style="padding:1px 8px;font-size:10px">${this.esc(a.tier || 'unknown')}</span>${a.tierManual ? ' <span style="color:var(--text-dim);font-size:10px">✎ ' + I18n.t('account.tierManualBadge') + '</span>' : ''}</span>
             ${a.balance != null ? `<span class="k">${T('plan.balance')}</span><span class="v"><b style="color:var(--success)">$${Number(a.balance).toFixed(2)}</b></span>` : ''}
             ${a.periodStart ? `<span class="k">${T('plan.periodStart')}</span><span class="v">${fmtDate(a.periodStart)}</span>` : `<span class="k">${T('plan.start')}</span><span class="v">${fmtDate(cr.planStart || us.planStart)}</span>`}
-            ${a.periodEnd ? `<span class="k">${T('plan.periodEnd')}</span><span class="v">${fmtDate(a.periodEnd)}</span>` : `<span class="k">${T('plan.end')}</span><span class="v">${fmtDate(cr.planEnd || us.planEnd)}${trialDaysLeft != null ? ` <span style="color:${trialDaysLeft <= 3 ? 'var(--error)' : 'var(--text-dim)'};font-size:11px">(${trialDaysLeft}d left)</span>` : ''}</span>`}
-            ${cr.overageBalance != null ? `<span class="k">${T('plan.overage')}</span><span class="v">$${cr.overageBalance.toFixed(4)}</span>` : ''}
+            ${a.periodEnd
+              ? `<span class="k">${T('plan.periodEnd')}</span><span class="v">${fmtDate(a.periodEnd)}${periodLeftHtml(a.periodEnd)}</span>`
+              : `<span class="k">${T('plan.end')}</span><span class="v">${fmtDate(cr.planEnd || us.planEnd)}${trialDaysLeft != null ? ` <span style="color:${trialDaysLeft <= 3 ? 'var(--error)' : 'var(--text-dim)'};font-size:11px">(${trialDaysLeft}d left)</span>` : periodLeftHtml(cr.planEnd || us.planEnd)}</span>`}
           </div>
         </div>
 
@@ -6978,6 +7008,14 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
           ${renderBar(T('quota.daily'), cr.dailyPercent, cr.dailyResetAt, I18n.t('creditsBar.dailyNA'))}
           ${renderBar(T('quota.weekly'), cr.weeklyPercent, cr.weeklyResetAt, I18n.t('creditsBar.weeklyNA'))}
           <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)" class="detail-kv">
+            ${(() => {
+              const du = usedPct(cr.dailyPercent), wu = usedPct(cr.weeklyPercent);
+              const usedRows =
+                (du != null ? `<span class="k">${T('quota.dailyUsed')}</span><span class="v"><b>${du}%</b></span>` : '')
+              + (wu != null ? `<span class="k">${T('quota.weeklyUsed')}</span><span class="v"><b>${wu}%</b></span>` : '');
+              return usedRows;
+            })()}
+            ${cr.overageBalance != null ? `<span class="k">${T('quota.extraBalance')}</span><span class="v"><b style="color:${cr.overageBalance < 0 ? 'var(--error)' : 'var(--success)'}">$${Number(cr.overageBalance).toFixed(2)}</b></span>` : ''}
             ${cr.prompt?.limit ? `<span class="k">${T('quota.promptCredits')}</span><span class="v"><b>${cr.prompt.remaining ?? 0}</b> / ${cr.prompt.limit} <span style="color:var(--text-dim);font-size:10px">(${T('quota.used')} ${cr.prompt.used ?? 0})</span></span>` : `<span class="k">${T('quota.promptCredits')}</span><span class="v" style="color:var(--text-dim)">${T('quota.notApplicable')}</span>`}
             ${cr.flex?.limit ? `<span class="k">${T('quota.flexCredits')}</span><span class="v"><b>${cr.flex.remaining ?? 0}</b> / ${cr.flex.limit} <span style="color:var(--text-dim);font-size:10px">(${T('quota.used')} ${cr.flex.used ?? 0})</span></span>` : `<span class="k">${T('quota.flexCredits')}</span><span class="v" style="color:var(--text-dim)">${T('quota.notApplicable')}</span>`}
             <span class="k">${T('quota.fetchedAt')}</span><span class="v">${fmtAgo(cr.fetchedAt)}</span>

@@ -21,7 +21,7 @@ import {
   validateApiKey, isAuthenticated, getAccountList, getAccountCount,
   addAccountByEmail, addAccountByPastedSecret, removeAccount,
   configureBindHost, emitNoAuthWarnings, getDroughtSummary, ensureLsForAccount,
-  checkLockout, failedAuthAttempt, successfulAuthAttempt,
+  checkLockout, failedAuthAttempt, successfulAuthAttempt, refreshCredits,
 } from './auth.js';
 import { trustedClientIp } from './net-safety.js';
 import { handleChatCompletions, normalizeOpenAIErrorBody } from './handlers/chat.js';
@@ -530,6 +530,9 @@ async function route(req, res) {
               continue;
             }
             bindAccountProxy(result.id, parsedProxy);
+            // Fetch email/quota right away so the new row isn't a bare label
+            // until the next 15-min sweep (free GetUserStatus read).
+            refreshCredits(result.id).catch(() => {});
             results.push({ id: result.id, email: result.email, status: result.status });
           } catch (err) {
             results.push({ email: acct.email, error: err.message });
@@ -552,6 +555,7 @@ async function route(req, res) {
       }
 
       bindAccountProxy(account.id, parsedProxy);
+      refreshCredits(account.id).catch(() => {});
 
       return json(res, 200, {
         success: true,

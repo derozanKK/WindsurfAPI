@@ -3485,6 +3485,7 @@ function publicAccount(a, now, { view = 'full' } = {}) {
   const base = {
     id: a.id,
     email: a.email,
+    displayName: a.displayName || null,
     method: a.method,
     status: a.status,
     errorCount: a.errorCount,
@@ -3709,6 +3710,17 @@ async function _refreshCreditsImpl(account) {
     const { getUserStatus } = await import('./windsurf-api.js');
     const proxy = getEffectiveProxy(account.id) || null;
     const status = await getUserStatus(apiKey, proxy);
+    // Identity backfill (cockpit parity): GetUserStatus carries the account's
+    // email/name, so rows added by pasting a devin-session-token$/sk- key can
+    // shed their `key-xxxx`/`token-xxxx` placeholder label for the real email.
+    // Same rule the gRPC probe uses — only replace when the current label has
+    // no '@', so an operator-set label that already looks like an email stays.
+    if (status.email && !String(account.email || '').includes('@')) {
+      account.email = status.email;
+    }
+    if (status.displayName && !account.displayName) {
+      account.displayName = status.displayName;
+    }
     // Drop the huge raw payload before persisting — keep it only in memory for
     // downstream callers (e.g. model catalog cache) to inspect once.
     const { raw, ...persist } = status;

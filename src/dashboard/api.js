@@ -1395,6 +1395,10 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       // Fire-and-forget LS warmup is opt-in. Current LS builds are heavy,
       // so adding many proxied accounts must not spawn many LSPs up front.
       scheduleAccountWarmup(account.id);
+      // Populate email/quota immediately (free GetUserStatus read) so a fresh
+      // row shows its real email + plan + quota bars without waiting for the
+      // 15-min sweep — mirrors cockpit showing account info right after login.
+      refreshCredits(account.id).catch(() => {});
       return json(res, 200, {
         success: true,
         account: { id: account.id, email: account.email, method: account.method, status: account.status },
@@ -1430,6 +1434,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         if (kind === 'auth1') { results.skipped.push({ kind, reason: 'auth1_not_a_pool_key' }); continue; }
         try {
           const acc = await addByKind(raw, '');
+          refreshCredits(acc.id).catch(() => {});
           results.added.push({ id: acc.id, email: acc.email, kind });
         } catch (e) { results.failed.push({ kind, error: e.message }); }
       }
@@ -1441,6 +1446,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         }
         try {
           const acc = await addByKind(pair.token, pair.email || '');
+          refreshCredits(acc.id).catch(() => {});
           results.added.push({ id: acc.id, email: acc.email || pair.email, kind: pairKind });
         } catch (e) { results.failed.push({ email: pair.email, error: e.message }); }
       }

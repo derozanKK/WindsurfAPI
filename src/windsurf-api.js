@@ -269,9 +269,14 @@ function normalizeWebSearchResults(data) {
  * (availablePromptCredits / usedPromptCredits) and the newer quota contract
  * (dailyQuotaRemainingPercent / weeklyQuotaRemainingPercent).
  *
+ * Also surfaces the account identity upstream attaches to userStatus
+ * (`email`, `displayName`) — the same fields cockpit reads to label an
+ * account — plus used-side percents (`dailyUsedPercent`/`weeklyUsedPercent`)
+ * for the cockpit-style "每日/每周额度用量" rendering.
+ *
  * @param {string} apiKey
  * @param {object} [proxy] optional HTTP CONNECT proxy
- * @returns {Promise<{planName, dailyPercent, weeklyPercent, dailyResetAt, weeklyResetAt, prompt:{used,limit}, flex:{used,limit}, raw}>}
+ * @returns {Promise<{planName, dailyPercent, weeklyPercent, dailyUsedPercent, weeklyUsedPercent, dailyResetAt, weeklyResetAt, overageBalance, planStart, planEnd, email, displayName, prompt:{used,limit}, flex:{used,limit}, raw}>}
  */
 export async function getUserStatus(apiKey, proxy = null) {
   const body = {
@@ -308,8 +313,12 @@ export async function getUserStatus(apiKey, proxy = null) {
 }
 
 function normalizeUserStatus(data) {
-  const ps = data?.userStatus?.planStatus || {};
-  const plan = ps.planInfo || {};
+  const us = data?.userStatus || {};
+  const ps = us.planStatus || {};
+  // planInfo sits in different places depending on which upstream emitted the
+  // response: Devin/Auth1 GetUserStatus carries it top-level or under
+  // userStatus, while the legacy Codeium response nests it inside planStatus.
+  const plan = data?.planInfo || us.planInfo || ps.planInfo || {};
 
   // Legacy values come in hundredths; divide by 100 for display.
   const legacyDiv = (n) => (typeof n === 'number' ? n / 100 : null);
@@ -322,8 +331,29 @@ function normalizeUserStatus(data) {
     return Number.isFinite(n) ? n : null;
   };
 
+  // planStart/planEnd arrive as proto-Timestamp JSON (ISO string) on some
+  // accounts and unix seconds on others — normalize to epoch MILLISECONDS so
+  // the dashboard's `new Date(v)` renders correctly for both.
+  const toMillis = (v) => {
+    if (v == null) return null;
+    if (typeof v === 'object') {
+      // google.protobuf.Timestamp decoded as { seconds, nanos } rather than the
+      // canonical ISO string.
+      if (v.seconds != null) return toMillis(v.seconds);
+      return null;
+    }
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n > 1e12 ? n : n * 1000;
+    const ms = Date.parse(v);
+    return Number.isFinite(ms) ? ms : null;
+  };
+
+  const dailyResetAt = asUnix(ps.dailyQuotaResetAtUnix);
+  const weeklyResetAt = asUnix(ps.weeklyQuotaResetAtUnix);
+
   const out = {
-    planName: plan.planName || 'Unknown',
+    // cockpit also accepts teamsTier as the plan-name carrier on team accounts.
+    planName: plan.planName || plan.teamsTier || 'Unknown',
     // proto3-JSON omits zero values, so a fully-used quota (0% remaining) comes
     // back as an ABSENT field, not `0` — which we'd otherwise render as N/A even
     // though the real answer is "0% left / 100% used". When the quota dimension
@@ -335,8 +365,8 @@ function normalizeUserStatus(data) {
     weeklyPercent: typeof ps.weeklyQuotaRemainingPercent === 'number'
       ? ps.weeklyQuotaRemainingPercent
       : ((ps.weeklyQuotaResetAtUnix != null || typeof ps.dailyQuotaRemainingPercent === 'number') ? 0 : null),
-    dailyResetAt: asUnix(ps.dailyQuotaResetAtUnix),
-    weeklyResetAt: asUnix(ps.weeklyQuotaResetAtUnix),
+    dailyResetAt,
+    weeklyResetAt,
     overageBalance: typeof ps.overageBalanceMicros === 'number' ? ps.overageBalanceMicros / 1_000_000 : null,
     prompt: {
       limit: legacyDiv(plan.monthlyPromptCredits),
@@ -348,8 +378,16 @@ function normalizeUserStatus(data) {
       used: legacyDiv(ps.usedFlexCredits),
       remaining: legacyDiv(ps.availableFlexCredits),
     },
-    planStart: ps.planStart || null,
-    planEnd: ps.planEnd || null,
+    planStart: toMillis(ps.planStart),
+    // Free-plan responses omit planEnd entirely (the plan has no expiry), but
+    // the UI still wants a "billing period" — fall back to the next quota
+    // reset, mirroring cockpit's weeklyResetAt → dailyResetAt order.
+    planEnd: toMillis(ps.planEnd) ?? (weeklyResetAt != null ? weeklyResetAt * 1000 : null)
+      ?? (dailyResetAt != null ? dailyResetAt * 1000 : null),
+    // Account identity carried on userStatus (Devin/Auth1 responses always
+    // include it; the email lets pasted-token rows drop their key-xxxx label).
+    email: us.email || us.username || data?.email || data?.username || null,
+    displayName: us.name || us.displayName || data?.name || null,
     // Preserve the untouched response so downstream caching (model catalog)
     // can inspect fields we haven't normalized yet.
     raw: data,
@@ -365,6 +403,13 @@ function normalizeUserStatus(data) {
   } else {
     out.percent = null;
   }
+
+  // cockpit parity: upstream sends REMAINING percent but its UI shows USED
+  // percent ("每日额度用量 100%"). Expose both — the pool's drought logic keeps
+  // consuming remaining, the detail view can render the used side.
+  const used = (remaining) => remaining == null ? null : Math.max(0, Math.min(100, 100 - remaining));
+  out.dailyUsedPercent = used(out.dailyPercent);
+  out.weeklyUsedPercent = used(out.weeklyPercent);
 
   return out;
 }

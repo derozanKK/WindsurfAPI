@@ -220,7 +220,9 @@
     "dailyNA": "Windsurf 未返回每日配额数据",
     "weeklyNA": "Windsurf 未返回每周配额数据",
     "promptNA": "该账号无提示词额度数据",
-    "noResetTime": "重置时间未知"
+    "noResetTime": "重置时间未知",
+    "resetDone": "已重置",
+    "resetLabel": "重置："
   },
   "section": {
     "settings": {
@@ -1098,12 +1100,16 @@
         "periodEnd": "账期结束",
         "start": "开始",
         "end": "到期",
-        "overage": "透支余额"
+        "overage": "透支余额",
+        "periodLeft": "剩余 {{days}} 天"
       },
       "quota": {
         "title": "配额使用",
         "daily": "每日",
         "weekly": "每周",
+        "dailyUsed": "每日额度用量",
+        "weeklyUsed": "每周额度用量",
+        "extraBalance": "额外用量余额",
         "promptCredits": "提示词额度",
         "flexCredits": "Flex 额度",
         "used": "已用",
