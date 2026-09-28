@@ -26,20 +26,26 @@ export function normalizeStop(stop) {
 }
 
 // Non-streaming: truncate `text` at the earliest stop-sequence hit. Returns
-// { text, hit } — hit is true when any sequence matched (→ finish_reason:'stop').
+// { text, hit, stop } — hit is true when any sequence matched (→ finish_reason:'stop'),
+// and `stop` is the EXACT sequence that won (null when nothing matched). Callers
+// that must report the cause — the Anthropic Messages route echoes it as
+// `stop_sequence` — need the cause at THIS layer: the matched bytes are removed
+// from the returned text, so nothing downstream can recover which sequence fired.
 // When multiple sequences appear, the one with the EARLIEST index wins so the
-// output is the shortest correct prefix.
+// output is the shortest correct prefix; on an exact tie the earlier entry in the
+// caller's list wins (unchanged).
 export function applyStop(text, stopSequences) {
-  if (typeof text !== 'string' || !text) return { text: text || '', hit: false };
+  if (typeof text !== 'string' || !text) return { text: text || '', hit: false, stop: null };
   const seqs = normalizeStop(stopSequences);
-  if (!seqs.length) return { text, hit: false };
+  if (!seqs.length) return { text, hit: false, stop: null };
   let cut = -1;
+  let matched = null;
   for (const seq of seqs) {
     const idx = text.indexOf(seq);
-    if (idx !== -1 && (cut === -1 || idx < cut)) cut = idx;
+    if (idx !== -1 && (cut === -1 || idx < cut)) { cut = idx; matched = seq; }
   }
-  if (cut === -1) return { text, hit: false };
-  return { text: text.slice(0, cut), hit: true };
+  if (cut === -1) return { text, hit: false, stop: null };
+  return { text: text.slice(0, cut), hit: true, stop: matched };
 }
 
 /**
@@ -61,6 +67,10 @@ export class StopSequenceGate {
     this.maxLen = this.seqs.reduce((m, s) => Math.max(m, s.length), 0);
     this.buf = '';
     this.done = false;
+    // The sequence that ended the stream (null until a hit). Same reason as
+    // applyStop's `stop`: the matched bytes never reach the caller's text, so the
+    // cause has to be captured where the match happened.
+    this.matched = null;
   }
 
   get active() { return this.seqs.length > 0; }
@@ -74,16 +84,18 @@ export class StopSequenceGate {
       return { emit: this.done ? '' : (chunk || ''), hit: false };
     }
     this.buf += (chunk || '');
-    // Earliest stop match in the running buffer.
+    // Earliest stop match in the running buffer (ties keep the earlier list entry).
     let cut = -1;
+    let matched = null;
     for (const seq of this.seqs) {
       const idx = this.buf.indexOf(seq);
-      if (idx !== -1 && (cut === -1 || idx < cut)) cut = idx;
+      if (idx !== -1 && (cut === -1 || idx < cut)) { cut = idx; matched = seq; }
     }
     if (cut !== -1) {
       const emit = this.buf.slice(0, cut);
       this.buf = '';
       this.done = true;
+      this.matched = matched;
       return { emit, hit: true };
     }
     // No full match yet. Emit everything except a trailing (maxLen-1) window that

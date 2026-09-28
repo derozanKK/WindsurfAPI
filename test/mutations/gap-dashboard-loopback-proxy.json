@@ -1,0 +1,29 @@
+{
+  "tests": [
+    "test/dashboard-auth-hardening.test.js"
+  ],
+  "expectBaselinePass": 24,
+  "mutations": [
+    {
+      "name": "G-6: the verified-local half of the dashboard convenience is deleted",
+      "file": "src/dashboard/api.js",
+      "anchor": "  if (isLocalBindHost() && isLoopbackAddress(clientIp)) {\n    const effectiveApiKey = getEffectiveApiKey();\n    // H2 (Grok audit):",
+      "replacement": "  if (isLocalBindHost() && true) {\n    const effectiveApiKey = getEffectiveApiKey();\n    // H2 (Grok audit):",
+      "expectCaught": true
+    },
+    {
+      "name": "G-6: the trusted proxy's XFF hop is ignored, so a loopback socket peer wins",
+      "file": "src/net-safety.js",
+      "anchor": "  if (env.TRUST_PROXY_X_FORWARDED_FOR !== '1') return remote;",
+      "replacement": "  if (true) return remote;",
+      "expectCaught": true
+    },
+    {
+      "name": "G-6: the XFF entry is taken from the LEFT (the spoofable end) instead of by hop count",
+      "file": "src/net-safety.js",
+      "anchor": "  const idx = parts.length - trustedProxyHops(env);",
+      "replacement": "  const idx = 0;",
+      "expectCaught": true
+    }
+  ]
+}

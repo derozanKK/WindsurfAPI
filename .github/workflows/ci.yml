@@ -100,17 +100,24 @@ jobs:
 
   # Mutation-spec consistency. Three baseline/anchor drifts reached master in one week
   # (#241's anchors, retry-rescue 82/87 -> 88, reasoning-continuity 289 -> 300) and the
-  # test suite saw none of them: it does not run specs. These checks read files only and
-  # cost ~0.3s, so they are mandatory rather than a local habit someone has to remember.
+  # test suite saw none of them: it does not run specs. The anchor/shape checks read files
+  # only and cost ~0.3s, so they are mandatory rather than a local habit to remember.
   #
-  # Baseline VALUE drift is deliberately NOT checked here — it needs a real test run per
-  # spec (~40 min for all 25). That is the post-merge sweep: scripts/spec-baseline-audit.mjs.
+  # Baseline VALUE drift is measured here too, by EXECUTING the covered specs and reading
+  # the runner's events (scripts/spec-baseline-check.mjs) — never by scraping display text
+  # and never by rewriting a pin. A changed diff measures only the affected specs; a
+  # synchronised checkout measures all of them, which costs ~100s for 82 specs. The check
+  # used to run only in the local gate, so a wrong pin reached CI green.
   specs:
     name: Mutation spec consistency
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Change-scoped selection diffs against origin/master, so the history has to be
+          # here; a shallow clone would silently widen the selection to every spec.
+          fetch-depth: 0
 
       - name: Setup Node 24
         uses: actions/setup-node@v5
@@ -119,6 +126,9 @@ jobs:
 
       - name: Anchors unique, specs well-formed
         run: node scripts/spec-static-check.mjs
+
+      - name: Measured baselines match, from executed evidence
+        run: node scripts/spec-baseline-check.mjs
 
       - name: Secret scan (includes test/ — half of a typical diff lives there)
         run: node scripts/secret-scan.mjs

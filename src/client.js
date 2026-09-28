@@ -8,8 +8,9 @@
 
 import https from 'https';
 import { randomUUID, createHash } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
+import { dirname } from 'node:path';
 import { log } from './config.js';
 import { extractImages } from './image.js';
 import { closeSessionForPort, grpcFrame, grpcUnary, grpcStream } from './grpc.js';
@@ -354,44 +355,51 @@ const _seededWorkspaces = new Set();
 // "my-project" or carried a Hello-world src/index.js. On upgrade we
 // rewrite those files in place so the next cascade init re-snapshots
 // the labeled-as-stub version into <workspace_layout>.
-function isLegacyScaffold(workspacePath) {
-  try {
-    const pkgPath = `${workspacePath}/package.json`;
-    if (!existsSync(pkgPath)) return false;
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-    return pkg?.name !== 'proxy-workspace-stub';
-  } catch {
-    return false;
-  }
-}
+//
+// REMOVED (GPT-01): that rewrite deleted `src/` recursively and overwrote
+// package.json / README.md / .gitignore based on a predicate whose whole test was
+// "the name is not the one we write today". Refusing to recognise a file is not
+// evidence that we wrote it. Fresh directories receive labeled content; existing
+// legacy directories are preserved, not automatically relabeled. This deliberately
+// gives up automatic legacy cleanup rather than risking authored files. See
+// test/workspace-scaffold-ownership.test.js and docs/releases/RELEASE_NOTES_3.9.38.md.
 
-function ensureWorkspaceDir(workspacePath) {
+export function ensureWorkspaceDir(workspacePath) {
   if (_seededWorkspaces.has(workspacePath)) return;
   try {
-    const exists = existsSync(workspacePath);
-    if (exists && isLegacyScaffold(workspacePath)) {
-      // Rewrite stub files but leave any other content alone — operator
-      // may have manually placed files in this dir for some reason.
-      try {
-        rmSync(`${workspacePath}/src`, { recursive: true, force: true });
-      } catch {}
-      writeStubFiles(workspacePath);
-      log.info(`Workspace scaffold migrated to #108 stub-labeled form: ${workspacePath}`);
+    // Ownership rule (GPT-01): the only thing this code can prove it owns is what this
+    // call created. The directory name is derived from the account's apiKey hash, but a
+    // path existing says nothing about who wrote its contents — so an existing
+    // directory is left exactly as it is.
+    //
+    // What used to be here was a "legacy scaffold migration": any package.json whose
+    // name was not `proxy-workspace-stub` was taken as an old template, then `src/` was
+    // deleted recursively and package.json / README.md / .gitignore were overwritten.
+    // That is not ownership, it is the absence of recognition. A real project at that
+    // path — or our own old scaffold after the user edited one file — lost data.
+    if (existsSync(workspacePath)) {
       _seededWorkspaces.add(workspacePath);
       return;
     }
-    if (!exists) {
-      mkdirSync(workspacePath, { recursive: true });
-      writeStubFiles(workspacePath);
-      // Init git repo so LS picks up real git state
-      try {
-        execSync('git init -q && git add -A && git commit -q -m "proxy stub" --allow-empty', {
-          cwd: workspacePath, stdio: 'ignore', timeout: 5000,
-        });
-      } catch {}
-      log.info(`Workspace scaffold created: ${workspacePath}`);
+    // Parent creation grants no ownership of the leaf. A concurrent creator must win
+    // without this call seeding or truncating any of its files.
+    mkdirSync(dirname(workspacePath), { recursive: true });
+    try { mkdirSync(workspacePath); }
+    catch (error) {
+      if (error.code === 'EEXIST') return;
+      throw error;
     }
+    writeStubFiles(workspacePath);
+    // Init git repo so LS picks up real git state
+    try {
+      execSync('git init -q && git add -A && git commit -q -m "proxy stub" --allow-empty', {
+        cwd: workspacePath, stdio: 'ignore', timeout: 5000,
+      });
+    } catch {}
+    // Existing or partially created directories are preserved on later calls.
+    // This is non-destructive seeding, not a crash-recoverable migration transaction.
     _seededWorkspaces.add(workspacePath);
+    log.info(`Workspace scaffold created: ${workspacePath}`);
   } catch (e) {
     log.debug(`ensureWorkspaceDir: ${e.message}`);
   }
@@ -406,16 +414,21 @@ function ensureWorkspaceDir(workspacePath) {
 // that the LS still indexes a workspace (closes the fingerprint gap)
 // but make every file unmistakably labeled as a proxy placeholder so
 // the model can't confuse it for the user's project.
+function writeOwnedStubFile(file, content) {
+  // The directory claim is not permission to truncate a file created concurrently.
+  writeFileSync(file, content, { flag: 'wx' });
+}
+
 function writeStubFiles(workspacePath) {
-  writeFileSync(`${workspacePath}/package.json`, JSON.stringify({
+  writeOwnedStubFile(`${workspacePath}/package.json`, JSON.stringify({
     name: 'proxy-workspace-stub',
     version: '0.0.0',
     private: true,
     description: 'Empty placeholder created by the WindsurfAPI proxy. NOT the user project — the user\'s real workspace lives on the calling client and is described via the calling agent\'s Environment facts.',
     license: 'UNLICENSED',
   }, null, 2) + '\n');
-  writeFileSync(`${workspacePath}/README.md`, '# Proxy workspace placeholder\n\nThis directory exists only so the Windsurf language server has a workspace to register. It is NOT the user\'s project.\n\nThe user\'s real workspace lives on the calling client (their local IDE / CLI) and its path is communicated through the calling agent\'s Environment facts. To inspect actual files, use Read / Glob / Bash with paths from the Working directory in the Environment facts block.\n');
-  writeFileSync(`${workspacePath}/.gitignore`, '# proxy workspace placeholder — see README.md\n');
+  writeOwnedStubFile(`${workspacePath}/README.md`, '# Proxy workspace placeholder\n\nThis directory exists only so the Windsurf language server has a workspace to register. It is NOT the user\'s project.\n\nThe user\'s real workspace lives on the calling client (their local IDE / CLI) and its path is communicated through the calling agent\'s Environment facts. To inspect actual files, use Read / Glob / Bash with paths from the Working directory in the Environment facts block.\n');
+  writeOwnedStubFile(`${workspacePath}/.gitignore`, '# proxy workspace placeholder — see README.md\n');
 }
 
 // ─── WindsurfClient ────────────────────────────────────────
@@ -762,22 +775,20 @@ export class WindsurfClient {
       // path doesn't replay history (cascade still has it), so coverage =
       // full input; fresh path may truncate large histories.
       let historyCoverage = { droppedTurnCount: 0, firstIncludedTurnIndex: 0, totalTurns: convo.length };
-      if (isResume || convo.length <= 1) {
-        const last = convo[convo.length - 1];
-        const extracted = await extractImages(last?.content ?? '');
-        text = extracted.text;
-        images = extracted.images;
-        if (!isResume && sysText) text = sysText + '\n\n' + text;
-      } else {
-        const maxHistoryBytes = cascadeHistoryBudget(modelUid);
+      // GPT-08: one computation for "which turns fit the prompt", shared by the fresh
+      // path and the post-resume-rebuild path. They used to disagree — the rebuild
+      // truncated the same history without updating historyCoverage, so a request that
+      // started as a resume reported full coverage while the wire carried a truncated
+      // history. The prompt text is unchanged; only the bookkeeping is now common.
+      const buildHistoryLines = (budgetBytes, openingBytes) => {
         const lines = [];
-        let historyBytes = sysText ? sysText.length : 0;
+        let historyBytes = openingBytes;
         let firstIncluded = 0;
         for (let i = convo.length - 2; i >= 0; i--) {
           const m = convo[i];
           const tag = m.role === 'user' ? 'human' : 'assistant';
           const line = `<${tag}>\n${escapeHistoryTag(contentToString(m.content), tag)}\n</${tag}>`;
-          if (historyBytes + line.length > maxHistoryBytes && lines.length > 0) {
+          if (historyBytes + line.length > budgetBytes && lines.length > 0) {
             log.info(`Cascade: trimmed history at turn ${i}/${convo.length} (${Math.round(historyBytes/1024)}KB kept, ${convo.length - 2 - i} turns dropped)`);
             firstIncluded = i + 1;
             break;
@@ -786,6 +797,17 @@ export class WindsurfClient {
           historyBytes += line.length;
           firstIncluded = i;
         }
+        return { lines, firstIncluded };
+      };
+      if (isResume || convo.length <= 1) {
+        const last = convo[convo.length - 1];
+        const extracted = await extractImages(last?.content ?? '');
+        text = extracted.text;
+        images = extracted.images;
+        if (!isResume && sysText) text = sysText + '\n\n' + text;
+      } else {
+        const maxHistoryBytes = cascadeHistoryBudget(modelUid);
+        const { lines, firstIncluded } = buildHistoryLines(maxHistoryBytes, sysText ? sysText.length : 0);
         historyCoverage = {
           droppedTurnCount: firstIncluded,
           firstIncludedTurnIndex: firstIncluded,
@@ -827,17 +849,16 @@ export class WindsurfClient {
       const MAX_PANEL_RETRIES = 3;
       const rebuildFullHistoryText = async () => {
         if (!(isResume && convo.length > 1)) return;
-        const maxHistoryBytes = cascadeHistoryBudget(modelUid);
-        const lines = [];
-        let historyBytes = 0;
-        for (let i = convo.length - 2; i >= 0; i--) {
-          const m = convo[i];
-          const tag = m.role === 'user' ? 'human' : 'assistant';
-          const line = `<${tag}>\n${escapeHistoryTag(contentToString(m.content), tag)}\n</${tag}>`;
-          if (historyBytes + line.length > maxHistoryBytes && lines.length > 0) break;
-          lines.unshift(line);
-          historyBytes += line.length;
-        }
+        // Share the truncation mechanism and record the rebuilt prompt coverage
+        // number. Fresh includes system-prompt overhead while this historical rebuild
+        // path starts at zero; preserve those existing budgets and report each
+        // actual suffix rather than promising identical counts for every input.
+        const { lines, firstIncluded } = buildHistoryLines(cascadeHistoryBudget(modelUid), 0);
+        historyCoverage = {
+          droppedTurnCount: firstIncluded,
+          firstIncludedTurnIndex: firstIncluded,
+          totalTurns: convo.length,
+        };
         const latest = convo[convo.length - 1];
         const extracted = await extractImages(latest?.content ?? '');
         text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${extracted.text}\n</human>`;

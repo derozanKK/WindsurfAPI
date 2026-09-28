@@ -451,6 +451,117 @@ describe('WindsurfClient cascade panel retry', () => {
     });
   });
 
+  it('GPT-08: a rebuilt history reports the coverage of what was actually sent', async () => {
+    // An independent audit (2026-09-22) found the recovery path reporting full coverage
+    // for a truncated history: the fresh branch updated historyCoverage, the resume
+    // rebuild truncated the same history without updating it, and the stale value was
+    // returned verbatim. In THIS fixture both paths open with zero bytes of system
+    // prompt, so the same history and budget must give the same answer — that is a
+    // property of this input, not a general rule: with a system prompt present the fresh
+    // path counts its length and the rebuilt path does not, so the two coverage values
+    // legitimately differ. See test/review-history-coverage.test.js, which pins each
+    // path against the turns actually present in the encoded request.
+    const budget = 1024;
+    const prevBudget = process.env.CASCADE_MAX_HISTORY_BYTES;
+    process.env.CASCADE_MAX_HISTORY_BYTES = String(budget);
+    process.env.CASCADE_POLL_INTERVAL_MS = '10';
+    process.env.CASCADE_IDLE_GRACE_MS = '1';
+    process.env.CASCADE_MAX_WAIT_MS = '1500';
+    process.env.CASCADE_COLD_STALL_BASE_MS = '500';
+    process.env.CASCADE_WARM_STALL_MS = '500';
+    process.env.GRPC_PROTOCOL = 'connect';
+
+    // Five turns, the first three far larger than the whole budget: with 1024 bytes
+    // only the newest assistant turn and the closing user message can fit, so the
+    // oldest three are dropped no matter which path builds the prompt.
+    const big = 'x'.repeat(2048);
+    const history = [
+      { role: 'user', content: big },
+      { role: 'assistant', content: big },
+      { role: 'user', content: big },
+      { role: 'assistant', content: 'small-reply' },
+      { role: 'user', content: 'final question' },
+    ];
+
+    const run = ({ resume }) => {
+      let sendCount = 0;
+      return withFakeLanguageServer((stream, headers) => {
+        const chunks = [];
+        stream.on('data', chunk => chunks.push(chunk));
+        stream.on('end', () => {
+          const path = String(headers[':path'] || '');
+          const method = path.split('/').pop();
+          if (method === 'StartCascade') {
+            stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
+            stream.end(responseBody(startCascadeResponse('cascade-' + (resume ? 'recovered' : 'fresh')), headers));
+            return;
+          }
+          if (method === 'SendUserCascadeMessage') {
+            sendCount++;
+            if (resume && sendCount === 1) {
+              const err = errorBody('not_found: cascade trajectory has been expired by ttl', headers);
+              stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
+              if (err.trailers) stream.additionalHeaders(err.trailers);
+              stream.end(err.body);
+              return;
+            }
+            stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
+            stream.end(responseBody(Buffer.alloc(0), headers));
+            return;
+          }
+          if (method === 'GetCascadeTrajectorySteps') {
+            const offset = readStepOffset(requestPayload(Buffer.concat(chunks), headers));
+            stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
+            stream.end(responseBody(trajectoryStepsResponse(offset === 0 ? 'final answer' : ''), headers));
+            return;
+          }
+          if (method === 'GetCascadeTrajectory') {
+            stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
+            stream.end(responseBody(trajectoryStatusResponse(1), headers));
+            return;
+          }
+          if (method === 'GetCascadeTrajectoryGeneratorMetadata') {
+            stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
+            stream.end(responseBody(Buffer.alloc(0), headers));
+            return;
+          }
+          stream.respond({ ':status': 404 });
+          stream.end();
+        });
+      }, async (port) => {
+        const { WindsurfClient } = await import('../src/client.js');
+        const client = new WindsurfClient('test-api-key', port, 'csrf-token');
+        const chunks = await client.cascadeChat(history.map(m => ({ ...m })), 0, 'claude-sonnet-4-6', {
+          reuseEntry: resume
+            ? {
+              cascadeId: 'expired-cascade', sessionId: 'expired-session', lsPort: port,
+              apiKey: 'test-api-key', stepOffset: 5, generatorOffset: 5,
+            }
+            : null,
+        });
+        if (resume) assert.equal(sendCount, 2, 'the fixture must actually take the recovery path');
+        return chunks;
+      });
+    };
+
+    try {
+      const fresh = await run({ resume: false });
+      const recovered = await run({ resume: true });
+
+      assert.equal(fresh.historyCoverage.totalTurns, 5);
+      assert.equal(fresh.historyCoverage.droppedTurnCount, 3, 'the fixture must truncate the three oversized turns');
+      assert.equal(fresh.historyCoverage.firstIncludedTurnIndex, 3);
+      assert.deepEqual(
+        recovered.historyCoverage,
+        fresh.historyCoverage,
+        'with no system prompt both paths send the same truncated history, so their coverage must agree',
+      );
+    } finally {
+      if (prevBudget === undefined) delete process.env.CASCADE_MAX_HISTORY_BYTES;
+      else process.env.CASCADE_MAX_HISTORY_BYTES = prevBudget;
+    }
+  });
+
   it('native bridge returns after first cascade-native tool call instead of waiting for remote execution', async () => {
     process.env.CASCADE_POLL_INTERVAL_MS = '10';
     process.env.CASCADE_IDLE_GRACE_MS = '1';

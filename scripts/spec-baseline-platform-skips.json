@@ -1,0 +1,323 @@
+{
+  "version": 1,
+  "note": "Named machine-gated tests measured at 4e429fa on Windows; not passing-test evidence. Additions require review, not automatic regeneration.",
+  "platforms": {
+    "win32": {
+      "reason": "real-Git fixtures require git at a trusted absolute POSIX system path",
+      "tests": [
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "a syntax-error mutation is UNTRUSTWORTHY, not CAUGHT"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "--keep-going cannot continue after untrustworthy evidence"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "a mutation that exits the process mid-suite aborts with an explanation"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "cannot bless a truncated run through allowTruncatedCatch"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "cannot forge a complete caught run with test-authored TAP"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "a mutation target outside the repo is refused before anything runs"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "an untracked target is refused, since the restore could not undo it"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "an anchor that does not match exactly once is refused"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "a stale expectBaselinePass is refused"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "a test path that would be parsed as a node option is refused"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "a survivor expected to be caught exits 1"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "and the tree is left clean either way"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "FORCE_COLOR=\"3\" still yields a real baseline and verdict"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "FORCE_COLOR=\"1\" still yields a real baseline and verdict"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "FORCE_COLOR=\"\" still yields a real baseline and verdict"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "FORCE_COLOR=0 (the one value that does not colour) is unaffected"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "does not carry credentials, proxies, auth switches, or real data paths"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "blocks hard-coded non-loopback fetch before it can become mutation evidence"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "discards non-target test side effects instead of leaving them in the Owner checkout"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "snapshots every ref namespace and Git pseudoref state"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "ignores index stat-cache churn but still detects staged index semantics"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "snapshots ignored owner files and executable mode changes"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "materializes the network preload but never copies forbidden state trees"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "takes the lock in the Owner repo before materializing a clone"
+        },
+        {
+          "file": "test/mutate-verify-harness.test.js",
+          "name": "refuses a stale lock that already has a competing recovery claim"
+        },
+        {
+          "file": "test/ota-fixture-containment-static.test.js",
+          "name": "runtime fixture environments ignore poisoned system and global Git config"
+        },
+        {
+          "file": "test/self-update-gate.test.js",
+          "name": "uses remote refs as authority after a tag is revoked without deleting the local tag"
+        },
+        {
+          "file": "test/self-update-gate.test.js",
+          "name": "rejects incomplete or out-of-root real Git fixtures before spawning the dashboard check"
+        },
+        {
+          "file": "test/self-update-gate.test.js",
+          "name": "rejects dashboard fixture children that are symlinks escaping the temporary root"
+        },
+        {
+          "file": "test/self-update-untracked-safety.test.js",
+          "name": "rollback refuses an untracked path that reset --hard would overwrite, then force mode stashes it"
+        },
+        {
+          "file": "test/self-update-untracked-safety.test.js",
+          "name": "rollback refuses an ignored target collision even with force, without blocking unrelated ignored data"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "rejects incomplete or out-of-root fixtures before spawning update.sh"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "rejects fixture children that are symlinks escaping the temporary root"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails before fetch or installation when pm2 is unavailable"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "refuses every malformed successful rev-list count before any mutation"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "refuses an unsafe oversized successful rev-list count before any mutation"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "installs the newest release tag and leaves post-tag commits unpublished"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "never pattern-kills unrelated processes whose command line contains src/index.js"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "keeps the failed target checked out when rollback cannot prove PM2 and the port are stopped"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when no usable listener probe is available"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "reports rollback PM2 restart failure instead of claiming the service is healthy"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "rejects a 200 health response from the wrong commit and verifies the rollback service"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "rejects a 200 health response from an unrelated process pid"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "stops/deletes the failed PM2 target before rollback so duplicate names and stale PIDs cannot survive Git reset"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails when rollback health answers 200 for a different commit"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "rolls back when pm2 start exits zero but the named app has no live pid"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails when rollback pm2 start exits zero but the named app has no live pid"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "rolls back verified code and restores its exact stash when the first pm2 start fails"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "follows the untagged branch head only with WINDSURFAPI_UPDATE_FORCE=1"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "force-reset cleans tracked changes without downgrading a checkout past the tag"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "refuses a normal fast-forward that would overwrite ignored owner data"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "refuses force-reset when the target collides with ignored owner data"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "allows unrelated ignored runtime data that cannot collide with the target tree"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "case-folds ignored target collisions even when core.ignorecase is false"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when only prerelease or arbitrary tags exist"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "allows explicit force mode to follow branch HEAD without a stable tag"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when the release-distance rev-list probe fails"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when release-tag enumeration emits partial output then exits nonzero"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when successful remote-tag output violates the ls-remote protocol"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when ls-remote output contains an empty field via repeated tabs"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "ignores a revoked remote tag without pruning the stale local tag"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "skips a newer stable tag that is not reachable from origin/master"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when the fetched tag object differs from the advertised remote ref"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when an annotated tag peels to a commit other than the advertised peeled OID"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "refuses to continue when a post-merge hook leaves the verified target tracked-dirty"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "accepts a nonzero merge exit only after the exact target is independently clean"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "never pops an older user stash when status-to-stash races to no local changes"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "reports an incomplete health rollback when its exact stash cannot be applied"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "refuses an automatic health rollback that would overwrite newly-created ignored owner data"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "accepts a nonzero rollback reset only after independently verifying the exact clean target"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "never restores its stash when health rollback leaves HEAD on the failed release"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "never restores its stash when health rollback reaches the target with tracked dirt"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "refuses to start while another script updater holds the repository lock"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "treats kill-denied plus a present ps row as a live lock owner"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "does not delete a replacement lock when cleanup ownership no longer matches"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "recovers a repository lock whose recorded owner PID is gone"
+        },
+        {
+          "file": "test/update-script-release-target.test.js",
+          "name": "fails closed when a stale lock already has a competing recovery claim"
+        },
+        {
+          "file": "test/wire-provenance.test.js",
+          "name": "the real gate refuses a real checkout that is not the selected release"
+        }
+      ]
+    }
+  }
+}

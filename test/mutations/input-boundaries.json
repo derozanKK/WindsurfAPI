@@ -1,0 +1,124 @@
+{
+  "tests": [
+    "test/pdf-stream-dict.test.js",
+    "test/image-jpeg-deep-sof.test.js",
+    "test/image-fetch-deadline.test.js",
+    "test/trace-depth-redaction.test.js",
+    "test/https-proxy-policy.test.js"
+  ],
+  "expectBaselinePass": 52,
+  "mutations": [
+    {
+      "name": "A7: literal strings close at the first ')' again (nested groups ignored)",
+      "file": "src/pdf.js",
+      "anchor": "    if (c === 0x28) { depth++; i++; continue; }  // (",
+      "replacement": "    if (false && c === 0x28) { depth++; i++; continue; }  // (",
+      "expectCaught": true
+    },
+    {
+      "name": "A7: backslash escapes are no longer honoured inside literal strings",
+      "file": "src/pdf.js",
+      "anchor": "    if (c === 0x5c) { i += 2; continue; }        // backslash escapes the next byte",
+      "replacement": "    if (false && c === 0x5c) { i += 2; continue; }  // backslash escapes the next byte",
+      "expectCaught": true
+    },
+    {
+      "name": "A7: the 500-byte lookback is restored",
+      "file": "src/pdf.js",
+      "anchor": "    const isFlate = !!dict\n      && onlyWhitespaceAndComments(buf, dict.end, streamStart)\n      && dictHasFlateFilter(buf, dict.start, dict.end);",
+      "replacement": "    const dictStart = Math.max(0, streamStart - 500);\n    const isFlate = buf.subarray(dictStart, streamStart).toString('latin1').includes('FlateDecode');",
+      "expectCaught": true
+    },
+    {
+      "name": "A7: the dictionary is found by searching all prior bytes for any FlateDecode",
+      "file": "src/pdf.js",
+      "anchor": "    const isFlate = !!dict\n      && onlyWhitespaceAndComments(buf, dict.end, streamStart)\n      && dictHasFlateFilter(buf, dict.start, dict.end);",
+      "replacement": "    const isFlate = buf.subarray(0, streamStart).toString('latin1').includes('FlateDecode');",
+      "expectCaught": true
+    },
+    {
+      "name": "A7: strings and comments are no longer skipped when reading the dictionary",
+      "file": "src/pdf.js",
+      "anchor": "    if (c === 0x25) { i = skipComment(buf, i, stop); continue; }          // %\n    if (c === 0x28) { i = skipLiteralString(buf, i, stop); continue; }    // (",
+      "replacement": "    if (false && c === 0x25) { i = skipComment(buf, i, stop); continue; }\n    if (false && c === 0x28) { i = skipLiteralString(buf, i, stop); continue; }",
+      "expectCaught": true
+    },
+    {
+      "name": "E3: the guard is head-only again (SOF past the header window bypasses the ceiling)",
+      "file": "src/image.js",
+      "anchor": "    if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) {\n      const jpegDims = readJpegDimensions(buf);",
+      "replacement": "    if (false && buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) {\n      const jpegDims = readJpegDimensions(buf);",
+      "expectCaught": true
+    },
+    {
+      "name": "E3: the decoder ceiling is loosened back to 200 MP",
+      "file": "src/image.js",
+      "anchor": "      maxResolutionInMP: IMAGE_MAX_DECODE_PIXELS / 1_000_000,",
+      "replacement": "      maxResolutionInMP: 200,",
+      "expectCaught": true
+    },
+    {
+      "name": "E3: the decoder memory guard is dropped along with the ceiling",
+      "file": "src/image.js",
+      "anchor": "      maxMemoryUsageInMB: 512,",
+      "replacement": "      maxMemoryUsageInMB: 4096,",
+      "expectCaught": true
+    },
+    {
+      "name": "A5: each redirect hop receives a renewed absolute budget",
+      "file": "src/image.js",
+      "anchor": "    fetchImageUrl(res.headers.location, ctx.timeoutMs, depth + 1, ctx).then(",
+      "replacement": "    fetchImageUrl(res.headers.location, ctx.timeoutMs, depth + 1, null).then(",
+      "expectCaught": true
+    },
+    {
+      "name": "A5: the absolute timer is never armed",
+      "file": "src/image.js",
+      "anchor": "    ctx.timer = setTimeout(\n      () => settle(new Error(`Image fetch deadline exceeded (${timeoutMs} ms)`)),\n      timeoutMs,\n    );",
+      "replacement": "    ctx.timer = null;",
+      "expectCaught": true
+    },
+    {
+      "name": "A5: settlement stops destroying the handles it owns",
+      "file": "src/image.js",
+      "anchor": "      for (const handle of ctx.handles) {\n        detach(handle.res, handle.resListeners);\n        detach(handle.req, handle.reqListeners);\n        if (!handle.res?.destroyed) handle.res?.destroy();\n        if (!handle.req?.destroyed) handle.req?.destroy();\n      }",
+      "replacement": "      for (const handle of ctx.handles) {\n        handle.res = null;\n        handle.req = null;\n      }",
+      "expectCaught": true
+    },
+    {
+      "name": "A5: a failed hop leaves its request and listeners live",
+      "file": "src/image.js",
+      "anchor": "      if (error) {\n        // A failed hop aborts whatever it still owns: no request/response may stay\n        // live (or keep streaming) after the fetch it belonged to has failed.\n        if (!handle.res?.destroyed) handle.res?.destroy();\n        if (!handle.req?.destroyed) handle.req?.destroy();\n        reject(error);",
+      "replacement": "      if (error) {\n        reject(error);",
+      "expectCaught": true
+    },
+    {
+      "name": "D2: the depth cutoff returns the raw container again",
+      "file": "src/trace.js",
+      "anchor": "  if (depth > MAX_TRACE_DEPTH) return DEPTH_TRUNCATION;",
+      "replacement": "  if (depth > MAX_TRACE_DEPTH) return value;",
+      "expectCaught": true
+    },
+    {
+      "name": "F4: the wildcard CORS overlay on every response is restored",
+      "file": "https-proxy.js",
+      "anchor": "    // The backend owns its CORS policy: its allowlist, Vary and status pass through\n    // untouched. Overlaying a wildcard here would silently widen an operator-restricted\n    // origin for every client that reaches the dashboard through this helper.\n    res.writeHead(proxyRes.statusCode, respHeaders);",
+      "replacement": "    Object.assign(respHeaders, { 'access-control-allow-origin': '*' });\n    res.writeHead(proxyRes.statusCode, respHeaders);",
+      "expectCaught": true
+    },
+    {
+      "name": "F4: OPTIONS is answered locally instead of being forwarded",
+      "file": "https-proxy.js",
+      "anchor": "  // Build headers for the HTTP/1.1 backend\n  const fwdHeaders = {};",
+      "replacement": "  if (method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*' }); return res.end(); }\n\n  // Build headers for the HTTP/1.1 backend\n  const fwdHeaders = {};",
+      "expectCaught": true
+    },
+    {
+      "name": "F4: the caller's X-Forwarded-For is forwarded unchanged (no peer appended)",
+      "file": "https-proxy.js",
+      "anchor": "  const peer = req.socket?.remoteAddress || req.connection?.remoteAddress || '';\n  if (peer) {\n    const prior = req.headers['x-forwarded-for'];\n    fwdHeaders['x-forwarded-for'] = prior ? `${prior}, ${peer}` : peer;\n  }",
+      "replacement": "  const peer = '';\n  if (peer) {\n    const prior = req.headers['x-forwarded-for'];\n    fwdHeaders['x-forwarded-for'] = prior ? `${prior}, ${peer}` : peer;\n  }",
+      "expectCaught": true
+    }
+  ]
+}

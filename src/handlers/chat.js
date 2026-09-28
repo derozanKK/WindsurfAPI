@@ -3185,13 +3185,20 @@ async function _handleChatCompletionsInner(body, context = {}) {
       const fallbackInfo = getModelInfo(fallbackKey);
       const fallbackAccess = fallbackInfo ? isModelAllowed(fallbackKey) : { allowed: false };
       if (fallbackInfo && fallbackAccess.allowed) {
-        log.info(`Chat[${reqId}]: ${routingModelKey} blocked (${access.reason}); falling back to default model ${fallbackKey}`);
+        // A8: every model/reason fragment on these two lines is caller- or
+        // config-derived and used to reach the log sink raw — a model name
+        // carrying ESC/BEL/newline forged console output (and split a line).
+        // safeLogValue (same primitive the rest of this file uses for
+        // caller-supplied identity) strips C0/C1/DEL and bounds the length;
+        // `access.reason` carries the caller's model too, so it is sanitized with
+        // them. Routing and the client-facing values below are untouched.
+        log.info(`Chat[${reqId}]: ${safeLogValue(routingModelKey)} blocked (${safeLogValue(access.reason)}); falling back to default model ${safeLogValue(fallbackKey)}`);
         routingModelKey = fallbackKey;
         modelInfo = fallbackInfo;
         access = fallbackAccess;
         accessFallbackModel = fallbackRaw;
       } else {
-        log.warn(`Chat[${reqId}]: ${routingModelKey} blocked and default model "${fallbackRaw}" is unusable (info=${!!fallbackInfo}, allowed=${fallbackAccess.allowed}); rejecting`);
+        log.warn(`Chat[${reqId}]: ${safeLogValue(routingModelKey)} blocked and default model "${safeLogValue(fallbackRaw)}" is unusable (info=${!!fallbackInfo}, allowed=${fallbackAccess.allowed}); rejecting`);
         return { status: 403, body: { error: { message: access.reason, type: 'model_blocked' } } };
       }
     } else {
@@ -3645,7 +3652,12 @@ async function _handleChatCompletionsInner(body, context = {}) {
     const connectDisplayModel = mapped ? reqModelName : connectParams.model;
     // O1: honor stream_options.include_usage on the connect path too — the
     // trailing usage frame is emitted only when the caller opted in.
-    const connectMeta = { id: ccId, created: ccCreated, displayModel: connectDisplayModel, emulateTools, includeUsage: body.stream_options?.include_usage === true, stop: body.stop ?? null, clineCompat: clineCompatActive, reqId, account: ccAcct ? safeAccountRef(ccAcct) : null };
+    const connectMeta = { id: ccId, created: ccCreated, displayModel: connectDisplayModel, emulateTools, includeUsage: body.stream_options?.include_usage === true, stop: body.stop ?? null, clineCompat: clineCompatActive, reqId, account: ccAcct ? safeAccountRef(ccAcct) : null,
+      // SEED-C3a: only the internal Anthropic Messages route needs the adapter's
+      // exact matched stop sequence (it echoes it as the public `stop_sequence`).
+      // Explicit opt-in from the route — a direct OpenAI client keeps the
+      // public response shape untouched.
+      stopCarrier: context.__messagesStopCarrier === true };
     // Shared failover bookkeeping for both stream + non-stream paths. triedKeys
     // accumulates every session token burned this request so getApiKey never
     // re-picks a known-dead account when we hop to the next pool member.
@@ -4552,6 +4564,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // double-count billing). Internal accounting (recordTokenUsage) still runs
       // regardless — only the client-facing frame is gated.
       includeUsage: body.stream_options?.include_usage === true,
+      // SEED-C3b: the Cascade stream path had no local stop enforcement at all
+      // (the Devin wire has no stop field), so the caller's `stop` was silently
+      // ignored here while the Connect adapter honored it.
+      stop: normalizeStop(body.stop),
       fpOpts: buildReuseOpts({ tools: effectiveTools, toolChoice: tool_choice, toolPreamble, preambleTier, emulateTools, route: body.__route || 'chat' }),
       tools: effectiveTools,
       route: body.__route || 'chat',
@@ -4570,16 +4586,25 @@ async function _handleChatCompletionsInner(body, context = {}) {
   if (cached) {
     log.info(`Chat: cache HIT model=${displayModel} flow=non-stream`);
     recordRequest(displayModel, true, 0, null);
-    const message = { role: 'assistant', content: cached.text || null };
+    // SEED-C3b: a replay must obey the caller's `stop` too. Entries written by
+    // this build already store the visible text plus the cause; an entry from an
+    // older build (or any raw text) is re-enforced here rather than replayed
+    // verbatim.
+    const replayed = applyStop(cached.text || '', normalizeStop(body.stop));
+    const cachedStop = replayed.hit ? replayed.stop : (cached.stop || null);
+    const cachedText = replayed.hit ? replayed.text : (cached.text || '');
+    const message = { role: 'assistant', content: cachedText || null };
     if (cached.thinking) message.reasoning_content = cached.thinking;
+    const choice = { index: 0, message, finish_reason: 'stop' };
+    if (context.__messagesStopCarrier === true && cachedStop) choice._windsurf_stop_sequence = cachedStop;
     return {
       status: 200,
       body: {
         id: chatId, object: 'chat.completion', created, model: displayModel,
         system_fingerprint: systemFingerprint(displayModel),
         service_tier: DEFAULT_SERVICE_TIER,
-        choices: [{ index: 0, message, finish_reason: 'stop' }],
-        usage: cachedUsage(messages, cached.text),
+        choices: [choice],
+        usage: cachedUsage(messages, cachedText),
       },
     };
   }
@@ -4795,6 +4820,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
       cacheShareable ? (context.__originalCkey || null) : null,
       clineCompatActive,
       allowCascadeMetadataUnwrap,
+      // SEED-C3b: the Cascade non-stream path ignored the caller's `stop` too.
+      normalizeStop(body.stop),
+      context.__messagesStopCarrier === true,
     );
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
@@ -4953,7 +4981,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null, clineCompatActive = false, allowCascadeMetadataUnwrap = true) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null, clineCompatActive = false, allowCascadeMetadataUnwrap = true, stopSequences = [], stopCarrier = false) {
   const startTime = Date.now();
   const nativeBridgeOn = !!nativeOpts?.enabled;
   try {
@@ -5335,6 +5363,23 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       allText = allThinking;
       allThinking = '';
     }
+
+    // SEED-C3b — the caller's `stop`, enforced locally at the FINAL visible prose
+    // boundary. The Devin wire has no stop field, so this route used to return
+    // the model's full answer including the sentinel and everything after it.
+    // Position matters: this runs after the tool-call parse (so structured
+    // arguments stay opaque), after the egress/sanitize/shaping transforms, and
+    // after any thinking→content promotion — i.e. against exactly the bytes that
+    // would otherwise be returned as `content`. The pre-stop text is kept for
+    // usage accounting (a stop truncates what the client SEES; the upstream still
+    // generated and billed the tokens).
+    const usageText = allText;
+    let localStop = null;
+    if (!toolCalls.length) {
+      const stopped = applyStop(allText, stopSequences);
+      if (stopped.hit) { allText = stopped.text; localStop = stopped.stop; }
+    }
+
     bridgeDiag.totalToolCalls = toolCalls.length;
     bridgeDiag.noToolCalls = bridgeDiag.requestedTools && toolCalls.length === 0 && !hasCompletedNativeReadUrlResult;
     logBridgeResultDiagnostics(reqId, bridgeDiag);
@@ -5403,7 +5448,11 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     if (/^kimi/i.test(String(modelKey || ''))
         && !toolCalls.length
         && (!allText || allText.trim().length === 0)
-        && (!allThinking || allThinking.trim().length === 0)) {
+        && (!allThinking || allThinking.trim().length === 0)
+        // SEED-C3b: an empty VISIBLE prefix that a stop sequence produced is a
+        // legitimate stopped answer (the caller asked generation to halt at byte
+        // zero), not the idle_empty upstream outage this guard exists for.
+        && !localStop) {
       return {
         status: 502,
         body: {
@@ -5416,9 +5465,12 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     }
 
     if (ckey && !toolCalls.length) {
-      cacheSet(ckey, { text: allText, thinking: allThinking });
+      // SEED-C3b: cache the VISIBLE (post-stop) text together with the local stop
+      // cause, so a replay reproduces both the truncated answer and the
+      // `stop_sequence` metadata the Messages route derives from it.
+      cacheSet(ckey, { text: allText, thinking: allThinking, stop: localStop });
       if (aliasCkey && aliasCkey !== ckey) {
-        cacheSet(aliasCkey, { text: allText, thinking: allThinking });
+        cacheSet(aliasCkey, { text: allText, thinking: allThinking, stop: localStop });
       }
     }
 
@@ -5447,20 +5499,27 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // threaded through as its own parameter rather than via poolCtx so that
     // non-reuse requests with `cache_control: { ttl: '1h' }` still attribute
     // their tokens to ephemeral_1h_input_tokens correctly (see #82, #83).
-    const usage = buildUsageBody(serverUsage, messages, allText, allThinking, cachePolicy);
+    // `usageText` is the PRE-stop text on purpose: the stop sequence hides bytes
+    // from the client, it does not un-generate (or un-bill) them.
+    const usage = buildUsageBody(serverUsage, messages, usageText, allThinking, cachePolicy);
     // v2.0.69 (#118): feed bucket totals into stats so dashboard can show
     // fresh_input vs cache_read vs cache_write breakdown.
     try { recordTokenUsage(usage); } catch {}
     // K8: per-account lifetime spend (Cascade non-stream path).
     try { recordAccountSpend(apiKey, usage); } catch {}
     const finishReason = toolCalls.length ? 'tool_calls' : 'stop';
+    const choice = { index: 0, message, finish_reason: finishReason };
+    // SEED-C3a carrier on the internal Messages route only (same contract as the
+    // Connect adapter): the exact sequence that truncated the visible prose. A
+    // tool/tool_calls finish never carries it — only a genuine local stop.
+    if (stopCarrier && localStop && finishReason === 'stop') choice._windsurf_stop_sequence = localStop;
     return {
       status: 200,
       body: {
         id, object: 'chat.completion', created, model,
         system_fingerprint: systemFingerprint(model),
         service_tier: DEFAULT_SERVICE_TIER,
-        choices: [{ index: 0, message, finish_reason: finishReason }],
+        choices: [choice],
         usage,
       },
     };
@@ -5602,6 +5661,10 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
   // can drive a non-Claude model to emit `<tool_call>{"name":"Bash"}…`
   // even when the caller only declared `get_weather`.
   const declaredTools = Array.isArray(deps.tools) ? deps.tools : [];
+  // SEED-C3b: the caller's normalized `stop` for this stream. Declared here (not
+  // next to the gate below) because the cache-replay branch — which runs first —
+  // must fence a stored answer the same way a fresh turn is fenced.
+  const stopSequences = Array.isArray(deps.stop) ? deps.stop : [];
   // Cline compat active for this stream? Resolved at the edge, threaded via
   // deps.context. Falsy for every non-Cline request → emit stays byte-identical.
   const clineCompatActive = !!deps.context?.clineCompat?.active;
@@ -5673,6 +5736,13 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       if (cached) {
         log.info(`Chat: cache HIT model=${model} flow=stream`);
         recordRequest(model, true, 0, null);
+        // SEED-C3b: the replay obeys the caller's `stop` like a fresh turn does.
+        // This build caches the visible text + the cause; an entry from an older
+        // build (or any raw text) is re-enforced here instead of replayed
+        // verbatim. Reasoning is not prose-matched.
+        const replayed = applyStop(cached.text || '', stopSequences);
+        const cachedStop = replayed.hit ? replayed.stop : (cached.stop || null);
+        const replayedText = replayed.hit ? replayed.text : (cached.text || '');
         try {
           send({ id, object: 'chat.completion.chunk', created, model,
             choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
@@ -5680,16 +5750,18 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             send({ id, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: { reasoning_content: cached.thinking }, finish_reason: null }] });
           }
-          if (cached.text) {
+          if (replayedText) {
             send({ id, object: 'chat.completion.chunk', created, model,
-              choices: [{ index: 0, delta: { content: cached.text }, finish_reason: null }] });
+              choices: [{ index: 0, delta: { content: replayedText }, finish_reason: null }] });
           }
+          const replayChoice = { index: 0, delta: {}, finish_reason: 'stop' };
+          if (deps.context?.__messagesStopCarrier === true && cachedStop) replayChoice._windsurf_stop_sequence = cachedStop;
           send({ id, object: 'chat.completion.chunk', created, model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+            choices: [replayChoice] });
           // O1: only the include_usage opt-in gets the trailing usage frame.
           if (deps.includeUsage) {
             send({ id, object: 'chat.completion.chunk', created, model,
-              choices: [], usage: cachedUsage(messages, cached.text) });
+              choices: [], usage: cachedUsage(messages, replayedText) });
           }
           if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
         } finally {
@@ -5721,6 +5793,43 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       let accText = '';
       let accThinking = '';
       let emittedClientPayload = false;
+
+      // SEED-C3b — the caller's `stop`, enforced locally on the stream. The Devin
+      // wire has no stop field, so this route used to deliver the sentinel and
+      // everything after it. ONE gate per stream, shared by every content sink
+      // (live deltas, dedup/buffered/cache flushes, released tails, and the
+      // thinking→content promotion): a stop sequence may straddle two chunks, so
+      // the gate withholds a (maxSeqLen-1)-char tail until it can prove no
+      // sequence starts there, and after a hit it swallows everything, including
+      // later tails. `accText` keeps the FULL generated text for usage
+      // accounting; only the visible bytes are fenced.
+      const contentGate = new StopSequenceGate(stopSequences);
+      let stopMatched = null;
+      // Text actually handed to the client on the content channel (pre-hit only,
+      // plus the gate's released tail). Used as the cached text only when a stop
+      // truncated the answer, so a replay reproduces the fenced view.
+      let visibleText = '';
+      const emitVisibleContent = (out) => {
+        if (!out) return;
+        visibleText += out;
+        emittedClientPayload = true;
+        send({ id, object: 'chat.completion.chunk', created, model,
+          choices: [{ index: 0, delta: { content: out }, finish_reason: null }] });
+      };
+      const emitGatedContent = (clean) => {
+        if (!clean) return;
+        if (!contentGate.active) return emitVisibleContent(clean);
+        const { emit, hit } = contentGate.push(clean);
+        if (hit) stopMatched = contentGate.matched;
+        emitVisibleContent(emit);
+      };
+      // Release the withheld tail once the turn is over — after every prose
+      // fallback/promotion, before the terminal frames. No-op after a hit.
+      const flushContentGate = () => {
+        if (!contentGate.active || stopMatched) return;
+        const tail = contentGate.flush();
+        if (tail) emitVisibleContent(tail);
+      };
 
       // Cascade conversation pool (stream path). Opus 4.7 tool-emulated
       // requests opt in even when the global experiment toggle is off, because
@@ -5857,15 +5966,11 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         if (reasoningDedup) {
           const { emit, hold } = reasoningDedup.feed(clean);
           if (hold || !emit) return;
-          send({ id, object: 'chat.completion.chunk', created, model,
-            choices: [{ index: 0, delta: { content: emit }, finish_reason: null }] });
-          emittedClientPayload = true;
+          emitGatedContent(emit);
           return;
         }
-        // dedup off — pass through untouched
-        emittedClientPayload = true;
-        send({ id, object: 'chat.completion.chunk', created, model,
-          choices: [{ index: 0, delta: { content: clean }, finish_reason: null }] });
+        // dedup off — pass through the stop gate untouched
+        emitGatedContent(clean);
       };
       const emitExternalContent = (raw) => {
         const clean = sanitizeText(raw);
@@ -5875,9 +5980,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         // transforms, think classification, reasoning dedup, and JSON shaping.
         usedNativeReadUrlFallback = true;
         accText += clean;
-        emittedClientPayload = true;
-        send({ id, object: 'chat.completion.chunk', created, model,
-          choices: [{ index: 0, delta: { content: clean }, finish_reason: null }] });
+        emitGatedContent(clean);
       };
       const emitThinking = (clean, { accumulate = true } = {}) => {
         if (!clean) return;
@@ -6500,9 +6603,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             // below (fallback, narrative scan, cascade history).
             const settled = reasoningDedup?.settle() ?? { emit: '', suppressed: false };
             if (settled.emit) {
-              emittedClientPayload = true;
-              send({ id, object: 'chat.completion.chunk', created, model,
-                choices: [{ index: 0, delta: { content: settled.emit }, finish_reason: null }] });
+              emitGatedContent(settled.emit);
             }
             // For response_format=json_* we buffered all content — flush one
             // clean JSON payload now. extractJsonPayload strips fences and
@@ -6513,8 +6614,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (wantJson && accText && !usedNativeReadUrlFallback && !(accThinking && accText === accThinking)) {
               const cleaned = stabilizeJsonPayload(accText, messages);
               if (cleaned) {
-                send({ id, object: 'chat.completion.chunk', created, model,
-                  choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }] });
+                emitGatedContent(cleaned);
                 accText = cleaned;
               }
             }
@@ -6533,8 +6633,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             });
             if (thinkingPromotedToText) {
               log.info(`Chat[${reqId}]: thinking-only stream from non-reasoning model ${modelKey}; promoting ${accThinking.length}c thinking → content`);
-              send({ id, object: 'chat.completion.chunk', created, model,
-                choices: [{ index: 0, delta: { content: accThinking }, finish_reason: null }] });
+              emitGatedContent(accThinking);
               accText = accThinking;
               accThinking = '';
             }
@@ -6553,12 +6652,23 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               });
             }
             const finalReason = collectedToolCalls.length ? 'tool_calls' : 'stop';
+            // Release the last withheld prose tail now that every fallback and
+            // promotion has run; it must precede the terminal frames so no
+            // content can arrive after them. No-op when a stop already fired.
+            flushContentGate();
             // OpenAI spec: the finish_reason chunk carries NO usage, then a
             // separate terminal chunk has empty choices[] + usage
             // (stream_options.include_usage convention). Emitting usage on
             // both made some clients double-count billing. Drop the first.
+            const finishChoice = { index: 0, delta: {}, finish_reason: finalReason };
+            // SEED-C3a carrier on the internal Messages route only: the exact
+            // sequence that truncated the visible prose, so the Anthropic
+            // translator can report stop_reason:'stop_sequence' + stop_sequence
+            // instead of guessing from a suffix that no longer exists. A tool
+            // finish never carries it.
+            if (deps.context?.__messagesStopCarrier === true && stopMatched && finalReason === 'stop') finishChoice._windsurf_stop_sequence = stopMatched;
             send({ id, object: 'chat.completion.chunk', created, model,
-              choices: [{ index: 0, delta: {}, finish_reason: finalReason }] });
+              choices: [finishChoice] });
             {
               // Always build + record for internal billing; O1: only forward the
               // usage-only frame to the client when they opted in via
@@ -6597,7 +6707,10 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             }
             if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
             if (ckey && !collectedToolCalls.length && cacheShareable && (accText || accThinking)) {
-              cacheSet(ckey, { text: accText, thinking: accThinking });
+              // SEED-C3b: when a stop truncated the answer, cache the VISIBLE text
+              // plus the cause so the replay reproduces both; otherwise the cached
+              // text stays exactly what it was (accText = full generated text).
+              cacheSet(ckey, { text: stopMatched ? visibleText : accText, thinking: accThinking, stop: stopMatched });
             }
             return;
           } catch (err) {
@@ -6862,11 +6975,11 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         if (emittedClientPayload) {
           failureStage('dedup-tail', () => {
             const heldTail = reasoningDedup?.release() ?? '';
-            if (heldTail) {
-              send({ id, object: 'chat.completion.chunk', created, model,
-                choices: [{ index: 0, delta: { content: heldTail }, finish_reason: null }] });
-            }
+            if (heldTail) emitGatedContent(heldTail);
           });
+        }
+        failureStage('content-gate-tail', () => flushContentGate());
+        if (emittedClientPayload) {
           // Keep the existing synthetic-finish contract on internal routes.
           // Suppress its local DONE write; the independent stage below owns it.
           failureStage('finish-frame', () => {

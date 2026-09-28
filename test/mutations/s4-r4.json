@@ -39,5 +39,5 @@
       "expectCaught": true
     }
   ],
-  "expectBaselinePass": 8
+  "expectBaselinePass": 9
 }

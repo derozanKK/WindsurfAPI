@@ -199,8 +199,15 @@ async function main() {
     log.warn('################################################################');
     log.warn('#           已为你自动生成密钥(请截图妥善保存)              #');
     log.warn('################################################################');
-    if (c.DASHBOARD_PASSWORD) log.warn(`  面板登录密码 (DASHBOARD_PASSWORD): ${c.DASHBOARD_PASSWORD}`);
-    if (c.API_KEY) log.warn(`  网关调用密钥 (API_KEY):            ${c.API_KEY}`);
+    // D6-LOGS (audit 2026-09-22): only these two lines carry generated credentials,
+    // and `log.warn` is patched by dashboard/logger.js to copy every call into the
+    // dashboard ring buffer, the live SSE subscribers and logs/{app,error}-<date>.jsonl
+    // — sinks that outlive the session and travel into bug reports, container logs and
+    // backups. The first-run display exists for the operator in front of the console,
+    // so it goes straight to console.warn; the banner, the .env path and the failure
+    // explanation below stay on the logger, where operators expect to find them.
+    if (c.DASHBOARD_PASSWORD) console.warn(`  面板登录密码 (DASHBOARD_PASSWORD): ${c.DASHBOARD_PASSWORD}`);
+    if (c.API_KEY) console.warn(`  网关调用密钥 (API_KEY):            ${c.API_KEY}`);
     if (c.envPath) log.warn(`  已写入 ${c.envPath} — 下次启动沿用,无需重设。`);
     else log.warn(`  (写入 .env 失败${c.persistError ? ': ' + c.persistError : ''} — 本次有效,重启会重新生成)`);
     log.warn('################################################################');

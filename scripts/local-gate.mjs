@@ -63,6 +63,7 @@ export async function runGate(root = process.cwd()) {
   delete env.FORCE_COLOR; delete env.NODE_TEST_CONTEXT;
   const steps = [
     ['spec-static-check', process.execPath, ['scripts/spec-static-check.mjs']],
+    ['spec-baseline-check', process.execPath, ['scripts/spec-baseline-check.mjs']],
     ['secret-scan', process.execPath, ['scripts/secret-scan.mjs']],
     ['test:release', process.execPath, [npmCli, 'run', '--silent', 'test:release']],
     ['git diff --check', 'git', ['diff', '--check']],
@@ -74,7 +75,7 @@ export async function runGate(root = process.cwd()) {
     const result = await execute(command, args, root, env);
     // Git uses exit 2 for whitespace errors. Only evidence-producing scripts
     // reserve that status for untrustworthy evidence; preserve every raw code.
-    result.untrustworthy ||= result.code === 2 && ['spec-static-check', 'test:release'].includes(name);
+    result.untrustworthy ||= result.code === 2 && ['spec-static-check', 'spec-baseline-check', 'test:release'].includes(name);
     let detail = result.error || '';
     if (name === 'test:release') {
       try {
@@ -91,7 +92,8 @@ export async function runGate(root = process.cwd()) {
   }
   console.log('\n=== Local gate summary ===');
   for (const row of results) console.log(`${row.code === 0 ? 'PASS' : 'FAIL'} ${row.name} exit=${row.code}${row.detail ? ` — ${row.detail}` : ''}`);
-  console.log('SKIP mutations — not part of the incremental gate; run the Linux full-gate recipe separately');
+  console.log('SKIP mutation EXECUTION — this incremental gate checks spec shape, anchors and baseline'
+    + ' values, but does not run the mutants themselves; the Linux full-gate recipe runs the sweep.');
   const code = results.some(row => row.untrustworthy) ? 2 : results.some(row => row.code !== 0) ? 1 : 0;
   console.log(`INCREMENTAL GATE: ${code ? 'FAIL' : 'PASS'} exit=${code}`);
   return code;

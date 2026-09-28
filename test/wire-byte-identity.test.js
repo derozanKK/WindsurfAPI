@@ -17,6 +17,18 @@
 // works. When neither exists the test SKIPS with a reason instead of passing
 // quietly — a gate that cannot run must never look green.
 //
+// The base is IDENTIFIED, not assumed (2026-09-22, D-WIRE-BASE). A directory holding
+// the right two filenames is not a released revision, and the recorded re-check of this
+// gate passed while its stdout named no revision at all: WIRE_BASE_TREE happened to
+// point at v3.9.37, and the stale `.claude/worktrees/wire-base` fallback (0c35545, three
+// releases back) was one unset variable away from being the compared tree — the log
+// would have reported a byte difference, if any, without ever naming what it compared
+// against. So before importing the base modules this file resolves the expected release
+// from the tested repository's annotated tags, measures the base checkout's HEAD with
+// Git, and refuses to compare unless they match, the base is not the tested commit, and
+// the base's src/ tree is clean. The resolved identity is printed as one `WIRE_PROVENANCE`
+// line — a comparison whose base cannot be named in the output is not evidence.
+//
 // WHAT THIS DOES NOT PROVE (2026-09-17 review, protocol lens — do not read this
 // gate as "the wire is correct"):
 //   • it compares the protobuf request body only; not HTTP/Connect framing, not the
@@ -37,6 +49,8 @@ import { syncBuiltinESMExports } from 'node:module';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'node:test';
+import { selectBase } from '../scripts/wire-base.mjs';
+import { absentBase, formatProvenance, reportProvenanceFailure, resolveWireProvenance } from './wire-provenance.js';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..');
 const EXPECTED_COMPARISONS = 270;
@@ -57,11 +71,21 @@ function findBaseTree() {
 
 const BASE = findBaseTree();
 const SKIP = 'no pre-change tree to compare against — set WIRE_BASE_TREE to a checkout of the last release';
-// CI sets this: there the comparison base is always materialised, so a missing
-// one is a broken gate and must fail loudly instead of skipping green.
-if (!BASE && process.env.WIRE_BASE_REQUIRED === '1') {
-  throw new Error(`${SKIP} (WIRE_BASE_REQUIRED=1)`);
+// Resolved — and enforced — in this child, before any base module is imported. See
+// test/wire-provenance.js for the rules and test/wire-provenance.test.js for them
+// exercised without a real Git.
+let PROVENANCE;
+try {
+  PROVENANCE = BASE
+    ? resolveWireProvenance({
+      root: ROOT, baseTree: BASE, env: process.env, selectBase, comparisons: EXPECTED_COMPARISONS,
+    })
+    : absentBase({ root: ROOT, reason: SKIP, env: process.env, comparisons: EXPECTED_COMPARISONS });
+} catch (error) {
+  reportProvenanceFailure(error);
+  throw error;
 }
+process.stdout.write(formatProvenance(PROVENANCE) + '\n');
 
 async function load(root) {
   const file = name => pathToFileURL(resolve(root, 'src', name)).href;
@@ -135,7 +159,7 @@ function build(api, messages, env = {}, nativeToolCall = true) {
   }
 }
 
-test('the default path emits the same complete request bytes as the last release', { skip: BASE ? false : SKIP }, async () => {
+test('the default path emits the same complete request bytes as the last release', { skip: PROVENANCE.skipped ? PROVENANCE.reason : false }, async () => {
   const current = await load(ROOT);
   const previous = await load(BASE);
   let compared = 0;
@@ -152,6 +176,11 @@ test('the default path emits the same complete request bytes as the last release
       }
     }
   }
+  // What this run actually measured, next to what it claimed it would: the identity
+  // line above is only evidence together with a count of the comparisons it covers.
+  process.stdout.write('WIRE_PROVENANCE_COMPARED ' + JSON.stringify({
+    compared, expected: EXPECTED_COMPARISONS, base_head: PROVENANCE.baseHead ?? null,
+  }) + '\n');
   // A shrunken matrix must not read as a pass.
   assert.equal(compared, EXPECTED_COMPARISONS, 'the comparison matrix changed size; update the expectation deliberately');
 });

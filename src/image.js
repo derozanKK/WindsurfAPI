@@ -73,7 +73,14 @@ function decodePixels(buf) {
   }
   // JPEG magic: FF D8
   if (b[0] === 0xff && b[1] === 0xd8) {
-    const img = jpegDecode(buf, { useTArray: true, maxResolutionInMP: 200, maxMemoryUsageInMB: 512 });
+    // Ceiling aligned with IMAGE_MAX_DECODE_PIXELS: the decoder is the backstop for a
+    // frame whose header the module could not classify (truncated/unusual SOF), and a
+    // looser number here would let exactly those frames through. 512 MB memory guard kept.
+    const img = jpegDecode(buf, {
+      useTArray: true,
+      maxResolutionInMP: IMAGE_MAX_DECODE_PIXELS / 1_000_000,
+      maxMemoryUsageInMB: 512,
+    });
     return { width: img.width, height: img.height, data: img.data };
   }
   throw new Error('unsupported image format for re-encode (only PNG/JPEG)');
@@ -148,6 +155,17 @@ export async function shrinkPixels(base64, opts = {}) {
     const headerDims = readImageDimensions(base64);
     if (headerDims && headerDims.width * headerDims.height > IMAGE_MAX_DECODE_PIXELS) {
       return { ok: false, error: `image ${headerDims.width}x${headerDims.height} exceeds decode pixel budget` };
+    }
+    // The header read above is deliberately cheap (256 KiB for JPEG), so a SOF that
+    // sits behind a large EXIF/ICC/filler run is invisible to it and the guard above
+    // is skipped entirely. Re-check the dimensions on the FULL decoded buffer, which
+    // is the same ceiling applied at the same boundary — just over every byte we
+    // already hold, not a window of it. readJpegDimensions allocates nothing.
+    if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8) {
+      const jpegDims = readJpegDimensions(buf);
+      if (jpegDims && jpegDims.width * jpegDims.height > IMAGE_MAX_DECODE_PIXELS) {
+        return { ok: false, error: `image ${jpegDims.width}x${jpegDims.height} exceeds decode pixel budget` };
+      }
     }
     const original = decodePixels(buf); // { width, height, data:RGBA }
     const srcW = original.width;
@@ -509,44 +527,137 @@ export async function pushImage(images, image) {
   return out;
 }
 
-export function fetchImageUrl(url, timeoutMs = 8000, _depth = 0) {
+// One absolute wall-clock budget for a whole image fetch: armed once by the root
+// call, shared by every redirect hop, and cleared on settlement. The per-hop
+// `timeout` option stays what node documents it as — a socket-INACTIVITY guard —
+// so a chain of 7 s redirects or a body trickling one byte at a time can no longer
+// hold the fetch open for minutes (each hop used to receive the full budget again).
+//
+// Every handle this helper owns (the active request/response) is tracked in `ctx`,
+// so settlement destroys them and drops the helper's own listeners exactly once,
+// whether the fetch ends by deadline, byte cap, bad status/MIME, transport error or
+// success. Late events after settlement neither resolve again nor start a request.
+const IMAGE_FETCH_TIMEOUT_MS = 8000;
+
+// Remove the listeners this hop registered, so a settled (or abandoned) hop leaves
+// nothing behind that can fire later.
+function detach(emitter, listeners) {
+  if (!emitter) return;
+  for (const [event, fn] of listeners) emitter.removeListener(event, fn);
+  listeners.length = 0;
+}
+
+export function fetchImageUrl(url, timeoutMs = IMAGE_FETCH_TIMEOUT_MS, _depth = 0, _ctx = null) {
   if (_depth > MAX_REDIRECTS) return Promise.reject(new Error('Too many image redirects'));
-  validateImageUrl(url);
+  if (_ctx) return fetchImageHop(url, _depth, _ctx);
 
+  // Root call: one timer, one settlement, one set of owned handles.
+  const ctx = { done: false, timer: null, handles: new Set(), timeoutMs };
+  const promise = new Promise((resolve, reject) => {
+    const settle = (error, value) => {
+      if (ctx.done) return;
+      ctx.done = true;
+      if (ctx.timer) { clearTimeout(ctx.timer); ctx.timer = null; }
+      for (const handle of ctx.handles) {
+        detach(handle.res, handle.resListeners);
+        detach(handle.req, handle.reqListeners);
+        if (!handle.res?.destroyed) handle.res?.destroy();
+        if (!handle.req?.destroyed) handle.req?.destroy();
+      }
+      ctx.handles.clear();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    ctx.timer = setTimeout(
+      () => settle(new Error(`Image fetch deadline exceeded (${timeoutMs} ms)`)),
+      timeoutMs,
+    );
+    if (typeof ctx.timer.unref === 'function') ctx.timer.unref();
+    fetchImageHop(url, _depth, ctx).then(
+      (value) => settle(null, value),
+      (error) => settle(error),
+    );
+  });
+  return promise;
+}
+
+function fetchImageHop(url, depth, ctx) {
   return new Promise((resolve, reject) => {
-    let settled = false;
-    const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
+    if (ctx.done) { reject(new Error('Image fetch deadline exceeded')); return; }
 
-    const mod = url.startsWith('https') ? https : http;
-    const req = mod.get(url, { timeout: timeoutMs, headers: { 'Accept': 'image/*' }, lookup: safeLookup }, (res) => {
+    let parsed;
+    try { parsed = validateImageUrl(url); } catch (e) { reject(e); return; }
+
+    const handle = { req: null, res: null, reqListeners: [], resListeners: [] };
+    ctx.handles.add(handle);
+    let hopSettled = false;
+    const finish = (error, value) => {
+      if (hopSettled) return;
+      hopSettled = true;
+      detach(handle.res, handle.resListeners);
+      detach(handle.req, handle.reqListeners);
+      ctx.handles.delete(handle);
+      if (error) {
+        // A failed hop aborts whatever it still owns: no request/response may stay
+        // live (or keep streaming) after the fetch it belonged to has failed.
+        if (!handle.res?.destroyed) handle.res?.destroy();
+        if (!handle.req?.destroyed) handle.req?.destroy();
+        reject(error);
+      } else {
+        resolve(value);
+      }
+    };
+    const on = (emitter, list, event, fn) => {
+      emitter.on(event, fn);
+      list.push([event, fn]);
+    };
+
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const req = mod.get(parsed.href, { timeout: ctx.timeoutMs ?? IMAGE_FETCH_TIMEOUT_MS, headers: { 'Accept': 'image/*' }, lookup: safeLookup }, (res) => {
+      handle.res = res;
+      if (ctx.done) { res.destroy(); return; }
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        return fetchImageUrl(res.headers.location, timeoutMs, _depth + 1).then(
-          v => done(resolve, v), e => done(reject, e)
+        // Destroy the redirect body instead of draining it: an endless 3xx response
+        // must not keep a socket (or its bytes) alive after we have moved on.
+        detach(res, handle.resListeners);
+        ctx.handles.delete(handle);
+        handle.res = null;
+        res.destroy();
+        fetchImageUrl(res.headers.location, ctx.timeoutMs, depth + 1, ctx).then(
+          (v) => finish(null, v), (e) => finish(e),
         );
+        return;
       }
       if (res.statusCode !== 200) {
         res.resume();
-        return done(reject, new Error(`Image fetch HTTP ${res.statusCode}`));
+        finish(new Error(`Image fetch HTTP ${res.statusCode}`));
+        return;
       }
       const mime = (res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
       if (!MIME_OK.has(mime)) {
         res.resume();
-        return done(reject, new Error(`Unsupported image type: ${mime}`));
+        finish(new Error(`Unsupported image type: ${mime}`));
+        return;
       }
       const chunks = [];
       let size = 0;
-      res.on('data', (d) => {
-        if (settled) return;
+      on(res, handle.resListeners, 'data', (d) => {
+        if (hopSettled || ctx.done) return;
         size += d.length;
-        if (size > MAX_SIZE) { res.destroy(); done(reject, new Error(`Image exceeds ${MAX_SIZE} bytes`)); }
-        else chunks.push(d);
+        if (size > MAX_SIZE) {
+          res.destroy();
+          finish(new Error(`Image exceeds ${MAX_SIZE} bytes`));
+        } else chunks.push(d);
       });
-      res.on('end', () => done(resolve, { base64_data: Buffer.concat(chunks).toString('base64'), mime_type: mime }));
-      res.on('error', (e) => done(reject, e));
+      on(res, handle.resListeners, 'end', () => {
+        if (hopSettled || ctx.done) return;
+        finish(null, { base64_data: Buffer.concat(chunks).toString('base64'), mime_type: mime });
+      });
+      on(res, handle.resListeners, 'error', (e) => finish(e));
     });
-    req.on('error', (e) => done(reject, e));
-    req.on('timeout', () => { req.destroy(); done(reject, new Error('Image fetch timeout')); });
+    handle.req = req;
+    on(req, handle.reqListeners, 'error', (e) => finish(e));
+    on(req, handle.reqListeners, 'timeout', () => finish(new Error('Image fetch timeout')));
   });
 }
 

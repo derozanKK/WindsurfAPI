@@ -44,6 +44,10 @@ const SCRYPT_KEYLEN = 32;             // AES-256
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
 const ALGO = 'aes-256-gcm';
 const FILE_VERSION = 1;
+// AES-GCM's tag is fixed at 128 bits by this format's writer (`getAuthTag()`), and the
+// read path must require exactly that: node otherwise accepts any shorter tag present in
+// the file, which turns a truncation into an accepted credential rather than a tamper.
+const GCM_TAG_BYTES = 16;
 
 // Decrypt-failure signal. A GCM auth-tag mismatch means the master key is wrong
 // (rotated/typo'd) or the record is tampered — and because every record is
@@ -707,8 +711,22 @@ export function getCredential(email, env = process.env) {
 
   try {
     const aesKey = deriveKey(masterKey, Buffer.from(rec.salt, 'hex'));
-    const decipher = createDecipheriv(ALGO, aesKey, Buffer.from(rec.iv, 'hex'));
-    decipher.setAuthTag(Buffer.from(rec.tag, 'hex'));
+    // GCM's authentication strength is the tag length, and the writer always stores
+    // the full 128-bit tag (`getAuthTag()`). Without an explicit `authTagLength`,
+    // node accepts a SHORTER tag from the file and authenticates against it — so a
+    // store whose tag was truncated to 4 bytes still returned the password, with only
+    // a DEP0182 warning, and a tamper that shortens the tag was not detected. The
+    // length is part of this file format, so it is checked here rather than inferred.
+    const tagHex = rec.tag;
+    if (typeof tagHex !== 'string' || tagHex.length !== GCM_TAG_BYTES * 2) {
+      throw new Error(`credential record tag is not the ${GCM_TAG_BYTES}-byte GCM tag this format writes`);
+    }
+    const tag = Buffer.from(tagHex, 'hex');
+    if (tag.length !== GCM_TAG_BYTES) {
+      throw new Error(`credential record tag is not the ${GCM_TAG_BYTES}-byte GCM tag this format writes`);
+    }
+    const decipher = createDecipheriv(ALGO, aesKey, Buffer.from(rec.iv, 'hex'), { authTagLength: GCM_TAG_BYTES });
+    decipher.setAuthTag(tag);
     const pt = Buffer.concat([decipher.update(Buffer.from(rec.ct, 'hex')), decipher.final()]);
     // A successful decrypt proves the key is right — clear any stale alarm.
     if (_decryptFailures > 0) { _decryptFailures = 0; _lastDecryptError = null; }

@@ -21,23 +21,27 @@ describe('normalizeStop', () => {
 
 describe('applyStop (non-streaming truncation)', () => {
   it('truncates at the stop sequence and drops it', () => {
-    assert.deepEqual(applyStop('hello END world', 'END'), { text: 'hello ', hit: true });
+    assert.deepEqual(applyStop('hello END world', 'END'), { text: 'hello ', hit: true, stop: 'END' });
   });
   it('no match → text unchanged, hit false', () => {
-    assert.deepEqual(applyStop('hello world', 'END'), { text: 'hello world', hit: false });
+    assert.deepEqual(applyStop('hello world', 'END'), { text: 'hello world', hit: false, stop: null });
   });
   it('earliest of several sequences wins', () => {
-    assert.deepEqual(applyStop('aXbYc', ['Y', 'X']), { text: 'a', hit: true });
+    assert.deepEqual(applyStop('aXbYc', ['Y', 'X']), { text: 'a', hit: true, stop: 'X' });
+  });
+  it('a tie is won by the earlier entry in the caller list', () => {
+    // 'XY' and 'X' both start at index 2; the first declared sequence wins.
+    assert.deepEqual(applyStop('abXYc', ['XY', 'X']), { text: 'ab', hit: true, stop: 'XY' });
   });
   it('no stop configured → passthrough', () => {
-    assert.deepEqual(applyStop('anything', null), { text: 'anything', hit: false });
-    assert.deepEqual(applyStop('anything', []), { text: 'anything', hit: false });
+    assert.deepEqual(applyStop('anything', null), { text: 'anything', hit: false, stop: null });
+    assert.deepEqual(applyStop('anything', []), { text: 'anything', hit: false, stop: null });
   });
   it('empty text is safe', () => {
-    assert.deepEqual(applyStop('', 'END'), { text: '', hit: false });
+    assert.deepEqual(applyStop('', 'END'), { text: '', hit: false, stop: null });
   });
   it('stop at the very start → empty output, hit', () => {
-    assert.deepEqual(applyStop('ENDrest', 'END'), { text: '', hit: true });
+    assert.deepEqual(applyStop('ENDrest', 'END'), { text: '', hit: true, stop: 'END' });
   });
 });
 
@@ -63,13 +67,23 @@ describe('StopSequenceGate (streaming)', () => {
     let r = g.push('abcST');
     assert.equal(r.hit, false);
     assert.equal(r.emit, 'ab');
+    assert.equal(g.matched, null, 'no cause before a hit');
     // next chunk "OPxyz" completes "STOP" → emit the prefix "c", hit=true.
     r = g.push('OPxyz');
     assert.equal(r.hit, true);
     assert.equal(r.emit, 'c');
+    assert.equal(g.matched, 'STOP', 'the winning sequence is retained for the caller');
     // after a hit, nothing more escapes.
     assert.deepEqual(g.push('more'), { emit: '', hit: false });
     assert.equal(g.flush(), '');
+  });
+
+  it('retains the earliest-position winner when two sequences are present', () => {
+    const g = new StopSequenceGate(['SECOND', 'FIRST']);
+    const r = g.push('aFIRSTbSECOND');
+    assert.equal(r.hit, true);
+    assert.equal(r.emit, 'a');
+    assert.equal(g.matched, 'FIRST');
   });
 
   it('emits the prefix before an in-chunk stop and suppresses the rest', () => {

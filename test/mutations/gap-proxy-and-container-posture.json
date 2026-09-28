@@ -1,0 +1,37 @@
+{
+  "tests": [
+    "test/https-proxy-policy.test.js",
+    "test/docker-script-packaging.test.js"
+  ],
+  "expectBaselinePass": 16,
+  "mutations": [
+    {
+      "name": "G-7: a missing TLS key no longer stops the helper from starting",
+      "file": "https-proxy.js",
+      "anchor": "  key: readFileSync('./localhost+3-key.pem'),\n  cert: readFileSync('./localhost+3.pem'),",
+      "replacement": "  key: (() => { try { return readFileSync('./localhost+3-key.pem'); } catch { return Buffer.from(''); } })(),\n  cert: (() => { try { return readFileSync('./localhost+3.pem'); } catch { return Buffer.from(''); } })(),",
+      "expectCaught": true
+    },
+    {
+      "name": "G-8: the image silently drops to a non-root USER",
+      "file": "Dockerfile",
+      "anchor": "EXPOSE 3003",
+      "replacement": "EXPOSE 3003\nUSER node",
+      "expectCaught": true
+    },
+    {
+      "name": "G-8: compose silently overrides the container user",
+      "file": "docker-compose.yml",
+      "anchor": "    image: ghcr.io/dwgx/windsurf-api:latest",
+      "replacement": "    image: ghcr.io/dwgx/windsurf-api:latest\n    user: \"1000:1000\"",
+      "expectCaught": true
+    },
+    {
+      "name": "G-8: the host docker socket is mounted by default",
+      "file": "docker-compose.yml",
+      "anchor": "    image: ghcr.io/dwgx/windsurf-api:latest",
+      "replacement": "    image: ghcr.io/dwgx/windsurf-api:latest\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock",
+      "expectCaught": true
+    }
+  ]
+}

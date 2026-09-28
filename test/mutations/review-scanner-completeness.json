@@ -1,0 +1,36 @@
+{
+  "tests": [
+    "test/review-secret-scan.test.js"
+  ],
+  "expectBaselinePass": 4,
+  "mutations": [
+    {
+      "name": "Pre-marking the repository root hides an internal root link",
+      "file": "scripts/secret-scan.mjs",
+      "anchor": "  const seen = new Set([resolveInsideRepo(abs)]);",
+      "replacement": "  const seen = new Set([rootReal]);",
+      "expectCaught": true
+    },
+    {
+      "name": "Two-dot-prefixed children are wrongly treated as parents",
+      "file": "scripts/secret-scan.mjs",
+      "anchor": "  if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) return null;",
+      "replacement": "  if (rel.startsWith('..') || isAbsolute(rel)) return null;",
+      "expectCaught": true
+    },
+    {
+      "name": "Unreadable enumerated files are silently discarded",
+      "file": "scripts/secret-scan.mjs",
+      "anchor": "        refuseOutside(toRepoPath(full), full);",
+      "replacement": "        if (dirent.isSymbolicLink()) refuseOutside(toRepoPath(full), full);\n        continue;",
+      "expectCaught": true
+    },
+    {
+      "name": "Explicit files disappearing during the scan are treated as deleted tracked files",
+      "file": "scripts/secret-scan.mjs",
+      "anchor": "    if (args.length) {",
+      "replacement": "    if (false) {",
+      "expectCaught": true
+    }
+  ]
+}

@@ -13,6 +13,7 @@
  * gap — the mapping is complete and ready for a paid entitlement.
  */
 
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { log } from './config.js';
 
@@ -390,18 +391,39 @@ export function resolveConnectSelector(model, {
   // Unmapped: degrade to the always-available free selector, but make it
   // OBSERVABLE (one-time per distinct model) so a caller ignoring mapped:false
   // still gets an operator signal that a paid model was downgraded to free.
-  if (warnOnFallback && !degradeWarned.has(raw)) {
-    degradeWarned.add(raw);
-    log.warn(
-      `[devin-connect] unmapped model "${raw}" not in catalog — degrading to `
-      + `${FREE_TIER_SELECTOR} (paid request downgraded to free tier)`,
-    );
-  }
+  if (warnOnFallback) warnDegradeOnce(raw);
   return { selector: FREE_TIER_SELECTOR, mapped: false };
 }
 
 // Tracks model names we've already warned about so the degrade signal fires
 // once per distinct name rather than on every request (avoids log flooding).
+//
+// The name is CALLER-CONTROLLED and this record is process-lifetime, and the
+// resolver runs BEFORE the strict-model 400 in handlers/chat.js — so a rejected
+// request still left its raw string here until restart: one unbounded entry per
+// distinct junk name (audit 2026-09-22, D-SCALE-001, reproduced — 99 rejected
+// requests retained 99 raw names). Two bounds close that: the key is a SHA-256
+// digest (fixed 64 chars, so retained BYTES are bounded as well as cardinality)
+// and the set is a FIFO cache — a duplicate hit does NOT refresh its position, so
+// once the cap is exceeded the oldest insertion is evicted and may warn again.
+// The warning text is unchanged: it still names the model for the operator, that
+// string is just no longer the stored key.
+const DEGRADE_WARNED_MAX = 1024;
 const degradeWarned = new Set();
+
+/** Emit the one-time unmapped-model warning, keeping its record bounded (FIFO). */
+function warnDegradeOnce(raw) {
+  const key = createHash('sha256').update(raw).digest('hex');
+  if (degradeWarned.has(key)) return;
+  degradeWarned.add(key);
+  // Set iteration order is insertion order, so the first key is the oldest.
+  if (degradeWarned.size > DEGRADE_WARNED_MAX) {
+    degradeWarned.delete(degradeWarned.values().next().value);
+  }
+  log.warn(
+    `[devin-connect] unmapped model "${raw}" not in catalog — degrading to `
+    + `${FREE_TIER_SELECTOR} (paid request downgraded to free tier)`,
+  );
+}
 
 export const __testing = { SELECTOR_MAP, CATALOG_SELECTORS, degradeWarned, _liveSelectors };

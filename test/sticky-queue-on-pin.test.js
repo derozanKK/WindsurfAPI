@@ -319,6 +319,7 @@ describe('waiting is bounded by the account\'s own stated recovery', () => {
 
 describe('end to end: the caller stays on its own account', () => {
   it('with the knob ON, a blocked pin is served by the SAME account after the window frees', async () => {
+    const chat = await import('../src/handlers/chat.js');
     const A = seed('e2e-a');
     const B = seed('e2e-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
@@ -328,7 +329,6 @@ describe('end to end: the caller stays on its own account', () => {
     // Free the window shortly, as a real 60s RPM window would.
     setTimeout(() => unblock(A), 150);
 
-    const chat = await import('../src/handlers/chat.js');
     const acct = await chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR);
 
     assert.ok(acct, 'the caller must be served');
@@ -341,6 +341,7 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('with the knob OFF, the same scenario rotates to the substitute (default unchanged)', async () => {
+    const chat = await import('../src/handlers/chat.js');
     const A = seed('off-a');
     const B = seed('off-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
@@ -349,7 +350,6 @@ describe('end to end: the caller stays on its own account', () => {
 
     setTimeout(() => unblock(A), 150);
 
-    const chat = await import('../src/handlers/chat.js');
     const acct = await chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR);
 
     assert.ok(acct, 'the caller must still be served');
@@ -359,13 +359,13 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('a wait longer than the budget gives up and rotates rather than stalling', async () => {
+    const chat = await import('../src/handlers/chat.js');
     const A = seed('give-a');
     const B = seed('give-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
     blockOnRpm(A); // never freed
     setBudget(300);
 
-    const chat = await import('../src/handlers/chat.js');
     const t0 = Date.now();
     const acct = await chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR);
     const elapsed = Date.now() - t0;
@@ -378,13 +378,13 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('a quota dry-well rotates IMMEDIATELY instead of burning the budget', async () => {
+    const chat = await import('../src/handlers/chat.js');
     const A = seed('dry-a');
     const B = seed('dry-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
     auth.markQuotaExhausted(A.apiKey, 3 * 60 * 60 * 1000);
     setBudget(2000);
 
-    const chat = await import('../src/handlers/chat.js');
     const t0 = Date.now();
     const acct = await chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR);
     const elapsed = Date.now() - t0;
@@ -396,6 +396,7 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('a pin already burned this request is not waited on', async () => {
+    const chat = await import('../src/handlers/chat.js');
     // tried carries the keys this request has already failed on. Waiting for one of them
     // is waiting for a known-bad account.
     const A = seed('burn-a');
@@ -405,7 +406,6 @@ describe('end to end: the caller stays on its own account', () => {
     setBudget(2000);
     setTimeout(() => unblock(A), 100);
 
-    const chat = await import('../src/handlers/chat.js');
     const t0 = Date.now();
     const acct = await chat.__testing.waitForAccount([A.apiKey], null, 5000, null, CALLER, SELECTOR);
     const elapsed = Date.now() - t0;
@@ -416,6 +416,7 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('an aborted request stops waiting', async () => {
+    const chat = await import('../src/handlers/chat.js');
     const A = seed('abort-a');
     seed('abort-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
@@ -428,7 +429,6 @@ describe('end to end: the caller stays on its own account', () => {
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 120);
 
-    const chat = await import('../src/handlers/chat.js');
     const t0 = Date.now();
     const acct = await chat.__testing.waitForAccount([], ac.signal, 5000, null, CALLER, SELECTOR);
     const elapsed = Date.now() - t0;
@@ -438,6 +438,7 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('waits out a SELECTOR-scoped cooldown, not just an account-wide one', async () => {
+    const chat = await import('../src/handlers/chat.js');
     // The modelKey=null trap, and the reason this has to be an end-to-end assertion: the
     // unit test above proves getAccountAvailability can SEE a selector cooldown when asked
     // with the selector. It does not prove the wait loop asks that way. Measured: changing
@@ -455,7 +456,6 @@ describe('end to end: the caller stays on its own account', () => {
       + 'mutation silent');
     setBudget(4000);
 
-    const chat = await import('../src/handlers/chat.js');
     const acct = await chat.__testing.waitForAccount([], null, 8000, null, CALLER, SELECTOR);
 
     assert.ok(acct, 'the caller must be served');
@@ -468,6 +468,7 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('the WAIT LOOP itself does not inflate hit/miss stats', async () => {
+    const chat = await import('../src/handlers/chat.js');
     // The three peekStickyBinding tests above verify the FUNCTION. They do not verify that
     // the wait loop calls it: swapping the loop's peek for the mutating getStickyBinding
     // left all of them green (measured). This asserts the use site instead — one queued
@@ -480,7 +481,6 @@ describe('end to end: the caller stays on its own account', () => {
     setBudget(5000);
 
     const before = sticky.getStickyStats();
-    const chat = await import('../src/handlers/chat.js');
     const acct = await chat.__testing.waitForAccount([], null, 8000, null, CALLER, SELECTOR);
     assert.ok(acct && acct.id === A.id, 'precondition: the wait must have succeeded on the pin');
     auth.releaseAccountById(acct.id);
@@ -499,10 +499,10 @@ describe('end to end: the caller stays on its own account', () => {
   });
 
   it('a caller with no pin is unaffected by the knob', async () => {
+    const chat = await import('../src/handlers/chat.js');
     const A = seed('nopin-e2e');
     setBudget(3000);
 
-    const chat = await import('../src/handlers/chat.js');
     const t0 = Date.now();
     const acct = await chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR);
     const elapsed = Date.now() - t0;

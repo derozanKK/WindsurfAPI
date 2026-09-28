@@ -1,0 +1,37 @@
+{
+  "tests": [
+    "test/devin-connect-credentials.test.js",
+    "test/review-credential-tag.test.js"
+  ],
+  "expectBaselinePass": 21,
+  "mutations": [
+    {
+      "name": "The explicit encoded-tag shape refusal is removed (other layers still reject short tags)",
+      "file": "src/devin-connect-credentials.js",
+      "anchor": "    if (typeof tagHex !== 'string' || tagHex.length !== GCM_TAG_BYTES * 2) {",
+      "replacement": "    if (false) {",
+      "expectCaught": true
+    },
+    {
+      "name": "The format tag-size constant changes and breaks valid-v1 round trips",
+      "file": "src/devin-connect-credentials.js",
+      "anchor": "const GCM_TAG_BYTES = 16;",
+      "replacement": "const GCM_TAG_BYTES = 4;",
+      "expectCaught": true
+    },
+    {
+      "name": "The decoded-tag shape refusal is removed (crypto still enforces tag length)",
+      "file": "src/devin-connect-credentials.js",
+      "anchor": "    if (tag.length !== GCM_TAG_BYTES) {",
+      "replacement": "    if (false) {",
+      "expectCaught": true
+    },
+    {
+      "name": "All fixed-length barriers removed: truncated tags return plaintext again",
+      "file": "src/devin-connect-credentials.js",
+      "anchor": "    const tagHex = rec.tag;\n    if (typeof tagHex !== 'string' || tagHex.length !== GCM_TAG_BYTES * 2) {\n      throw new Error(`credential record tag is not the ${GCM_TAG_BYTES}-byte GCM tag this format writes`);\n    }\n    const tag = Buffer.from(tagHex, 'hex');\n    if (tag.length !== GCM_TAG_BYTES) {\n      throw new Error(`credential record tag is not the ${GCM_TAG_BYTES}-byte GCM tag this format writes`);\n    }\n    const decipher = createDecipheriv(ALGO, aesKey, Buffer.from(rec.iv, 'hex'), { authTagLength: GCM_TAG_BYTES });\n    decipher.setAuthTag(tag);\n",
+      "replacement": "    const decipher = createDecipheriv(ALGO, aesKey, Buffer.from(rec.iv, 'hex'));\n    decipher.setAuthTag(Buffer.from(rec.tag, 'hex'));\n",
+      "expectCaught": true
+    }
+  ]
+}

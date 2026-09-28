@@ -92,13 +92,14 @@ for (const s of specs) {
 
   // A number is required. `undefined` means nothing pins the count; a string would pass
   // a loose `==` and fail the strict comparison mutate-verify does.
-  if (typeof spec.expectBaselinePass !== 'number') {
-    problems.push({
-      spec: s.name,
-      kind: 'baseline-shape',
-      detail: `expectBaselinePass must be a number, got ${JSON.stringify(spec.expectBaselinePass)}`,
-    });
+  if (!Number.isSafeInteger(spec.expectBaselinePass) || spec.expectBaselinePass <= 0) {
+    problems.push({ spec: s.name, kind: 'baseline-shape',
+      detail: 'expectBaselinePass must be a positive safe integer' });
   }
+  // Counting it()/test() source text is not a lower bound: comments, strings and
+  // conditional registration can inflate it; loops and aliases can reduce it.
+  // Numeric drift is decided by the mandatory structured baseline execution step,
+  // not by pretending this static anchor/schema checker executed any tests.
 
   if (!Array.isArray(spec.mutations) || spec.mutations.length === 0) {
     problems.push({ spec: s.name, kind: 'shape', detail: '`mutations` must be a non-empty array' });
@@ -139,7 +140,7 @@ console.log(`${C.bold}spec-static-check${C.reset} ${C.dim}(no tests executed)${C
 console.log(`  specs: ${specs.length}   mutations: ${mutationCount}`);
 
 if (!problems.length) {
-  console.log(`  ${C.green}✓${C.reset} anchors unique, specs well-formed, baselines are numbers`);
+  console.log(`  ${C.green}✓${C.reset} anchors unique, specs well-formed, baselines are positive integers`);
   process.exit(0);
 }
 

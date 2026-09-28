@@ -47,6 +47,8 @@ function run(options = {}) {
     pathStreamText: { flush() { visited.push('egress'); if (options.pathFail) boom(); return ''; } },
     thinkClassifier: { flush() { visited.push('think'); return ''; } },
     reasoningDedup: { release() { visited.push('dedup'); if (options.dedupFail) boom(); return ''; } },
+    // The stop gate is owned outside this extracted continuation; real handler tests cover its bytes.
+    flushContentGate: options.gateFail ? boom : () => {},
     shouldFallbackThinkingToText: () => false, finishPartialStreamAfterError: options.helperFail ? boom : finishPartialStreamAfterError,
     chatStreamError: (message, type, code) => ({ error: { message, type, code } }),
   };
@@ -121,4 +123,13 @@ test('R4 classification and ordinary error logging cannot block terminal deliver
 test('R4 end failures are diagnosed rather than escaping the finalizer', () => {
   const r = run({ endFail: true });
   assert.equal(done(r), 1); assert.match(r.warnings.join(''), /stage=end/);
+});
+
+test('R4 a stop-gate flush failure still delivers the error frame and DONE', () => {
+  const r = run({ gateFail: true });
+  assert.equal(done(r), 1);
+  assert.ok(r.writes.some(x => x.includes('"error"')));
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /stage=content-gate-tail/);
+  assert.equal(r.res.writableEnded, true);
 });

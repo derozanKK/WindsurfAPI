@@ -23,6 +23,11 @@ export function extractPdfText(buf) {
   const pages = [];
   let streamCount = 0;
   let totalDecoded = 0;
+  // Token state for pairing a stream with the dictionary in front of it. Only the
+  // bytes BETWEEN stream bodies are tokenized (stream bodies are binary), and each
+  // byte is visited once, so the scan stays linear in the input size.
+  const dictScan = { stack: [], last: null };
+  let codeStart = 0;
 
   // Find all stream...endstream blocks
   let pos = 0;
@@ -41,10 +46,17 @@ export function extractPdfText(buf) {
     streamCount++;
     if (streamCount > MAX_STREAMS) throw new Error('PDF stream count exceeds safety limit');
 
-    // Check if this stream has FlateDecode by looking back at the dictionary
-    const dictStart = Math.max(0, streamStart - 500);
-    const dictText = buf.subarray(dictStart, streamStart).toString('latin1');
-    const isFlate = dictText.includes('FlateDecode');
+    // A stream is Flate when the dictionary IMMEDIATELY in front of it carries a
+    // direct /Filter /FlateDecode. The old version matched the bare substring
+    // "FlateDecode" anywhere in the preceding 500 bytes: a legitimate filter entry
+    // padded further back was missed, and a previous object's dictionary — or a
+    // string/comment inside this one — could classify a plain stream as Flate and
+    // (via the inflate error below) drop its text. Structure, not distance, decides.
+    scanPdfTokens(buf, codeStart, streamStart, dictScan);
+    const dict = dictScan.last;
+    const isFlate = !!dict
+      && onlyWhitespaceAndComments(buf, dict.end, streamStart)
+      && dictHasFlateFilter(buf, dict.start, dict.end);
 
     let decoded;
     try {
@@ -61,6 +73,7 @@ export function extractPdfText(buf) {
       }
     } catch (e) {
       if (/limit|exceed|maxOutputLength|Buffer larger/i.test(e.message) || e.code === 'ERR_BUFFER_TOO_LARGE') throw e;
+      codeStart = endStream + 10;
       pos = endStream + 10;
       continue;
     }
@@ -69,10 +82,164 @@ export function extractPdfText(buf) {
     const text = extractTextOps(decoded);
     if (text.trim()) pages.push(text.trim());
 
+    codeStart = endStream + 10;
     pos = endStream + 10;
   }
 
   return pages.join('\n\n');
+}
+
+// ─── Stream-dictionary association (structure, not a fixed lookback) ──────────
+//
+// PDF lexical basics only: PDF whitespace, %-comments, literal (…) and hex <…>
+// strings, and << … >> nesting. Enough to find the dictionary that belongs to a
+// stream; deliberately not an object model, xref reader, indirect-filter
+// resolver, or codec table.
+
+function isPdfWhitespace(byte) {
+  return byte === 0x00 || byte === 0x09 || byte === 0x0a || byte === 0x0c || byte === 0x0d || byte === 0x20;
+}
+
+// PDF delimiters: ( ) < > [ ] { } / % — a name ends at whitespace or one of these.
+function isPdfDelimiter(byte) {
+  return byte === 0x28 || byte === 0x29 || byte === 0x3c || byte === 0x3e
+    || byte === 0x5b || byte === 0x5d || byte === 0x7b || byte === 0x7d
+    || byte === 0x2f || byte === 0x25;
+}
+
+// Index after the comment that starts at `at` (the EOL belongs to the comment).
+function skipComment(buf, at, limit) {
+  let i = at + 1;
+  while (i < limit && buf[i] !== 0x0a && buf[i] !== 0x0d) i++;
+  return i;
+}
+
+// Index after the literal (…) string starting at `at`. PDF literal strings may hold
+// BALANCED nested parentheses — `(outer (nested) still)` is one string — and a
+// backslash escapes the next byte, so only the ')' that closes the group opened here
+// ends the string. Closing at the first ')' instead lets a '>>' inside the string be
+// read as the dictionary end, which loses the stream's dictionary association and
+// silently drops the text. An unterminated string runs to `limit`: nothing after it
+// can be trusted, so the caller degrades to "no dictionary found" rather than guessing.
+function skipLiteralString(buf, at, limit) {
+  let i = at + 1;
+  let depth = 1;
+  while (i < limit) {
+    const c = buf[i];
+    if (c === 0x5c) { i += 2; continue; }        // backslash escapes the next byte
+    if (c === 0x28) { depth++; i++; continue; }  // (
+    if (c === 0x29) {                            // )
+      depth--;
+      if (depth === 0) return i + 1;
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return i;
+}
+
+// Index after the hex <…> string starting at `at`.
+function skipHexString(buf, at, limit) {
+  let i = at + 1;
+  while (i < limit) {
+    if (buf[i] === 0x3e) return i + 1;
+    i++;
+  }
+  return i;
+}
+
+// Read a /Name token at `at`. Returns [name without the slash, index after it].
+function readPdfName(buf, at, limit) {
+  if (buf[at] !== 0x2f) return [null, at];
+  let i = at + 1;
+  while (i < limit && !isPdfWhitespace(buf[i]) && !isPdfDelimiter(buf[i])) i++;
+  return [buf.toString('latin1', at + 1, i), i];
+}
+
+function skipWhitespaceAndComments(buf, from, limit) {
+  let i = from;
+  while (i < limit) {
+    if (buf[i] === 0x25) { i = skipComment(buf, i, limit); continue; }
+    if (isPdfWhitespace(buf[i])) { i++; continue; }
+    break;
+  }
+  return i;
+}
+
+// Walk a code region (the bytes between stream bodies) and remember the most
+// recently CLOSED outermost dictionary. Strings and comments are skipped, so a
+// `<<` inside a string never opens a dictionary and a `>>` inside a comment never
+// closes one; nested dictionaries do not overwrite the outermost entry.
+function scanPdfTokens(buf, from, to, state) {
+  let i = from;
+  while (i < to) {
+    const c = buf[i];
+    if (c === 0x25) { i = skipComment(buf, i, to); continue; }            // %
+    if (c === 0x28) { i = skipLiteralString(buf, i, to); continue; }      // (
+    if (c === 0x3c) {                                                     // <
+      if (buf[i + 1] === 0x3c) { state.stack.push(i); i += 2; continue; } // <<
+      i = skipHexString(buf, i, to);
+      continue;
+    }
+    if (c === 0x3e && buf[i + 1] === 0x3e) {                              // >>
+      const start = state.stack.pop();
+      if (start !== undefined && state.stack.length === 0) state.last = { start, end: i + 2 };
+      i += 2;
+      continue;
+    }
+    i++;
+  }
+  return state;
+}
+
+// True when nothing but whitespace/comments separates a closed dictionary from the
+// `stream` keyword — i.e. that dictionary IS this stream's dictionary. Any token in
+// between (endobj, another object's number, …) means the dictionary belongs to
+// something else and must not classify this stream.
+function onlyWhitespaceAndComments(buf, from, to) {
+  let i = from;
+  while (i < to) {
+    if (buf[i] === 0x25) { i = skipComment(buf, i, to); continue; }
+    if (!isPdfWhitespace(buf[i])) return false;
+    i++;
+  }
+  return true;
+}
+
+// A dictionary's own /Filter entry, read at nesting depth 0 (a nested dictionary's
+// /Filter does not describe this stream's bytes). Only the direct name form
+// `/Filter /FlateDecode` counts — no array form, no indirect reference.
+function dictHasFlateFilter(buf, start, end) {
+  let i = start + 2; // past "<<"
+  const stop = end - 2; // before ">>"
+  let depth = 0;
+  while (i < stop) {
+    const c = buf[i];
+    if (c === 0x25) { i = skipComment(buf, i, stop); continue; }          // %
+    if (c === 0x28) { i = skipLiteralString(buf, i, stop); continue; }    // (
+    if (c === 0x3c) {                                                     // <
+      if (buf[i + 1] === 0x3c) { depth++; i += 2; continue; }             // <<
+      i = skipHexString(buf, i, stop);
+      continue;
+    }
+    if (c === 0x3e && buf[i + 1] === 0x3e) {                              // >>
+      if (depth > 0) depth--;
+      i += 2;
+      continue;
+    }
+    if (c === 0x2f && depth === 0) {                                      // /
+      const [name, afterName] = readPdfName(buf, i, stop);
+      if (name === 'Filter') {
+        const [value] = readPdfName(buf, skipWhitespaceAndComments(buf, afterName, stop), stop);
+        if (value === 'FlateDecode') return true;
+      }
+      i = afterName > i ? afterName : i + 1;
+      continue;
+    }
+    i++;
+  }
+  return false;
 }
 
 /**

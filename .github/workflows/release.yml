@@ -15,6 +15,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # The wire comparison base is a tag, so the tags have to be here.
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -27,6 +30,28 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Select the release baseline (strict ancestor, recorded)
+        # Without this the suite skipped the byte comparison and said so only in the log,
+        # so a release could pass with no wire evidence at all; a sibling CI job on the
+        # same SHA had run it, which is a coincidence, not a gate. Same selector as the
+        # CI wire job: the newest ANNOTATED release tag that is a strict ancestor, no
+        # lightweight fallback, refusing a self-comparison.
+        run: |
+          node scripts/wire-base.mjs
+          BASE_TAG=$(node scripts/wire-base.mjs --field tag)
+          BASE_SHA=$(node scripts/wire-base.mjs --field sha)
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+            echo "::error::refusing to compare $HEAD_SHA against itself"
+            exit 1
+          fi
+          git worktree add --detach "$RUNNER_TEMP/wire-base" "$BASE_SHA"
+          echo "comparing $HEAD_SHA against $BASE_SHA ($BASE_TAG)"
+          echo "WIRE_BASE_TREE=$RUNNER_TEMP/wire-base" >> "$GITHUB_ENV"
+          echo "WIRE_BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+          echo "WIRE_BASE_TAG=$BASE_TAG" >> "$GITHUB_ENV"
+          echo "WIRE_BASE_REQUIRED=1" >> "$GITHUB_ENV"
 
       - name: Secret scan
         run: npm run secret-scan
@@ -222,27 +247,8 @@ jobs:
           npm run build:bundle
           pkg src/_bundle.cjs --config package.json --targets node22-win-x64 --output dist-windows/windsurfapi.exe
 
-      - name: Smoke-check the exe boots
-        shell: pwsh
-        run: |
-          $env:DEVIN_CONNECT = '1'; $env:HOST = '127.0.0.1'; $env:PORT = '3999'
-          $env:API_KEY = 'ci-smoke'; $env:DATA_DIR = "$env:RUNNER_TEMP\wa-smoke"
-          $env:WINDSURFAPI_NO_OPEN = '1'  # don't try to launch a browser on the headless runner
-          $out = "$env:RUNNER_TEMP\exe-out.log"; $err = "$env:RUNNER_TEMP\exe-err.log"
-          $p = Start-Process -FilePath dist-windows\windsurfapi.exe -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err
-          $ok = $false
-          for ($i = 0; $i -lt 40; $i++) {
-            if ($p.HasExited) { break }
-            try { $r = Invoke-WebRequest 'http://127.0.0.1:3999/health' -UseBasicParsing -TimeoutSec 3; if ($r.StatusCode -eq 200) { $ok = $true; break } } catch {}
-            Start-Sleep -Milliseconds 500
-          }
-          try { $d = Invoke-WebRequest 'http://127.0.0.1:3999/dashboard' -UseBasicParsing -TimeoutSec 5; $dashOk = ($d.StatusCode -eq 200 -and $d.Content.Length -gt 1000) } catch { $dashOk = $false }
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          Write-Host "--- exe stdout ---"; if (Test-Path $out) { Get-Content $out -Tail 40 }
-          Write-Host "--- exe stderr ---"; if (Test-Path $err) { Get-Content $err -Tail 40 }
-          if (-not $ok) { Write-Error 'exe did not answer /health'; exit 1 }
-          if (-not $dashOk) { Write-Error 'exe did not serve /dashboard (asset bundling broken?)'; exit 1 }
-          Write-Host 'exe smoke OK: /health 200 + /dashboard served from snapshot assets'
+      - name: Smoke-check /health identity and /dashboard assets
+        run: node scripts/exe-boot-smoke.mjs dist-windows/windsurfapi.exe
 
       # Assemble the "解压即用" zip: the exe + the tray launcher scripts + icon,
       # all in ONE flat folder. tray.ps1 auto-detects the sibling windsurfapi.exe

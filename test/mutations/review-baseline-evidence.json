@@ -1,0 +1,65 @@
+{
+  "tests": [
+    "test/spec-baseline-check.test.js",
+    "test/review-static-baseline.test.js"
+  ],
+  "expectBaselinePass": 24,
+  "mutations": [
+    {
+      "name": "Nonzero child termination is ignored",
+      "file": "scripts/spec-baseline-evidence.mjs",
+      "anchor": "  if (result.error || result.signal || result.status !== 0) fail('abnormal child termination; counts cannot override exit/signal/error');",
+      "replacement": "  if (false) fail('abnormal child termination; counts cannot override exit/signal/error');",
+      "expectCaught": true
+    },
+    {
+      "name": "Unapproved skipped assertions are accepted",
+      "file": "scripts/spec-baseline-evidence.mjs",
+      "anchor": "    if (row.type !== 'test' || !approved.has(key) || row.skip !== policyForPlatform.reason\n        || skippedNames.has(key)) fail(`unapproved or duplicate platform skip: ${file}: ${row.name}`);",
+      "replacement": "    if (false) fail(`unapproved or duplicate platform skip: ${file}: ${row.name}`);",
+      "expectCaught": true
+    },
+    {
+      "name": "Duplicate summaries are accepted",
+      "file": "scripts/spec-baseline-evidence.mjs",
+      "anchor": "  if (summaries.length !== 1) fail('exactly one aggregate summary is required');",
+      "replacement": "  if (false) fail('exactly one aggregate summary is required');",
+      "expectCaught": true
+    },
+    {
+      "name": "Missing file receipts are accepted",
+      "file": "scripts/spec-baseline-evidence.mjs",
+      "anchor": "  if (measured.size !== wanted.size || FIELDS.some(k => totals[k] !== counts[k])) fail('file coverage or aggregate reconciliation failed');",
+      "replacement": "  if (false) fail('file coverage or aggregate reconciliation failed');",
+      "expectCaught": true
+    },
+    {
+      "name": "A named platform guard may disappear",
+      "file": "scripts/spec-baseline-evidence.mjs",
+      "anchor": "  for (const key of approved) if (!seenNames.has(key)) fail('a named machine-gated test disappeared');",
+      "replacement": "  for (const key of approved) if (false) fail('a named machine-gated test disappeared');",
+      "expectCaught": true
+    },
+    {
+      "name": "Spec-only changes are omitted from selection",
+      "file": "scripts/spec-baseline-check.mjs",
+      "anchor": "changed.has(`test/mutations/${s.name}`) || s.tests.some(f => changed.has(f))",
+      "replacement": "s.tests.some(f => changed.has(f))",
+      "expectCaught": true
+    },
+    {
+      "name": "A matching pass count hides approved skipped assertions",
+      "file": "scripts/spec-baseline-check.mjs",
+      "anchor": "    if (value.total !== spec.expectBaselinePass) {",
+      "replacement": "    if (value.pass !== spec.expectBaselinePass && value.total !== spec.expectBaselinePass) {",
+      "expectCaught": true
+    },
+    {
+      "name": "Static schema accepts nonpositive pins",
+      "file": "scripts/spec-static-check.mjs",
+      "anchor": "  if (!Number.isSafeInteger(spec.expectBaselinePass) || spec.expectBaselinePass <= 0) {",
+      "replacement": "  if (false) {",
+      "expectCaught": true
+    }
+  ]
+}

@@ -1319,14 +1319,55 @@ describe('Anthropic response robustness (B3/B4/B5/F3)', () => {
     assert.equal(result.body.stop_reason, 'refusal', 'content_filter maps to refusal, not end_turn');
   });
 
-  it('B5: back-fills stop_reason=stop_sequence and the matched stop_sequence (non-stream)', async () => {
+  it('B5: back-fills stop_reason=stop_sequence and the matched stop_sequence from the carrier (non-stream)', async () => {
+    // The generation layer reports the sequence it actually matched; the matched
+    // bytes are removed from the text, so the cause has to ride along.
+    const result = await respond({
+      model: 'claude-sonnet-4.6',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hello ' }, finish_reason: 'stop', _windsurf_stop_sequence: 'END' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }, { stop_sequences: ['END'] });
+    assert.equal(result.body.stop_reason, 'stop_sequence', 'a reported stop match yields stop_sequence');
+    assert.equal(result.body.stop_sequence, 'END', 'the matched sequence is echoed');
+  });
+
+  it('B5: a carrier outside the request stop_sequences is ignored (non-stream)', async () => {
+    const result = await respond({
+      model: 'claude-sonnet-4.6',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hello ' }, finish_reason: 'stop', _windsurf_stop_sequence: 'NOT-REQUESTED' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }, { stop_sequences: ['END'] });
+    assert.equal(result.body.stop_reason, 'end_turn');
+    assert.equal(result.body.stop_sequence, null);
+  });
+
+  it('B5: a tool finish is never upgraded by a carrier (non-stream)', async () => {
+    const result = await respond({
+      model: 'claude-sonnet-4.6',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+        finish_reason: 'tool_calls',
+        _windsurf_stop_sequence: 'END',
+      }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }, { stop_sequences: ['END'] });
+    assert.equal(result.body.stop_reason, 'tool_use');
+    assert.equal(result.body.stop_sequence, null);
+  });
+
+  it('B5: text that merely ends with a stop sequence is not guessed into stop_sequence (non-stream)', async () => {
+    // The old implementation tested `text.endsWith(seq)`. A real hit strips the
+    // matched bytes, so that test could only ever fire on text the upstream
+    // produced naturally — the exact false positive removed here.
     const result = await respond({
       model: 'claude-sonnet-4.6',
       choices: [{ index: 0, message: { role: 'assistant', content: 'hello END' }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 1, completion_tokens: 1 },
     }, { stop_sequences: ['END'] });
-    assert.equal(result.body.stop_reason, 'stop_sequence', 'text ending with a stop sequence yields stop_sequence');
-    assert.equal(result.body.stop_sequence, 'END', 'the matched sequence is echoed');
+    assert.equal(result.body.stop_reason, 'end_turn');
+    assert.equal(result.body.stop_sequence, null);
+    assert.equal(result.body.content[0].text, 'hello END', 'the text itself is untouched');
   });
 
   it('B5: leaves stop_reason=end_turn and stop_sequence=null on a plain finish', async () => {
@@ -1350,7 +1391,7 @@ describe('Anthropic response robustness (B3/B4/B5/F3)', () => {
     assert.equal(result.body.usage.service_tier, 'standard', 'service_tier default present');
   });
 
-  it('B5 (stream): back-fills stop_sequence in the final message_delta', async () => {
+  it('B5 (stream): back-fills stop_sequence in the final message_delta from the carrier', async () => {
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
       stream: true,
@@ -1362,8 +1403,10 @@ describe('Anthropic response robustness (B3/B4/B5/F3)', () => {
           status: 200,
           stream: true,
           async handler(res) {
-            res.write(chatChunk({ choices: [{ index: 0, delta: { content: 'answer then STOP' }, finish_reason: null }] }));
-            res.write(chatChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+            res.write(chatChunk({ choices: [{ index: 0, delta: { content: 'answer then ' }, finish_reason: null }] }));
+            // The terminal choice carries the generation layer's matched sequence
+            // (only the internal Messages route opts into it).
+            res.write(chatChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop', _windsurf_stop_sequence: 'STOP' }] }));
             res.end('data: [DONE]\n\n');
           },
         };
@@ -1375,6 +1418,30 @@ describe('Anthropic response robustness (B3/B4/B5/F3)', () => {
     const delta = events.find(e => e.event === 'message_delta');
     assert.equal(delta.data.delta.stop_reason, 'stop_sequence', 'streamed stop-sequence hit maps to stop_sequence');
     assert.equal(delta.data.delta.stop_sequence, 'STOP', 'matched sequence echoed in the stream');
+  });
+
+  it('B5 (stream): the carrier never leaks into the Anthropic events', async () => {
+    const result = await handleMessages({
+      model: 'claude-sonnet-4.6',
+      stream: true,
+      stop_sequences: ['STOP'],
+      messages: [{ role: 'user', content: 'hi' }],
+    }, {
+      async handleChatCompletions() {
+        return {
+          status: 200,
+          stream: true,
+          async handler(res) {
+            res.write(chatChunk({ choices: [{ index: 0, delta: { content: 'answer then ' }, finish_reason: null }] }));
+            res.write(chatChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop', _windsurf_stop_sequence: 'STOP' }] }));
+            res.end('data: [DONE]\n\n');
+          },
+        };
+      },
+    });
+    const res = fakeRes();
+    await result.handler(res);
+    assert.ok(!res.body.includes('_windsurf_stop_sequence'), 'the private carrier stays internal');
   });
 
   it('B5 (stream): content_filter finish_reason maps to refusal in message_delta', async () => {

@@ -41,22 +41,31 @@ export function newTraceId() {
 // Redact obvious secrets from an object we're about to persist. Shallow + a few
 // known-nested spots; the goal is "don't write raw tokens to disk", not perfect
 // scrubbing. Keeps byte length hints where useful.
+//
+// Past MAX_TRACE_DEPTH a subtree is never traversed, so it cannot be redacted: the
+// whole container is replaced by a constant marker. Returning the value (the old
+// behavior) persisted whatever the deep container held — recognized secret-key
+// values included — verbatim on disk. Diagnostic loss is the deliberate price:
+// every object/array below depth 6 in a persisted leg reads as DEPTH_TRUNCATION
+// instead of its contents.
 const SECRET_KEYS = /^(authorization|x-api-key|api[-_]?key|token|apikey|password|secret|refresh[-_]?token|id[-_]?token|cookie)$/i;
+const MAX_TRACE_DEPTH = 6;
+const DEPTH_TRUNCATION = '[truncated:max-depth]';
 function redact(value, depth = 0) {
-  if (value == null || depth > 6) return value;
+  if (value == null) return value;
+  const isContainer = Array.isArray(value) || typeof value === 'object';
+  if (!isContainer) return value;
+  if (depth > MAX_TRACE_DEPTH) return DEPTH_TRUNCATION;
   if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1));
-  if (typeof value === 'object') {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      if (SECRET_KEYS.test(k)) {
-        out[k] = typeof v === 'string' && v ? `[redacted:${v.length}b]` : '[redacted]';
-      } else {
-        out[k] = redact(v, depth + 1);
-      }
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (SECRET_KEYS.test(k)) {
+      out[k] = typeof v === 'string' && v ? `[redacted:${v.length}b]` : '[redacted]';
+    } else {
+      out[k] = redact(v, depth + 1);
     }
-    return out;
   }
-  return value;
+  return out;
 }
 
 function dirFor(traceId, env) {

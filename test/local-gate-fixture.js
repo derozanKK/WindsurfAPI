@@ -16,6 +16,7 @@ export async function verifyLocalGateFixture() {
     mkdirSync(join(root, 'scripts'));
     writeFileSync(join(root, 'scripts/local-gate.mjs'), source);
     writeFileSync(join(root, 'scripts/spec-static-check.mjs'), '');
+    writeFileSync(join(root, 'scripts/spec-baseline-check.mjs'), '');
     writeFileSync(join(root, 'scripts/secret-scan.mjs'), '');
     const healthy = 'Running test shard 1/1: 1/1 files\n- test/fixture.test.js\n'
       + ['tests 2', 'pass 1', 'fail 0', 'skipped 1', 'cancelled 0', 'todo 0']
@@ -27,7 +28,7 @@ export async function verifyLocalGateFixture() {
     const run = () => spawnSync(process.execPath, ['scripts/local-gate.mjs'], { cwd: root, env, encoding: 'utf8', timeout: 30000 });
     let result = run(); assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.match(result.stdout, /PASS test:release exit=0 — 1 pass \/ 0 fail \/ 1 skip/);
-    assert.match(result.stdout, /SKIP mutations/);
+    assert.match(result.stdout, /SKIP mutation EXECUTION/, 'the gate must still say what it does not run');
     setReporter('reporter changed without a summary');
     result = run(); assert.equal(result.status, 2); assert.match(result.stdout, /FAIL test:release/);
     assert.doesNotMatch(result.stdout, /INCREMENTAL GATE: PASS/);

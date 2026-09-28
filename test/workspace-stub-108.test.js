@@ -114,18 +114,12 @@ describe('workspace scaffold: stub-labeled content (#108)', () => {
       'scaffold README must point the reader at the calling client for the real workspace');
   });
 
-  test('legacy-scaffold migration is wired up so existing accounts get rewritten on next call', () => {
-    // Without migration, _seededWorkspaces is in-memory and existsSync()
-    // short-circuits the rewrite. Existing accounts upgraded from
-    // pre-#108 still carry the "my-project" stub and would never
-    // self-heal until the dir is manually deleted.
-    assert.match(CLIENT_JS, /isLegacyScaffold/,
-      'must export an isLegacyScaffold detector');
-    assert.match(CLIENT_JS, /pkg\?\.name !== 'proxy-workspace-stub'/,
-      'detector must key on package.json name (the only field guaranteed across legacy variants)');
-    assert.match(CLIENT_JS, /Workspace scaffold migrated to #108/,
-      'must log a distinct migration message so operators can grep for it on upgrade');
-  });
+  // The "legacy-scaffold migration is wired up" test that stood here asserted the
+  // implementation by source text (`assert.match(CLIENT_JS, /isLegacyScaffold/)` and
+  // `/pkg\?\.name !== 'proxy-workspace-stub'/`). It pinned the defect GPT-01 removed,
+  // and it was never a behavioural test — deleting it is the correction, not re-pinning
+  // it to the new text. The rule it was trying to protect is now carried by
+  // test/workspace-scaffold-ownership.test.js, which calls the real helper.
 
   test('old "my-project" / Hello-world / Getting Started strings are gone from current scaffold', () => {
     // Defensive: a future refactor that brings back the project-shaped

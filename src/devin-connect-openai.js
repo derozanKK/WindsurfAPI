@@ -385,7 +385,7 @@ function nowSeconds() {
  * @returns {Promise<{status:number, body:object}>}
  */
 export async function toChatCompletion(params, opts = {}) {
-  const { id = newId(), created = nowSeconds(), displayModel, maxRetries = 2, retryBaseMs = 400, emulateTools = false, stop = null, clineCompat = false } = opts;
+  const { id = newId(), created = nowSeconds(), displayModel, maxRetries = 2, retryBaseMs = 400, emulateTools = false, stop = null, clineCompat = false, stopCarrier = false } = opts;
   const model = displayModel || params.model;
 
   // Non-stream path buffers the whole answer, so a transient failure (network
@@ -438,17 +438,21 @@ export async function toChatCompletion(params, opts = {}) {
   // tool defs were injected into the prompt (normalizeMessagesForCascade) and
   // the model answers with <tool_call>…</tool_call> markup we pull back out,
   // mirroring the Cascade non-stream path (handlers/chat.js buildToolCalls).
-  // proto-openai-03: enforce the client's `stop` locally (the Devin wire has no
-  // native stop field). Truncate at the earliest stop-sequence hit and report
-  // finish_reason:'stop'. Only meaningful for plain-text answers — a hit means
-  // the model was mid-prose, so we also skip tool-call extraction below (a
-  // truncated <tool_call> block would be malformed anyway).
+  //
+  // SEED-C3c: the emulated parse runs BEFORE the stop gate, never after it. The
+  // stop sequence fences the model's PROSE; a complete, declared, allowlisted
+  // tool call carries opaque structured arguments. Gating the raw text first cut
+  // inside that JSON and handed non-stream clients a truncated `<tool_call>`
+  // fragment with no tool at all, while the stream path (which parses before its
+  // prose gate, see sendContent below) returned the real call — the same request
+  // answered two different ways depending on `stream`. Native structured calls
+  // are opaque for the same reason.
+  //
+  // This does NOT decide mixed prose/tool ordering (an END that appears before a
+  // later call, split-chunk order, salvage parity): only the accepted, declared,
+  // allowlisted structured call is exempt from the cut.
   let stopHit = false;
-  if (!nativeToolCalls.length) {
-    const stopped = applyStop(content, stop);
-    if (stopped.hit) { content = stopped.text; finishReason = 'stop'; stopHit = true; }
-  }
-
+  let matchedStop = null;
   let toolCalls = [];
   if (nativeToolCalls.length) {
     // arguments is the raw JSON string off the wire (decodeToolCalls); map it to
@@ -458,7 +462,7 @@ export async function toChatCompletion(params, opts = {}) {
       id: tc.id, name: tc.name, argumentsJson: tc.arguments,
     }));
     finishReason = 'tool_calls';
-  } else if (emulateTools && !stopHit) {
+  } else if (emulateTools) {
     const parsed = parseToolCallsFromText(content, {
       modelKey: params.model, provider: null, route: 'devin_connect',
     });
@@ -467,6 +471,15 @@ export async function toChatCompletion(params, opts = {}) {
       toolCalls = filterToolCallsByAllowlist(parsed.toolCalls, params.tools || []);   // M2 ToolGuard parity
     }
   }
+  // proto-openai-03: enforce the client's `stop` locally (the Devin wire has no
+  // native stop field). Truncate at the earliest stop-sequence hit and report
+  // finish_reason:'stop'. The cut applies to the prose that is left after the
+  // structured-call parse above; tool arguments are never matched against it.
+  {
+    const stopped = applyStop(content, stop);
+    if (stopped.hit) { content = stopped.text; matchedStop = stopped.stop; stopHit = true; }
+  }
+  if (stopHit && !toolCalls.length) finishReason = 'stop';
 
   // Fallback promotion: promote reasoning to content when no tool calls and no content exist
   // so plain prompts never return an empty visible answer to clients.
@@ -485,7 +498,7 @@ export async function toChatCompletion(params, opts = {}) {
   // `<tool_call>` XML to the client as the visible answer with finish_reason='stop'.
   // The agent loop does not advance and the user sees markup, which is worse than
   // the empty turn the promotion exists to prevent.
-  let promotedReasoning = !toolCalls.length && !content && !!reasoning;
+  let promotedReasoning = !toolCalls.length && !content && !!reasoning && !stopHit;
   if (promotedReasoning) {
     if (emulateTools && !stopHit) {
       const promotedParse = parseToolCallsFromText(reasoning, {
@@ -509,6 +522,14 @@ export async function toChatCompletion(params, opts = {}) {
     }
   }
 
+  // Promotion creates visible prose after the first gate. Gate it at this final boundary.
+  if (promotedReasoning) {
+    const stopped = applyStop(content, stop);
+    content = stopped.text;
+    if (stopped.hit) { matchedStop = stopped.stop; stopHit = true; }
+    if (stopHit && !toolCalls.length) finishReason = 'stop';
+  }
+
   // OpenAI convention: content is a string (may be empty), never undefined.
   const message = { role: 'assistant', content: content || '' };
   if (reasoning && !promotedReasoning) message.reasoning_content = reasoning;
@@ -524,13 +545,25 @@ export async function toChatCompletion(params, opts = {}) {
     finishReason = 'tool_calls';
   }
 
+  const choice = { index: 0, message, finish_reason: finishReason };
+  // SEED-C3a carrier. The internal Anthropic Messages route needs to know WHICH
+  // stop sequence truncated this answer (it echoes it as `stop_sequence`), and
+  // the matched bytes are gone from `content`, so the cause has to ride along.
+  // Serialisable plain field, not a Symbol: the streaming twin travels through
+  // JSON.stringify into the messages translator's SSE parser. Gated on the
+  // explicit route opt-in (chat.js sets `stopCarrier` only for
+  // trusted Messages context) so a direct OpenAI client sees the public shape
+  // byte-for-byte. Only a genuine local stop carries it — a tool/length/refusal
+  // finish cannot be upgraded by a stray value.
+  if (stopCarrier && matchedStop && finishReason === 'stop') choice._windsurf_stop_sequence = matchedStop;
+
   const body = {
     id,
     object: OBJECT_COMPLETION,
     created,
     model,
     system_fingerprint: systemFingerprint(model),
-    choices: [{ index: 0, message, finish_reason: finishReason }],
+    choices: [choice],
   };
   if (usage) body.usage = usage;
   // Private field: per-request credit/ACU cost, absent unless the billing tags are
@@ -560,7 +593,7 @@ export async function toChatCompletion(params, opts = {}) {
  *          the assembled result, so callers can cache it after streaming.
  */
 export async function streamChatCompletion(params, send, opts = {}) {
-  const { id = newId(), created = nowSeconds(), displayModel, emulateTools = false, includeUsage = false, stop = null, clineCompat = false } = opts;
+  const { id = newId(), created = nowSeconds(), displayModel, emulateTools = false, includeUsage = false, stop = null, clineCompat = false, stopCarrier = false } = opts;
   const model = displayModel || params.model;
   const base = { id, object: OBJECT_CHUNK, created, model, system_fingerprint: systemFingerprint(model) };
 
@@ -598,6 +631,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // hit we emit the safe prefix, flip finish_reason:'stop', and stop the stream.
   const stopGate = new StopSequenceGate(stop);
   let stopHit = false;
+  let matchedStop = null;
   // Emit content through the stop gate. Returns true when the stream should end.
   const sendContent = (text) => {
     if (!text) return false;
@@ -607,7 +641,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
     }
     const { emit, hit } = stopGate.push(text);
     if (emit) send({ ...base, choices: [{ index: 0, delta: { content: emit }, finish_reason: null }] });
-    if (hit) { finishReason = 'stop'; stopHit = true; }
+    if (hit) { finishReason = 'stop'; stopHit = true; matchedStop = stopGate.matched; }
     return hit;
   };
 
@@ -684,12 +718,6 @@ export async function streamChatCompletion(params, send, opts = {}) {
     sendContent(text);
     if (collectedToolCalls.length) finishReason = 'tool_calls';
   }
-  // proto-openai-03: release the gate's held tail (the last few chars it was
-  // withholding in case they started a stop sequence). No-op after a hit.
-  if (!stopHit && stopGate.active) {
-    const tail = stopGate.flush();
-    if (tail) send({ ...base, choices: [{ index: 0, delta: { content: tail }, finish_reason: null }] });
-  }
 
   // Native tool calls win over text emulation (the two are mutually exclusive:
   // when native decode is calibrated the text carries no <tool_call> markup).
@@ -747,6 +775,13 @@ export async function streamChatCompletion(params, send, opts = {}) {
     }
   }
 
+  // proto-openai-03: release the gate's held tail (the last few chars it was
+  // withholding in case they started a stop sequence). No-op after a hit.
+  if (!stopHit && stopGate.active) {
+    const tail = stopGate.flush();
+    if (tail) send({ ...base, choices: [{ index: 0, delta: { content: tail }, finish_reason: null }] });
+  }
+
   // 4. Terminal finish chunk. Reaching here means streamChat drained cleanly
   //    (the upstream opened and completed); if it had thrown before any delta,
   //    the exception would have propagated with `primed` — and therefore the
@@ -754,7 +789,13 @@ export async function streamChatCompletion(params, send, opts = {}) {
   //    An empty / immediate-finish response yielded no delta to prime from, so
   //    prime here to keep the stream well-formed: role → finish → optional usage.
   prime();
-  send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] });
+  const finishChoice = { index: 0, delta: {}, finish_reason: finishReason };
+  // SEED-C3a carrier — see the non-stream twin above. This frame is what the
+  // internal Messages translator sees (chat.js serialises it onto the `data:`
+  // line, messages.js parses it back), so the field must survive JSON round-trip
+  // and is emitted only on the route opt-in and only for a genuine local stop.
+  if (stopCarrier && matchedStop && finishReason === 'stop') finishChoice._windsurf_stop_sequence = matchedStop;
+  send({ ...base, choices: [finishChoice] });
 
   // 5. Usage-only chunk (OpenAI streams usage in a trailing choices:[] frame).
   //    O1: only when the caller opted in via stream_options.include_usage;

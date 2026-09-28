@@ -44,25 +44,27 @@ function mapStopReason(finishReason) {
 
 // B5: Anthropic sets stop_reason:'stop_sequence' AND echoes the matched string
 // in stop_sequence when generation halts on a caller-supplied stop sequence.
-// The internal OpenAI path reports finish_reason:'stop' for both a natural
-// end_turn AND a stop-sequence hit, and never tells us which sequence matched.
-// Recover it by checking whether the emitted text ends with one of the request's
-// stop_sequences — if so, surface stop_reason:'stop_sequence' + the matched
-// value. Returns { stopReason, stopSequence } (stopSequence null when no match).
-function resolveStopSequence(finishReason, text, stopSequences) {
+//
+// SEED-C3a: the matcher is NOT re-derived here. The layer that truncated the
+// text knows exactly which sequence won and hands it over in a private carrier
+// (see stop-sequences.js applyStop / StopSequenceGate); the old version guessed
+// by testing whether the emitted text ENDS with a request sequence — which can
+// never work for a real hit, because the matched bytes are removed from the
+// output (measured: "hello END tail" with stop END came back as "hello " and
+// reported end_turn/null). `matchedSequence` is the only local stop-match
+// evidence; it is validated against the sequences this request actually sent.
+// Returns { stopReason, stopSequence } (stopSequence null when no match).
+function resolveStopSequence(finishReason, stopSequences, matchedSequence) {
   const base = mapStopReason(finishReason);
-  if (base !== 'end_turn' || !Array.isArray(stopSequences) || !stopSequences.length) {
-    return { stopReason: base, stopSequence: null };
-  }
-  if (typeof text !== 'string' || !text) return { stopReason: base, stopSequence: null };
-  for (const seq of stopSequences) {
-    // Upstream strips the stop sequence from the returned text, so a hit shows
-    // up as the text ENDING with the sequence. Guard against empty entries.
-    if (typeof seq === 'string' && seq && text.endsWith(seq)) {
-      return { stopReason: 'stop_sequence', stopSequence: seq };
-    }
-  }
-  return { stopReason: base, stopSequence: null };
+  // Only a natural stop can be UPGRADED to stop_sequence: a tool/length/refusal
+  // finish stays authoritative, whatever carrier arrived.
+  if (base !== 'end_turn') return { stopReason: base, stopSequence: null };
+  if (typeof matchedSequence !== 'string' || !matchedSequence) return { stopReason: base, stopSequence: null };
+  const accepted = Array.isArray(stopSequences)
+    ? stopSequences.filter(s => typeof s === 'string' && s)
+    : [];
+  if (!accepted.includes(matchedSequence)) return { stopReason: base, stopSequence: null };
+  return { stopReason: 'stop_sequence', stopSequence: matchedSequence };
 }
 
 // Anthropic's Messages API recognizes a FIXED set of error `type` values, and
@@ -916,9 +918,9 @@ export function openAIToAnthropic(result, model, msgId, cachePolicy = null, stop
     content.push({ type: 'text', text: choice?.message?.content || '' });
   }
   // B5: resolve stop_reason (incl. content_filter→refusal) and back-fill
-  // stop_sequence when generation halted on a caller-supplied stop sequence.
-  const finalText = typeof choice?.message?.content === 'string' ? choice.message.content : '';
-  const { stopReason, stopSequence } = resolveStopSequence(choice?.finish_reason, finalText, stopSequences);
+  // stop_sequence from the SEED-C3a carrier the generation layer attached to this
+  // choice (absent for a direct OpenAI client — that path never opts in).
+  const { stopReason, stopSequence } = resolveStopSequence(choice?.finish_reason, stopSequences, choice?._windsurf_stop_sequence);
   return {
     id: msgId,
     type: 'message',
@@ -1084,12 +1086,13 @@ class AnthropicStreamTranslator {
     this.toolCallBufs = new Map();   // index → { id, name, argsBuffered }
     this.finalUsage = null;
     this.stopReason = 'end_turn';
-    // B5: request stop_sequences (if any) + running text tail, so finish() can
-    // back-fill stop_sequence when the completion halted on a stop sequence. We
-    // only need the tail long enough to match the longest configured sequence.
+    // B5/SEED-C3a: the request's accepted stop_sequences (used to validate the
+    // carrier below) and the exact sequence the generation layer reported having
+    // matched (null until the terminal chunk arrives). No text tail is kept: the
+    // matched bytes never reach this translator, so a suffix test could only ever
+    // produce false positives.
     this.stopSequences = Array.isArray(stopSequences) ? stopSequences.filter(s => typeof s === 'string' && s) : [];
-    this.maxStopSeqLen = this.stopSequences.reduce((m, s) => Math.max(m, s.length), 0);
-    this.emittedTextTail = '';
+    this.matchedStopSequence = null;
     this.messageStarted = false;
     this.messageStopped = false;
     // True once the upstream delivered an authoritative end-of-stream signal:
@@ -1214,11 +1217,6 @@ class AnthropicStreamTranslator {
   emitTextDelta(text) {
     if (!text) return;
     if (this.current?.type !== 'text') this.startBlock('text');
-    // B5: keep a bounded tail of emitted text so finish() can detect a stop
-    // sequence hit. Only track when stop_sequences were configured.
-    if (this.maxStopSeqLen > 0) {
-      this.emittedTextTail = (this.emittedTextTail + text).slice(-this.maxStopSeqLen);
-    }
     this.send('content_block_delta', {
       type: 'content_block_delta',
       index: this.current.index,
@@ -1382,8 +1380,15 @@ class AnthropicStreamTranslator {
         // truncated answer was complete.
         if (chunk.__synthetic_finish) this.sawSyntheticFinish = true;
         else this.sawTerminalSignal = true;
+        // SEED-C3a: the generation layer reports WHICH stop sequence truncated
+        // the answer on this terminal choice (only the internal Messages route
+        // opts into the carrier, so a direct OpenAI client never sends one).
+        // finish() validates it against this request's stop_sequences.
+        if (typeof choice._windsurf_stop_sequence === 'string' && choice._windsurf_stop_sequence) {
+          this.matchedStopSequence = choice._windsurf_stop_sequence;
+        }
         // B5: shared map adds content_filter→refusal; stop_sequence back-fill
-        // happens in finish() once the full emitted text tail is known.
+        // happens in finish() from the carrier captured just above.
         this.stopReason = mapStopReason(choice.finish_reason);
       }
     }
@@ -1466,13 +1471,14 @@ class AnthropicStreamTranslator {
     const usageForDelta = (u.prompt_tokens == null && u.input_tokens == null)
       ? { ...u, prompt_tokens: this.inputEstimate }
       : u;
-    // B5: back-fill stop_sequence when the stream ended on a natural stop that
-    // actually matched one of the request's stop_sequences (upstream reports
-    // finish_reason:'stop' for both a genuine end_turn and a stop-sequence hit).
+    // B5: back-fill stop_sequence from the SEED-C3a carrier captured on the
+    // terminal chunk (the sequence the generation layer actually matched). The
+    // old suffix test on the emitted text is gone — the matched bytes are
+    // stripped upstream, so it could never match a real hit.
     const { stopReason, stopSequence } = resolveStopSequence(
       this.stopReason === 'end_turn' ? 'stop' : null,
-      this.emittedTextTail,
       this.stopSequences,
+      this.matchedStopSequence,
     );
     // Only the stop-sequence resolution can UPGRADE end_turn; any other stopReason
     // (max_tokens/tool_use/refusal) set from finish_reason stays authoritative.
@@ -1645,7 +1651,7 @@ export async function handleMessages(body, context = {}) {
   // do not send metadata.user_id keep the original callerKey unchanged.
   const subKey = extractCallerSubKey(body);
   const alreadyUserScoped = context.callerKey && context.callerKey.includes(':user:');
-  const effectiveContext = (subKey && !alreadyUserScoped)
+  const scopedContext = (subKey && !alreadyUserScoped)
     ? {
         ...context,
         callerKey: `${context.callerKey || ''}:user:${subKey}`,
@@ -1654,6 +1660,7 @@ export async function handleMessages(body, context = {}) {
           : context.nativeBridgeCallerKey,
       }
     : context;
+  const effectiveContext = { ...scopedContext, __messagesStopCarrier: true };
   // T2: the captured incoming thinking rides the body as __incomingThinking
   // (single __-prefixed carrier, same convention as __route); chat.js reads it
   // as a fallback continuity-store source when the outbound response has none.

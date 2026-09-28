@@ -45,15 +45,27 @@ import {
 
 const MB = 1024 * 1024;
 
-/** An http2 server on 127.0.0.1 with an ephemeral port, closed before the test returns. */
 async function withHttp2Server(handler, fn) {
   const server = http2.createServer();
+  const sessions = new Set();
+  server.on('session', (session) => {
+    sessions.add(session);
+    session.on('close', () => sessions.delete(session));
+  });
   server.on('stream', handler);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   try {
     return await fn(port);
   } finally {
+    // server.close() waits for every session to end, and probeLanguageServerPort closes
+    // its client GRACEFULLY, so the two can end up waiting on each other: nothing ends
+    // the session and this file hangs until node:test's watchdog interrupts it (seen on
+    // CI as a ~90s hang in shard 3, "Promise resolution is still pending but the event
+    // loop has already resolved"). Destroy the server-side sessions first — every
+    // assertion has already been made by the time this runs. (closeAllConnections()
+    // would be the usual tool, but http2's server does not expose it.)
+    for (const session of sessions) { try { session.destroy(); } catch { /* gone */ } }
     await new Promise((resolve) => server.close(resolve));
   }
 }

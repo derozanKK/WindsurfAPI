@@ -172,6 +172,47 @@ describe('audit #1: apiKey/no-auth dashboard fallback requires a verified-LOCAL 
     await handleDashboardApi('GET', '/config', {}, mkReq({ 'x-dashboard-password': 'real-admin-pw' }, '203.0.113.9'), res);
     assert.equal(captured.status, 200, 'explicit dashboard password auths regardless of peer');
   });
+
+  // The two tests above stop at the 401 that the *default-OFF opt-in* already
+  // produces, so they stay green if the `isLoopbackAddress(clientIp)` half of the
+  // predicate is deleted. These two arm the opt-in, which leaves the loopback
+  // check as the only thing that can refuse the caller.
+  it('G-6: SAME-HOST PROXY with the apiKey convenience ARMED → a remote client is still refused', async () => {
+    withXff();
+    process.env.DASHBOARD_ALLOW_API_KEY_AS_PASSWORD = '1'; // the convenience is explicitly on
+    config.apiKey = 'sk-chat-shared-key';
+    config.dashboardPassword = '';
+    configureBindHost('127.0.0.1');
+    const { res, captured } = mkRes();
+    const req = {
+      headers: { 'x-dashboard-password': 'sk-chat-shared-key', 'x-forwarded-for': '203.0.113.9' },
+      socket: { remoteAddress: '127.0.0.1' },
+    };
+    await handleDashboardApi('GET', '/config', {}, req, res);
+    assert.equal(captured.status, 401, 'with the opt-in armed, only the verified-local check can refuse this caller');
+    delete process.env.DASHBOARD_ALLOW_API_KEY_AS_PASSWORD;
+  });
+
+  it('G-6: SAME-HOST PROXY with DASHBOARD_ALLOW_NO_AUTH=1 → remote refused, verified-local still allowed', async () => {
+    withXff();
+    process.env.DASHBOARD_ALLOW_NO_AUTH = '1'; // the open-local convenience is explicitly on
+    config.apiKey = '';
+    config.dashboardPassword = '';
+    configureBindHost('127.0.0.1');
+    const remote = mkRes();
+    await handleDashboardApi('GET', '/config', {}, {
+      headers: { 'x-forwarded-for': '203.0.113.9' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, remote.res);
+    assert.equal(remote.captured.status, 401, 'an open-local opt-in must not become an open-remote opt-in');
+    const local = mkRes();
+    await handleDashboardApi('GET', '/config', {}, {
+      headers: { 'x-forwarded-for': '127.0.0.1' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, local.res);
+    assert.equal(local.captured.status, 200, 'control: the convenience still serves a verified-local client');
+    delete process.env.DASHBOARD_ALLOW_NO_AUTH;
+  });
 });
 
 describe('AUTH-1: localhost no-secret fail-closed by default', () => {

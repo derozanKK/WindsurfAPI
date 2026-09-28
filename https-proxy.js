@@ -5,26 +5,11 @@ import { readFileSync } from 'fs';
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '3443', 10);
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '3003', 10);
 
-const CORS_HEADERS = {
-  'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-  'access-control-allow-headers': '*',
-  'access-control-expose-headers': '*',
-  'access-control-max-age': '86400',
-};
-
 function proxy(req, res) {
   const ts = new Date().toISOString().slice(11, 19);
   const method = req.method || req.headers[':method'] || 'GET';
   const url = req.url || req.headers[':path'] || '/';
   console.log(`[${ts}] ${method} ${url} (${req.httpVersion})`);
-
-  // Handle CORS preflight directly — don't forward to backend
-  if (method === 'OPTIONS') {
-    console.log(`[${ts}] ← 204 CORS preflight`);
-    res.writeHead(204, CORS_HEADERS);
-    return res.end();
-  }
 
   // Build headers for the HTTP/1.1 backend
   const fwdHeaders = {};
@@ -34,6 +19,16 @@ function proxy(req, res) {
     fwdHeaders[k] = v;
   }
   fwdHeaders['host'] = `127.0.0.1:${TARGET_PORT}`;
+  // Append the peer this helper actually accepted the connection from. The backend
+  // counts X-Forwarded-For from the RIGHT (src/net-safety.js trustedClientIp, one hop
+  // per trusted proxy), so appending preserves an existing trusted chain while a
+  // caller-supplied leftmost value can no longer claim the client's identity. With
+  // the header absent the peer becomes the whole value.
+  const peer = req.socket?.remoteAddress || req.connection?.remoteAddress || '';
+  if (peer) {
+    const prior = req.headers['x-forwarded-for'];
+    fwdHeaders['x-forwarded-for'] = prior ? `${prior}, ${peer}` : peer;
+  }
 
   const proxyReq = http.request({
     hostname: '127.0.0.1',
@@ -56,8 +51,9 @@ function proxy(req, res) {
       respHeaders['cache-control'] = 'no-cache';
       respHeaders['x-accel-buffering'] = 'no';
     }
-    // Inject CORS headers into every response
-    Object.assign(respHeaders, CORS_HEADERS);
+    // The backend owns its CORS policy: its allowlist, Vary and status pass through
+    // untouched. Overlaying a wildcard here would silently widen an operator-restricted
+    // origin for every client that reaches the dashboard through this helper.
     res.writeHead(proxyRes.statusCode, respHeaders);
 
     proxyRes.on('data', (chunk) => {

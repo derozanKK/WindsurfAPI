@@ -1,0 +1,86 @@
+{
+  "tests": [
+    "test/exe-boot-smoke.test.js",
+    "test/exe-boot-smoke-isolation.test.js"
+  ],
+  "expectBaselinePass": 12,
+  "mutations": [
+    {
+      "name": "Unrelated listener health is accepted instead of requiring the spawned PID",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "identity.pid !== child.pid || ",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "HTTP 200 without dashboard HTML is accepted",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "  if (dashboard.status !== 200 || !/text\\/html/i.test(dashboard.type)\n      || !/<html\\b/i.test(dashboard.body) || !/<body\\b/i.test(dashboard.body) || dashboard.body.length < 1000) {",
+      "replacement": "  if (false) {",
+      "expectCaught": true
+    },
+    {
+      "name": "Locale asset omission is not probed",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "  await requireJsonAsset('/dashboard/i18n/en.json');",
+      "replacement": "  // Mutant omits the representative locale asset.",
+      "expectCaught": true
+    },
+    {
+      "name": "Windows workflow skips the verified smoke",
+      "file": ".github/workflows/release.yml",
+      "anchor": "        run: node scripts/exe-boot-smoke.mjs dist-windows/windsurfapi.exe",
+      "replacement": "        run: echo skipped",
+      "expectCaught": true
+    },
+    {
+      "name": "health status is ignored, so a degraded service certifies the binary",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "identity.status !== 'ok'\n      || ",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "the provider field is ignored, so any service on the port certifies the binary",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "identity.provider !== 'WindsurfAPI bydwgx1337' || ",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "the version field is ignored, so a different build certifies the binary",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": " || identity.version !== VERSION) {",
+      "replacement": ") {",
+      "expectCaught": true
+    },
+    {
+      "name": "Dashboard password omission restores packaged first-run credential generation",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "DASHBOARD_PASSWORD:'ci-smoke-dashboard', ",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "The child inherits operator dotenv loading instead of explicitly disabling it",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "WINDSURFAPI_SKIP_DOTENV:'1', ",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "Smoke completion leaves its owned application directory behind",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "  if (dataDir) rmSync(dataDir, { recursive:true, force:true });",
+      "replacement": "  if (false) rmSync(dataDir, { recursive:true, force:true });",
+      "expectCaught": true
+    },
+    {
+      "name": "Operator credentials and proxy environment leak into the smoke child",
+      "file": "scripts/exe-boot-smoke.mjs",
+      "anchor": "  const env = {};",
+      "replacement": "  const env = { ...process.env };",
+      "expectCaught": true
+    }
+  ]
+}

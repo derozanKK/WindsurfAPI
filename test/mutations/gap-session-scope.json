@@ -1,0 +1,36 @@
+{
+  "tests": [
+    "test/caller-key-session-scope.test.js"
+  ],
+  "expectBaselinePass": 6,
+  "mutations": [
+    {
+      "name": "G-1: the session header outranks a presented API key in the caller-key ladder",
+      "file": "src/caller-key.js",
+      "anchor": "  if (apiKey) {\n    const base = `api:${sha256Hex(apiKey).slice(0, 32)}`;",
+      "replacement": "  if (apiKey && false) {\n    const base = `api:${sha256Hex(apiKey).slice(0, 32)}`;",
+      "expectCaught": true
+    },
+    {
+      "name": "G-1: a session header becomes an accepted credential",
+      "file": "src/server.js",
+      "anchor": "  const xApiKey = req.headers['x-api-key'] || '';\n  if (xApiKey) return xApiKey;",
+      "replacement": "  const xApiKey = req.headers['x-api-key'] || '';\n  if (xApiKey) return xApiKey;\n  const sessionAsCredential = req.headers['x-dashboard-session'] || '';\n  if (sessionAsCredential) return sessionAsCredential;",
+      "expectCaught": true
+    },
+    {
+      "name": "G-1: hasPerUserScope stops granting the session branch",
+      "file": "src/handlers/chat.js",
+      "anchor": "  if (callerKey.startsWith('session:')) return true;",
+      "replacement": "  if (callerKey.startsWith('session:')) return false;",
+      "expectCaught": true
+    },
+    {
+      "name": "GPT-07: the outer API-key gate stops refusing, so /v1 routes are reached unauthenticated",
+      "file": "src/server.js",
+      "anchor": "  if (!validateApiKey(extractToken(req))) {",
+      "replacement": "  if (false && !validateApiKey(extractToken(req))) {",
+      "expectCaught": true
+    }
+  ]
+}

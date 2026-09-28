@@ -99,6 +99,46 @@ describe('credential store — tamper / wrong key', () => {
     assert.throws(() => storeCredential('', 'pw', env), /required/);
     assert.throws(() => storeCredential('a@b.com', '', env), /required/);
   });
+
+  // GPT-05 (independent audit, 2026-09-22): a 16-byte GCM tag truncated to 4 bytes
+  // still decrypted the password, because the read path passed no `authTagLength` and
+  // node authenticates against whatever tag the file presents (with only a DEP0182
+  // warning). The tag length is part of this format, not a caller preference.
+  it('refuses a record whose GCM tag was truncated (fails closed)', () => {
+    const env = mkEnv();
+    storeCredential('a@b.com', 'pw', env);
+    const file = join(dir, 'creds.json');
+    const store = JSON.parse(readFileSync(file, 'utf8'));
+    const fullTag = store.records['a@b.com'].tag;
+    assert.equal(fullTag.length, 32, 'the writer stores the full 16-byte tag as hex');
+    for (const keep of [8, 16, 24]) {   // 4, 8 and 12 bytes
+      store.records['a@b.com'].tag = fullTag.slice(0, keep);
+      writeFileSync(file, JSON.stringify(store));
+      assert.throws(
+        () => getCredential('a@b.com', env),
+        /credential record tag is not the 16-byte GCM tag/,
+        `a ${keep / 2}-byte tag must not be accepted as this format's 16-byte tag`,
+      );
+    }
+  });
+
+  it('refuses a record whose tag field is malformed or over-long', () => {
+    const env = mkEnv();
+    storeCredential('a@b.com', 'pw', env);
+    const file = join(dir, 'creds.json');
+    const store = JSON.parse(readFileSync(file, 'utf8'));
+    const fullTag = store.records['a@b.com'].tag;
+    for (const bad of ['', fullTag + 'ab', 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz', null]) {
+      store.records['a@b.com'].tag = bad;
+      writeFileSync(file, JSON.stringify(store));
+      assert.throws(() => getCredential('a@b.com', env), /credential record tag is not the 16-byte GCM tag/, `tag ${JSON.stringify(bad)} must be refused`);
+    }
+    // Control: the untouched record still decrypts, so the assertions above are about
+    // the tag and not about the store being unreadable.
+    store.records['a@b.com'].tag = fullTag;
+    writeFileSync(file, JSON.stringify(store));
+    assert.equal(getCredential('a@b.com', env), 'pw');
+  });
 });
 
 describe('credential store — derived key', () => {

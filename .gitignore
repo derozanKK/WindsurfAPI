@@ -27,6 +27,7 @@ scripts/*
 !scripts/run-test-shard.mjs
 !scripts/run-tests.mjs
 !scripts/spec-static-check.mjs
+!scripts/spec-baseline-check.mjs
 !scripts/wire-base.mjs
 !scripts/spec-baseline-audit.mjs
 !scripts/s2-a-bench.mjs
@@ -137,3 +138,7 @@ data/self-update-before.pending.json
 # Machine-local; never product
 .DS_Store
 .codegraph/
+
+# Tracked baseline gate runtime dependencies (not audit scratch files).
+!scripts/spec-baseline-evidence.mjs
+!scripts/spec-baseline-platform-skips.json

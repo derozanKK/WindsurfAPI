@@ -1,0 +1,30 @@
+{
+  "tests": ["test/devin-connect-warning-cache-bound.test.js"],
+  "expectBaselinePass": 5,
+  "mutations": [
+    {
+      "name": "the eviction is deleted — unbounded retention returns: 1,025 distinct rejected names all stay resident",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  if (degradeWarned.size > DEGRADE_WARNED_MAX) {\n    degradeWarned.delete(degradeWarned.values().next().value);\n  }\n",
+      "replacement": ""
+    },
+    {
+      "name": "the cap is raised to MAX_SAFE_INTEGER — eviction is never reached, same unbounded growth with the code still present",
+      "file": "src/devin-connect-models.js",
+      "anchor": "const DEGRADE_WARNED_MAX = 1024;",
+      "replacement": "const DEGRADE_WARNED_MAX = Number.MAX_SAFE_INTEGER;"
+    },
+    {
+      "name": "the raw model name is stored again instead of its digest — caller-length strings retained, not fixed 64-char keys",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  const key = createHash('sha256').update(raw).digest('hex');",
+      "replacement": "  const key = raw;"
+    },
+    {
+      "name": "the dedupe check is dropped — every repeat of one unknown name warns again and the flood guard is gone",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  if (degradeWarned.has(key)) return;",
+      "replacement": "  if (false) return;"
+    }
+  ]
+}

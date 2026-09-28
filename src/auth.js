@@ -550,7 +550,11 @@ function markDirty() { _dirty = true; }
 
 function flushDirty() {
   if (!_dirty) return;
-  _dirty = false;
+  // The write's outcome owns the flag — saveAccounts clears it only after the
+  // durable temp write AND the publish both succeeded, and re-arms it on failure.
+  // Clearing here would swallow one transient EIO/ENOSPC: the 30s interval would
+  // then never retry the batch, and it would reach disk only when some unrelated
+  // mutation happened to mark the pool dirty again.
   saveAccounts();
 }
 
@@ -612,8 +616,6 @@ function _serializeAccounts() {
 function saveAccounts() {
   if (_saveInFlight) { _savePending = true; return; }
   _saveInFlight = true;
-  // A full persist captures everything the lazy dirty flag was tracking.
-  _dirty = false;
   const tempFile = `${ACCOUNTS_FILE}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
   try {
     // Atomic + durable write: write to a unique sibling tmp, fsync it, then
@@ -625,8 +627,18 @@ function saveAccounts() {
     // idToken) in cleartext — must not be world-readable on a shared host.
     writeFileSyncDurable(tempFile, JSON.stringify(_serializeAccounts(), null, 2), { mode: 0o600 });
     renameSyncWithRetry(tempFile, ACCOUNTS_FILE);
+    // Only a persist that got this far captures the lazy state the dirty flag was
+    // tracking. A throw from the directory fsync above leaves the pool dirty on
+    // purpose even though the rename published (fs-atomic marks that error
+    // renamePublished): the new name is visible here, the directory entry is not
+    // proven durable, and the next flush rewrites memory into a FRESH temp file.
+    _dirty = false;
   } catch (e) {
     log.error('Failed to save accounts:', e.message);
+    // The failed attempt published nothing (or published bytes whose directory
+    // entry could not be proven), so the batch is still unwritten: keep the retry
+    // signal the periodic flush needs.
+    _dirty = true;
     try { unlinkSync(tempFile); } catch {}
   } finally {
     _saveInFlight = false;
@@ -643,15 +655,19 @@ function saveAccounts() {
  * write — the periodic dirty-flush keeps the on-disk file current instead).
  */
 export function saveAccountsSync() {
-  _dirty = false;
   const tempFile = `${ACCOUNTS_FILE}.${process.pid}.shutdown.tmp`;
   try {
     // 0600: accounts.json holds live upstream tokens (apiKey/refreshToken/
     // idToken) in cleartext — must not be world-readable on a shared host.
     writeFileSyncDurable(tempFile, JSON.stringify(_serializeAccounts(), null, 2), { mode: 0o600 });
     renameSyncWithRetry(tempFile, ACCOUNTS_FILE);
+    // Same rule as saveAccounts: the outcome of the write owns the flag, and a
+    // throw after a published rename (renamePublished) still counts as "the
+    // directory entry is not proven".
+    _dirty = false;
   } catch (e) {
     log.error('Failed to flush accounts:', e.message);
+    _dirty = true;
     try { unlinkSync(tempFile); } catch {}
   }
 }

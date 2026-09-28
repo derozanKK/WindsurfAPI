@@ -1,132 +1,129 @@
 #!/usr/bin/env node
 /**
- * Boot-smoke a packaged single-file binary.
- *
- * The pkg build can succeed and still ship a broken binary: the ESM→CJS bundle
- * step or the `pkg.assets` list can silently drop the dashboard HTML / i18n /
- * catalog JSON, and that only shows up at runtime. So the gate is "does it boot
- * and serve", not "did pkg exit 0":
- *   - GET /health must answer 200 (server up, config loaded)
- *   - GET /dashboard must answer 200 (asset bundling intact)
- *
- * This logic used to live inline in .github/workflows/release.yml, duplicated
- * across the arm64 / x64 / windows jobs, with no way to run it locally before
- * pushing a tag. Same script now backs both.
- *
- * Usage:
- *   node scripts/exe-boot-smoke.mjs [path-to-binary]
- *
- * Default path is the current platform's expected output. Exits non-zero with a
- * diagnostic on failure.
+ * Boot-smoke a packaged binary, not whichever service occupies the port.
+ * All three executable release jobs use this entry point. Synthetic runtime
+ * credentials and a fresh DATA_DIR prevent reading/writing adjacent user state.
+ * A pass covers this child's health, dashboard HTML and two representative JSON
+ * assets, not every bundled asset or real upstream model behaviour.
  */
-
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, chmodSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 const PORT = Number(process.env.SMOKE_PORT || 3999);
 const BOOT_TIMEOUT_MS = Number(process.env.SMOKE_BOOT_TIMEOUT_MS || 20000);
-
+const VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+const OUTPUT_LIMIT = 64 * 1024;
+const BODY_LIMIT = 4 * 1024 * 1024;
 function defaultBinary() {
   if (process.platform === 'win32') return 'dist-windows/windsurfapi.exe';
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-  return `dist-macos/windsurfapi-macos-${arch}`;
+  return 'dist-macos/windsurfapi-macos-' + (process.arch === 'arm64' ? 'arm64' : 'x64');
 }
-
-const binary = process.argv[2] || defaultBinary();
-
-if (!existsSync(binary)) {
-  console.error(`✖ binary not found: ${binary}`);
-  console.error('  build it first, e.g. `npm run build:exe:macos`');
-  process.exit(1);
+const binary = resolve(process.argv[2] || defaultBinary());
+let child = null, dataDir = null, childClosed = false, done = null;
+let exitedEarly = null, output = '';
+function appendOutput(bytes) { output = (output + bytes.toString()).slice(-OUTPUT_LIMIT); }
+function childEnvironment() {
+  // Preserve OS process-launch essentials, not the operator's account/proxy/config env.
+  const env = {};
+  for (const key of ['PATH','Path','SystemRoot','SYSTEMROOT','WINDIR','COMSPEC','PATHEXT',
+    'HOME','USERPROFILE','APPDATA','LOCALAPPDATA','TEMP','TMP','TMPDIR','LANG','LC_ALL','TZ']) {
+    if (process.env[key] != null) env[key] = process.env[key];
+  }
+  return { ...env, DEVIN_CONNECT:'1', HOST:'127.0.0.1', PORT:String(PORT),
+    API_KEY:'ci-smoke', DASHBOARD_PASSWORD:'ci-smoke-dashboard', DATA_DIR:dataDir,
+    WINDSURFAPI_SKIP_DOTENV:'1', WINDSURFAPI_NO_OPEN:'1', RELOGIN_LIVE:'0',
+    DEVIN_CONNECT_AUTO_RELOGIN:'0', NO_COLOR:'1' };
 }
-
-if (process.platform !== 'win32') {
-  try { chmodSync(binary, 0o755); } catch { /* best-effort */ }
+async function cleanup() {
+  if (child && !childClosed) {
+    try { child.kill('SIGKILL'); } catch { /* close/error listener is authoritative */ }
+    let timer;
+    try {
+      await Promise.race([done, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('cannot confirm smoke child termination')), 5000);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  if (dataDir) rmSync(dataDir, { recursive:true, force:true });
 }
-
-const dataDir = mkdtempSync(join(tmpdir(), 'wa-smoke-'));
-let child = null;
-
-function cleanup() {
-  if (child && child.exitCode === null) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
-  try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-}
-
-async function probe(path) {
+async function probe(route) {
   try {
-    const res = await fetch(`http://127.0.0.1:${PORT}${path}`, {
-      signal: AbortSignal.timeout(3000),
+    const res = await fetch('http://127.0.0.1:' + PORT + route, {
+      signal: AbortSignal.timeout(3000), redirect:'error',
     });
-    return res.status;
-  } catch {
-    return 0;
-  }
+    const reader = res.body?.getReader();
+    const chunks = []; let size = 0;
+    if (reader) {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.length;
+        if (size > BODY_LIMIT) { await reader.cancel(); throw new Error('smoke body limit exceeded'); }
+        chunks.push(Buffer.from(value));
+      }
+    }
+    return { status:res.status, type:res.headers.get('content-type') || '', body:Buffer.concat(chunks).toString('utf8') };
+  } catch { return { status:0, type:'', body:'' }; }
 }
-
+async function requireJsonAsset(route) {
+  const result = await probe(route);
+  let data = null;
+  try { data = JSON.parse(result.body); } catch { /* rejected below */ }
+  if (result.status !== 200 || !/application\/json/i.test(result.type)
+      || !data || typeof data !== 'object' || !Object.keys(data).length) {
+    throw new Error('missing or invalid bundled JSON asset: ' + route);
+  }
+  console.log('  PASS ' + route + ' JSON');
+}
 async function main() {
-  console.log(`▶ boot-smoke ${binary} (port ${PORT}, DATA_DIR ${dataDir})`);
-  child = spawn(binary, [], {
-    env: {
-      ...process.env,
-      DEVIN_CONNECT: '1',
-      HOST: '127.0.0.1',
-      PORT: String(PORT),
-      API_KEY: 'ci-smoke',
-      DATA_DIR: dataDir,
-      WINDSURFAPI_NO_OPEN: '1',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  let output = '';
-  child.stdout.on('data', (d) => { output += d.toString(); });
-  child.stderr.on('data', (d) => { output += d.toString(); });
-
-  let exitedEarly = null;
-  child.on('exit', (code, signal) => { exitedEarly = signal || code; });
-
+  if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('invalid SMOKE_PORT');
+  if (!Number.isFinite(BOOT_TIMEOUT_MS) || BOOT_TIMEOUT_MS < 1 || BOOT_TIMEOUT_MS > 300000) throw new Error('invalid SMOKE_BOOT_TIMEOUT_MS');
+  if (!existsSync(binary)) throw new Error('binary not found: ' + binary);
+  if (process.platform !== 'win32') { try { chmodSync(binary, 0o755); } catch {} }
+  dataDir = mkdtempSync(join(tmpdir(), 'wa-smoke-'));
+  console.log('boot-smoke ' + binary + ' (port ' + PORT + ')');
+  child = spawn(binary, [], { env:childEnvironment(), stdio:['ignore','pipe','pipe'] });
+  done = new Promise(resolveDone => child.once('close', () => { childClosed = true; resolveDone(); }));
+  child.once('error', error => { exitedEarly = error.code || error.message; });
+  child.once('exit', (code, signal) => { exitedEarly = signal || code; });
+  child.stdout?.on('data', appendOutput); child.stderr?.on('data', appendOutput);
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
-  let health = 0;
-  while (Date.now() < deadline) {
-    if (exitedEarly !== null) break;
+  let health = { status:0 };
+  while (Date.now() < deadline && exitedEarly === null) {
     health = await probe('/health');
-    if (health === 200) break;
-    await new Promise(r => setTimeout(r, 500));
+    if (health.status === 200) break;
+    await new Promise(r => setTimeout(r, 100));
   }
-
-  if (exitedEarly !== null) {
-    console.error(`✖ the binary exited before serving (${exitedEarly})`);
-    console.error(output.slice(-2000));
-    return 1;
+  if (exitedEarly !== null) throw new Error('binary exited before serving: ' + exitedEarly);
+  if (health.status !== 200) throw new Error('/health did not become ready within the boot timeout');
+  let identity = null;
+  try { identity = JSON.parse(health.body); } catch { /* rejected below */ }
+  if (!identity || identity.pid !== child.pid || identity.status !== 'ok'
+      || identity.provider !== 'WindsurfAPI bydwgx1337' || identity.version !== VERSION) {
+    throw new Error('/health identity/PID/version does not belong to the spawned binary');
   }
-  if (health !== 200) {
-    console.error(`✖ /health did not answer 200 within ${BOOT_TIMEOUT_MS}ms (last: ${health})`);
-    console.error(output.slice(-2000));
-    return 1;
+  console.log('  PASS /health identity pid=' + child.pid + ' version=' + identity.version);
+  const dashboard = await probe('/dashboard');
+  if (dashboard.status !== 200 || !/text\/html/i.test(dashboard.type)
+      || !/<html\b/i.test(dashboard.body) || !/<body\b/i.test(dashboard.body) || dashboard.body.length < 1000) {
+    throw new Error('/dashboard did not serve the bundled HTML');
   }
-  console.log('  ✓ /health 200');
-
-  // Served from pkg.assets — a missing entry there builds fine and 404s here.
-  const dash = await probe('/dashboard');
-  if (dash !== 200) {
-    console.error(`✖ /dashboard answered ${dash} — asset bundling is broken (check pkg.assets)`);
-    console.error(output.slice(-2000));
-    return 1;
-  }
-  console.log('  ✓ /dashboard 200 (assets bundled)');
-
-  console.log('✔ boot-smoke OK');
-  return 0;
+  console.log('  PASS /dashboard HTML');
+  await requireJsonAsset('/dashboard/i18n/en.json');
+  await requireJsonAsset('/dashboard/data/contributors.json');
+  // Observe pending exit callbacks before approving; no claim about future uptime.
+  await new Promise(r => setImmediate(r));
+  if (exitedEarly !== null || childClosed) throw new Error('binary exited during smoke');
 }
-
 let code = 1;
-try {
-  code = await main();
-} catch (err) {
-  console.error(`✖ smoke failed: ${err?.message || err}`);
-} finally {
-  cleanup();
+try { await main(); code = 0; }
+catch (error) { console.error('smoke failed: ' + (error?.message || error)); if (output) console.error(output.slice(-2000)); }
+finally {
+  try { await cleanup(); }
+  catch (error) { code = 1; console.error('smoke cleanup failed: ' + error.message); }
 }
-process.exit(code);
+if (code === 0) console.log('boot-smoke OK (owned process terminated)');
+// close, unlike exit, includes draining the child stdio. Never force process.exit().
+process.exitCode = code;

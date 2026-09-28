@@ -1,0 +1,37 @@
+{
+  "tests": [
+    "test/workspace-scaffold-ownership.test.js",
+    "test/review-scaffold-race.test.js"
+  ],
+  "expectBaselinePass": 8,
+  "mutations": [
+    {
+      "name": "Directory acquisition is recursive/nonexclusive: another creator is overwritten",
+      "file": "src/client.js",
+      "anchor": "    try { mkdirSync(workspacePath); }",
+      "replacement": "    try { mkdirSync(workspacePath, { recursive: true }); }",
+      "expectCaught": true
+    },
+    {
+      "name": "A concurrently created stub filename is truncated",
+      "file": "src/client.js",
+      "anchor": "  writeFileSync(file, content, { flag: 'wx' });",
+      "replacement": "  writeFileSync(file, content, { flag: 'w' });",
+      "expectCaught": true
+    },
+    {
+      "name": "GPT-01: a new workspace is seeded with a project-shaped package.json instead of the labeled stub",
+      "file": "src/client.js",
+      "anchor": "    name: 'proxy-workspace-stub',",
+      "replacement": "    name: 'workspace-' + Math.random().toString(16).slice(2),",
+      "expectCaught": true
+    },
+    {
+      "name": "GPT-01: an existing directory we did not create stops being recognised, so the scaffold is seeded into it",
+      "file": "src/client.js",
+      "anchor": "    if (existsSync(workspacePath)) {\n      _seededWorkspaces.add(workspacePath);\n      return;\n    }",
+      "replacement": "    if (existsSync(workspacePath)) {\n      writeStubFiles(workspacePath);\n      _seededWorkspaces.add(workspacePath);\n      return;\n    }",
+      "expectCaught": true
+    }
+  ]
+}
