@@ -189,6 +189,10 @@ const STATS_DEFAULTS = {
   modelCounts: {},    // { "gpt-4o-mini": { requests, success, errors, totalMs } }
   accountCounts: {},  // { "acct-<8 hex>": { requests, success, errors } } — opaque ref, never a key/email
   hourlyBuckets: [],  // [{ hour: "2026-04-09T07:00:00Z", requests, errors }]
+  // 15-minute buckets for the fine-grained chart (30 min is aggregated client
+  // side). Same shape as hourlyBuckets, keyed by the quarter-hour start; the
+  // last 7 days are kept (QUARTER_BUCKET_CAP).
+  quarterBuckets: [], // [{ hour: "2026-04-09T07:15:00Z", requests, errors }]
   // v2.0.69 (#118 wnfilm) — bucket-level token totals so the dashboard
   // can show fresh_input / cache_read / cache_write / output without
   // having to recompute from the per-request usage stream. Keyed by
@@ -226,7 +230,7 @@ const STATS_DEFAULTS = {
   tokensByModel: {},   // { "swe-2-medium": { fresh_input, cache_read, cache_write, output, total, requests_with_usage } }
   // v2.0.148 — per-request detail ring buffer (bounded, persisted) so long runs
   // keep a rolling window of recent calls for audit/export instead of losing them.
-  recentRequests: [],  // [{ ts, model, success, ms, account, credit }]  newest last, cap 500; account is an opaque acct-<hash> ref
+  recentRequests: [],  // [{ ts, model, success, ms, account, credit }]  newest last, cap RECENT_REQ_CAP; account is an opaque acct-<hash> ref
 };
 
 function createStatsState() {
@@ -237,7 +241,17 @@ function createStatsState() {
 
 const _state = createStatsState();
 
-const RECENT_REQ_CAP = 500;
+// Per-request log ring size. STATS_REQUEST_LOG_CAP overrides (100..50000).
+export const RECENT_REQ_CAP = (() => {
+  const raw = parseInt(process.env.STATS_REQUEST_LOG_CAP ?? '', 10);
+  return Number.isFinite(raw) ? Math.max(100, Math.min(50_000, raw)) : 5000;
+})();
+// getStats() is polled every few seconds; it only ships the newest rows (the
+// chart tooltip needs a recent window). The full ring is served paged by
+// getRequestLog and in full by exportStats.
+const STATS_VIEW_RECENT = 500;
+const QUARTER_MS = 15 * 60 * 1000;
+const QUARTER_BUCKET_CAP = 7 * 24 * 4;
 
 const ACCOUNT_REF_RE = /^acct-[0-9a-f]{8}$/;
 
@@ -474,6 +488,31 @@ function getHourKey() {
   return d.toISOString();
 }
 
+function getQuarterKey(now = Date.now()) {
+  return new Date(Math.floor(now / QUARTER_MS) * QUARTER_MS).toISOString();
+}
+
+let _curQuarter = null;
+function recordQuarterBucket(success) {
+  if (!Array.isArray(_state.quarterBuckets)) _state.quarterBuckets = [];
+  const key = getQuarterKey();
+  let bucket = _curQuarter && _curQuarter.hour === key ? _curQuarter : null;
+  if (!bucket) {
+    const tail = _state.quarterBuckets[_state.quarterBuckets.length - 1];
+    bucket = tail && tail.hour === key ? tail : null;
+  }
+  if (!bucket) {
+    bucket = { hour: key, requests: 0, errors: 0 };
+    _state.quarterBuckets.push(bucket);
+    if (_state.quarterBuckets.length > QUARTER_BUCKET_CAP) {
+      _state.quarterBuckets.splice(0, _state.quarterBuckets.length - QUARTER_BUCKET_CAP);
+    }
+  }
+  _curQuarter = bucket;
+  bucket.requests++;
+  if (!success) bucket.errors++;
+}
+
 /**
  * Credit cost of one request, from live billing data when the sync knows it.
  *
@@ -573,6 +612,7 @@ export function recordRequest(model, success, durationMs, accountId, extra = {})
   _curBucket = bucket;
   bucket.requests++;
   if (!success) bucket.errors++;
+  recordQuarterBucket(success);
 
   // v2.0.148 — Credits spend + per-request detail. Cost comes from the live
   // billing sync when it knows the model (free promo → 0, catalog/rate-table
@@ -669,6 +709,7 @@ function accountAttribution() {
 /** Get all stats, with computed latency percentiles per model. */
 export function getStats() {
   const out = { ..._state };
+  out.recentRequests = (_state.recentRequests || []).slice(-STATS_VIEW_RECENT);
   out.accountAttribution = accountAttribution();
   // Rebuild every keyed map as a plain object: the public response keeps its
   // historical Object.prototype shape, while Object.fromEntries creates own
@@ -751,12 +792,12 @@ function normalizeStatsSnapshot(src) {
         ['fresh_input', 'cache_read', 'cache_write', 'output', 'total', 'requests_with_usage']);
     }
   }
-  for (const key of ['hourlyBuckets', 'recentRequests', 'recentPolicyBlocks']) {
+  for (const key of ['hourlyBuckets', 'quarterBuckets', 'recentRequests', 'recentPolicyBlocks']) {
     if (!Object.hasOwn(src, key)) continue;
     if (!Array.isArray(src[key])) throw new Error('invalid history');
     out[key] = src[key].map(entry => {
       if (!object(entry)) throw new Error('invalid history entry');
-      if (key === 'hourlyBuckets') {
+      if (key === 'hourlyBuckets' || key === 'quarterBuckets') {
         if (typeof entry.hour !== 'string' || !Number.isFinite(Date.parse(entry.hour))) throw new Error('invalid hour');
         return { hour: new Date(entry.hour).toISOString(), ...counts(entry, ['requests', 'errors']) };
       }
@@ -824,13 +865,17 @@ export function importStats(snap, { mode = 'merge' } = {}) {
         }
       }
     }
-    const hours = new Map();
-    for (const bucket of [...(mode === 'merge' ? src.hourlyBuckets : []), ...next.hourlyBuckets]) {
-      const current = hours.get(bucket.hour);
-      if (current) { current.requests += bucket.requests; current.errors += bucket.errors; }
-      else hours.set(bucket.hour, { ...bucket });
-    }
-    next.hourlyBuckets = [...hours.values()].sort((a, b) => a.hour.localeCompare(b.hour)).slice(-720);
+    const mergeBuckets = (incoming, current, cap) => {
+      const byKey = new Map();
+      for (const bucket of [...(mode === 'merge' ? incoming : []), ...current]) {
+        const hit = byKey.get(bucket.hour);
+        if (hit) { hit.requests += bucket.requests; hit.errors += bucket.errors; }
+        else byKey.set(bucket.hour, { ...bucket });
+      }
+      return [...byKey.values()].sort((a, b) => a.hour.localeCompare(b.hour)).slice(-cap);
+    };
+    next.hourlyBuckets = mergeBuckets(src.hourlyBuckets, next.hourlyBuckets, 720);
+    next.quarterBuckets = mergeBuckets(src.quarterBuckets, next.quarterBuckets, QUARTER_BUCKET_CAP);
     next.recentRequests = mergeStatsHistory(next.recentRequests, mode === 'merge' ? src.recentRequests : [],
       r => `${r.ts}|${r.model}`, RECENT_REQ_CAP);
     next.recentPolicyBlocks = mergeStatsHistory(next.recentPolicyBlocks, mode === 'merge' ? src.recentPolicyBlocks : [],
@@ -846,6 +891,7 @@ export function importStats(snap, { mode = 'merge' } = {}) {
   Object.assign(_state, next);
   for (const entry of Object.values(_state.modelCounts)) _touchSeq = Math.max(_touchSeq, entry.lastTs);
   _curBucket = null;
+  _curQuarter = null;
   scheduleSave();
   return { ok: true, mode };
 }
@@ -858,7 +904,9 @@ export function resetStats() {
   _state.modelCounts = emptyMap();
   _state.accountCounts = emptyMap();
   _state.hourlyBuckets = [];
+  _state.quarterBuckets = [];
   _curBucket = null; // invalidate cached bucket ref (S8) — buckets array replaced
+  _curQuarter = null;
   _state.tokenTotals = {
     fresh_input: 0, cache_read: 0, cache_write: 0,
     output: 0, total: 0, requests_with_usage: 0,
@@ -1030,7 +1078,7 @@ function percentileOf(values, p) {
  * `model`/`account`, numeric `status`.
  */
 export function getRequestLog({
-  from = null, to = null, model = null, account = null, status = null,
+  from = null, to = null, model = null, account = null, status = null, outcome = null,
   limit = 50, offset = 0,
 } = {}) {
   const rows = Array.isArray(_state.recentRequests) ? _state.recentRequests : [];
@@ -1051,6 +1099,8 @@ export function getRequestLog({
     if (modelFilter && row.model !== modelFilter) continue;
     if (accountFilter && row.account !== accountFilter) continue;
     if (statusNum != null && (!Number.isFinite(statusNum) || row.status !== statusNum)) continue;
+    if (outcome === 'success' && !row.success) continue;
+    if (outcome === 'error' && row.success) continue;
     filtered.push(row);
   }
 

@@ -6,7 +6,7 @@ import { config } from '../src/config.js';
 
 process.env.STATS_MAX_MODELS = '3';
 process.env.POLICY_BLOCK_RING = '20';
-const { exportStats, getStats, importStats, recordRequest, recordTokenUsage, resetStats } =
+const { exportStats, getStats, importStats, recordRequest, recordTokenUsage, resetStats, RECENT_REQ_CAP } =
   await import('../src/dashboard/stats.js');
 const { accountRef } = await import('../src/log-safety.js');
 const snapshot = () => {
@@ -215,7 +215,7 @@ describe('statistics snapshot import', () => {
     const hourlyBuckets = Array.from({ length: 725 }, (_, i) => ({
       hour: new Date(Date.UTC(2026, 0, 1, i)).toISOString(), requests: 1, errors: 0,
     }));
-    const recentRequests = Array.from({ length: 505 }, (_, i) => ({ ts: i, model: 'm', success: true }));
+    const recentRequests = Array.from({ length: RECENT_REQ_CAP + 5 }, (_, i) => ({ ts: i, model: 'm', success: true }));
     const recentPolicyBlocks = Array.from({ length: 25 }, (_, i) => ({ ts: i, promptHash: `h${i}` }));
     const creditsByHour = Object.fromEntries(hourlyBuckets.map(b => [b.hour, 1]));
     const creditsByDay = Object.fromEntries(Array.from({ length: 95 }, (_, i) =>
@@ -229,7 +229,7 @@ describe('statistics snapshot import', () => {
       assert.equal(stats.modelCounts.m.recentMs.length, 200);
       assert.equal(stats.hourlyBuckets.length, 720);
       assert.equal(stats.hourlyBuckets[0].hour, hourlyBuckets[5].hour);
-      assert.equal(stats.recentRequests.length, 500);
+      assert.equal(stats.recentRequests.length, RECENT_REQ_CAP);
       assert.equal(stats.recentRequests[0].ts, 5);
       assert.equal(stats.recentPolicyBlocks.length, 20);
       assert.equal(Object.keys(stats.creditsByHour).length, 720);

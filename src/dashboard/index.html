@@ -2991,6 +2991,10 @@ tbody tr:hover td { background: var(--surface-2); }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
         <span data-i18n="nav.stats">统计分析</span>
       </a>
+      <a href="#requests" data-panel="requests">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        <span data-i18n="nav.requests">请求记录</span>
+      </a>
     </div>
     <div class="nav-group" id="settings-nav-group">
       <div class="nav-group-label" data-i18n="nav.group.settings">设置 · 高级</div>
@@ -4140,6 +4144,11 @@ tbody tr:hover td { background: var(--surface-2); }
             <button class="seg-btn stats-range-btn" role="radio" aria-checked="false" data-range="all" onclick="App.setStatsRange('all')" data-i18n="range.all">全部</button>
             <button class="seg-btn stats-range-btn" role="radio" aria-checked="false" data-range="custom" onclick="App.openCustomRange()" data-i18n="range.custom">自定义</button>
           </div>
+          <div class="seg-group" role="radiogroup" data-i18n-aria-label="aria.statsBucketGroup" aria-label="时间粒度">
+            <button class="seg-btn stats-bucket-btn" role="radio" aria-checked="false" data-bucket="15" onclick="App.setStatsBucket(15)" data-i18n="range.bucket15m">15分钟</button>
+            <button class="seg-btn stats-bucket-btn" role="radio" aria-checked="false" data-bucket="30" onclick="App.setStatsBucket(30)" data-i18n="range.bucket30m">30分钟</button>
+            <button class="seg-btn stats-bucket-btn active" role="radio" aria-checked="true" data-bucket="60" onclick="App.setStatsBucket(60)" data-i18n="range.bucket1h">1小时</button>
+          </div>
         </div>
       </div>
       <div class="chart-canvas-wrap">
@@ -4245,6 +4254,117 @@ tbody tr:hover td { background: var(--surface-2); }
           </table>
         </div>
         <div id="stats-agg-note" class="text-sm text-muted" style="margin-top:8px" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Request records: live per-request log with per-account breakdown -->
+  <section class="panel" id="p-requests">
+    <div class="page-header">
+      <div>
+        <h1 class="page-title" data-i18n="page.requests">请求记录</h1>
+        <div class="page-subtitle" data-i18n="pageSubtitle.requests">实时记录每次请求的账号、模型、耗时、Token 与结果（仅元数据，不含提示词）</div>
+      </div>
+      <div class="btn-group">
+        <label class="text-sm" style="display:inline-flex;align-items:center;gap:6px">
+          <input type="checkbox" id="reqlog-auto" checked onchange="App.setReqLogAuto(this.checked)">
+          <span data-i18n="reqlog.autoRefresh">每 5 秒自动刷新</span>
+        </label>
+        <button class="btn btn-ghost btn-sm" onclick="App.loadRequests()" data-i18n-title="action.refresh" title="刷新">
+          <span data-i18n="action.refresh">刷新</span>
+        </button>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <div class="section-title" data-i18n="reqlog.byAccountTitle">按账号汇总</div>
+          <div class="section-desc" data-i18n="reqlog.byAccountDesc">与下方明细同一筛选窗口；点击某个账号即可只看它的请求</div>
+        </div>
+        <span class="text-sm text-muted" id="reqlog-summary"></span>
+      </div>
+      <div class="stats-filter-bar">
+        <label><span data-i18n="reqlog.window">时间范围</span>
+          <select class="select" id="reqlog-window" onchange="App.setReqLogFilter('window', this.value)">
+            <option value="1" data-i18n="reqlog.window1h">最近 1 小时</option>
+            <option value="6" data-i18n="range.6h">6小时</option>
+            <option value="24" selected data-i18n="range.24h">24小时</option>
+            <option value="168" data-i18n="range.7d">7天</option>
+            <option value="all" data-i18n="range.all">全部</option>
+          </select>
+        </label>
+        <label><span data-i18n="section.statsLog.filters.account">账号</span>
+          <select class="select" id="reqlog-account" onchange="App.setReqLogFilter('account', this.value)"></select>
+        </label>
+        <label><span data-i18n="section.statsLog.filters.model">模型</span>
+          <select class="select" id="reqlog-model" onchange="App.setReqLogFilter('model', this.value)"></select>
+        </label>
+        <label><span data-i18n="reqlog.outcome">结果</span>
+          <select class="select" id="reqlog-outcome" onchange="App.setReqLogFilter('outcome', this.value)">
+            <option value="" data-i18n="section.statsLog.filters.all">全部</option>
+            <option value="success" data-i18n="reqlog.success">成功</option>
+            <option value="error" data-i18n="reqlog.failed">失败</option>
+          </select>
+        </label>
+        <button class="btn btn-ghost btn-xs" onclick="App.resetReqLogFilters()" data-i18n="section.statsLog.filters.reset">清除筛选</button>
+        <span class="text-sm text-muted" id="reqlog-retention"></span>
+      </div>
+      <div class="section-body tight">
+        <div class="table-wrap" tabindex="0" role="region" aria-label="可滚动表格" data-i18n-aria-label="aria.scrollableTable">
+          <table id="reqlog-account-table" class="stats-agg-table">
+            <thead><tr>
+              <th data-i18n="table.header.account">账号</th>
+              <th class="numeric" data-i18n="table.header.requests">请求数</th>
+              <th class="numeric" data-i18n="reqlog.success">成功</th>
+              <th class="numeric" data-i18n="reqlog.failed">失败</th>
+              <th class="numeric" data-i18n="table.header.successRate">成功率</th>
+              <th class="numeric" data-i18n="table.header.avg">平均耗时</th>
+              <th class="numeric" data-i18n="table.header.tokensIn">输入 Token</th>
+              <th class="numeric" data-i18n="table.header.tokensOut">输出 Token</th>
+              <th class="numeric" data-i18n="table.header.cost">费用 (credits)</th>
+            </tr></thead>
+            <tbody id="reqlog-account-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <div class="section-title" data-i18n="reqlog.detailTitle">请求明细</div>
+          <div class="section-desc" data-i18n="reqlog.detailDesc">每次上游尝试一行（故障切换的重试也会单独记录），最新在前</div>
+        </div>
+      </div>
+      <div class="section-body tight">
+        <div class="table-wrap" tabindex="0" role="region" aria-label="可滚动表格" data-i18n-aria-label="aria.scrollableTable">
+          <table id="reqlog-table">
+            <thead><tr>
+              <th data-i18n="table.header.time">时间</th>
+              <th data-i18n="table.header.account">账号</th>
+              <th data-i18n="table.header.model">模型</th>
+              <th data-i18n="reqlog.outcome">结果</th>
+              <th class="numeric" data-i18n="table.header.duration">耗时</th>
+              <th class="numeric" data-i18n="table.header.tokensIn">输入 Token</th>
+              <th class="numeric" data-i18n="table.header.tokensOut">输出 Token</th>
+              <th class="numeric" data-i18n="reqlog.cacheRead">缓存读取</th>
+              <th class="numeric" data-i18n="table.header.cost">费用 (credits)</th>
+            </tr></thead>
+            <tbody id="reqlog-body">
+              <tr class="empty-row"><td colspan="9" data-i18n="table.empty.noRequestData">暂无请求数据</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="table-pagination">
+          <button class="btn btn-ghost btn-xs" id="reqlog-prev" onclick="App.setReqLogPage(App.reqLogPage - 1)" data-i18n="action.prev">上一页</button>
+          <span class="page-label" id="reqlog-page-label">-</span>
+          <select class="select" id="reqlog-page-size" onchange="App.setReqLogPageSize(this.value)">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+          <button class="btn btn-ghost btn-xs" id="reqlog-next" onclick="App.setReqLogPage(App.reqLogPage + 1)" data-i18n="action.next">下一页</button>
+        </div>
       </div>
     </div>
   </section>
@@ -4867,7 +4987,7 @@ const App = {
     const loaders = {
       overview: 'loadOverview',
       accounts: 'loadAccounts', models: 'loadModels', proxy: 'loadProxy',
-      logs: 'loadLogs', stats: 'loadStats', usage: 'loadUsage',
+      logs: 'loadLogs', stats: 'loadStats', usage: 'loadUsage', requests: 'loadRequests',
       experimental: 'loadExperimental', credits: 'loadCredits', settings: 'loadSettings',
     };
     const loader = loaders[activePanelId];
@@ -5300,7 +5420,7 @@ docker compose up -d --force-recreate</pre>
     const loaders = {
       overview: 'loadOverview',
       accounts: 'loadAccounts', models: 'loadModels', proxy: 'loadProxy',
-      logs: 'loadLogs', stats: 'loadStats', usage: 'loadUsage',
+      logs: 'loadLogs', stats: 'loadStats', usage: 'loadUsage', requests: 'loadRequests',
       devin: 'loadDevin',
       experimental: 'loadExperimental',
       credits: 'loadCredits', settings: 'loadSettings',
@@ -12301,8 +12421,18 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
   statsRange: 24,            // number of hours, or 'all', or 'custom'
   statsCustomRange: null,    // { start: Date, end: Date } when range='custom'
   statsChartType: 'bar',
+  statsBucketMin: 60,        // chart granularity: 15 / 30 / 60 minutes
   statsMetrics: { requests: true, success: true, errors: true },
   _lastStatsData: null,
+  // Request-records panel state (its own window, independent of the chart).
+  reqLogPage: 1,
+  reqLogPageSize: 50,
+  reqLogWindow: '24',
+  reqLogAccount: '',
+  reqLogModel: '',
+  reqLogOutcome: '',
+  reqLogAuto: true,
+  _reqLogSeq: 0,
   // Request-log view state. The time window follows statsRange/statsCustomRange
   // so the chart's range control drives both views; model/account/status are
   // log-only filters. Page size is per-session (no localStorage: the log is a
@@ -12388,6 +12518,33 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     if (this._lastStatsData) this.renderMainChart(this._lastStatsData);
     this.statsLogPage = 1;
     this.loadStatsLog();
+  },
+
+  setStatsBucket(minutes) {
+    const m = Number(minutes);
+    this.statsBucketMin = [15, 30, 60].includes(m) ? m : 60;
+    this._syncRadioGroup('.stats-bucket-btn', b => Number(b.dataset.bucket) === this.statsBucketMin);
+    if (this._lastStatsData) this.renderMainChart(this._lastStatsData);
+  },
+
+  // Chart series at the selected granularity. 60 min reads hourlyBuckets; 15/30
+  // aggregate the backend's 15-minute buckets (kept for 7 days). The bucket that
+  // contains "now" is always included, so the chart is live to the current slot.
+  _chartBuckets(d) {
+    const minutes = Number(this.statsBucketMin) || 60;
+    if (minutes >= 60) return this._filterBuckets(d.hourlyBuckets, 3600_000);
+    const step = minutes * 60_000;
+    const agg = new Map();
+    for (const b of d.quarterBuckets || []) {
+      const t0 = new Date(b.hour).getTime();
+      if (!Number.isFinite(t0)) continue;
+      const t = Math.floor(t0 / step) * step;
+      const cur = agg.get(t) || { hour: new Date(t).toISOString(), requests: 0, errors: 0 };
+      cur.requests += b.requests || 0;
+      cur.errors += b.errors || 0;
+      agg.set(t, cur);
+    }
+    return this._filterBuckets([...agg.values()].sort((a, b) => a.hour.localeCompare(b.hour)), step);
   },
 
   setChartType(type) {
@@ -12492,6 +12649,168 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     if (this._lastStatsLog) this._renderStatsAgg(this._lastStatsLog);
   },
 
+  // ─── Request records panel ──────────────────────
+  // Live view over the same /stats/log ring as the stats page, with its own
+  // window/filters, account labels resolved server-side (accountLabels), and a
+  // 5s poll while the panel is visible.
+  _acctLabel(ref, labels) {
+    if (!ref) return I18n.t('reqlog.unattributed');
+    const label = (labels || this._reqLogLabels || {})[ref];
+    return label || ref;
+  },
+
+  reqLogUrl() {
+    const qs = new URLSearchParams();
+    const hours = Number(this.reqLogWindow);
+    if (Number.isFinite(hours) && hours > 0) qs.set('from', String(Date.now() - hours * 3600_000));
+    if (this.reqLogAccount) qs.set('account', this.reqLogAccount);
+    if (this.reqLogModel) qs.set('model', this.reqLogModel);
+    if (this.reqLogOutcome) qs.set('outcome', this.reqLogOutcome);
+    qs.set('limit', String(this.reqLogPageSize));
+    qs.set('offset', String((this.reqLogPage - 1) * this.reqLogPageSize));
+    return `/stats/log?${qs.toString()}`;
+  },
+
+  async loadRequests() {
+    const seq = ++this._reqLogSeq;
+    const d = await this.api('GET', this.reqLogUrl()).catch(() => null);
+    if (seq !== this._reqLogSeq) return;
+    this._renderRequests(d);
+    if (this.reqLogAuto) this.poll('requests', () => this.loadRequests(), 5000);
+    else if (this.pollers.requests) { clearInterval(this.pollers.requests); delete this.pollers.requests; }
+  },
+
+  setReqLogAuto(on) {
+    this.reqLogAuto = !!on;
+    this.loadRequests();
+  },
+
+  setReqLogFilter(key, value) {
+    if (key === 'window') this.reqLogWindow = value || 'all';
+    else if (key === 'account') this.reqLogAccount = value || '';
+    else if (key === 'model') this.reqLogModel = value || '';
+    else if (key === 'outcome') this.reqLogOutcome = value || '';
+    this.reqLogPage = 1;
+    this.loadRequests();
+  },
+
+  resetReqLogFilters() {
+    this.reqLogAccount = '';
+    this.reqLogModel = '';
+    this.reqLogOutcome = '';
+    const outcome = document.getElementById('reqlog-outcome');
+    if (outcome) outcome.value = '';
+    this.reqLogPage = 1;
+    this.loadRequests();
+  },
+
+  setReqLogPage(page) {
+    const next = Math.max(1, Number(page) || 1);
+    if (next === this.reqLogPage) return;
+    this.reqLogPage = next;
+    this.loadRequests();
+  },
+
+  setReqLogPageSize(value) {
+    this.reqLogPageSize = Math.max(1, Math.min(200, Number(value) || 50));
+    this.reqLogPage = 1;
+    this.loadRequests();
+  },
+
+  _renderRequests(d) {
+    const body = document.getElementById('reqlog-body');
+    const acctBody = document.getElementById('reqlog-account-body');
+    if (!body || !acctBody) return;
+    if (!d || d.success === false || !Array.isArray(d.items)) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="9">${this.esc(I18n.t('section.statsLog.unavailable'))}</td></tr>`;
+      acctBody.innerHTML = '';
+      return;
+    }
+    const labels = d.accountLabels || {};
+    this._reqLogLabels = labels;
+
+    // Account filter shows labels; the value stays the opaque ref the API filters on.
+    const acctSel = document.getElementById('reqlog-account');
+    if (acctSel) {
+      const refs = [...new Set([...(d.filters?.accounts || []), ...(this.reqLogAccount ? [this.reqLogAccount] : [])])];
+      refs.sort((a, b) => this._acctLabel(a, labels).localeCompare(this._acctLabel(b, labels)));
+      acctSel.innerHTML = `<option value="">${this.esc(I18n.t('section.statsLog.filters.all'))}</option>`
+        + refs.map(r => `<option value="${this.esc(r)}"${r === this.reqLogAccount ? ' selected' : ''}>${this.esc(this._acctLabel(r, labels))}</option>`).join('');
+      acctSel.value = this.reqLogAccount;
+    }
+    this._fillStatsLogSelect('reqlog-model', d.filters?.models, this.reqLogModel);
+
+    const retentionEl = document.getElementById('reqlog-retention');
+    if (retentionEl) {
+      retentionEl.textContent = I18n.t('section.statsLog.retention', {
+        stored: Number(d.retention?.stored) || 0,
+        capacity: Number(d.retention?.capacity) || 0,
+      });
+    }
+    const s = d.summary || {};
+    const summaryEl = document.getElementById('reqlog-summary');
+    if (summaryEl) {
+      summaryEl.textContent = I18n.t('section.statsLog.summary', {
+        count: Number(d.total) || 0,
+        in: this.fmtTokenCount(s.tokensIn),
+        out: this.fmtTokenCount(s.tokensOut),
+        credit: this.fmtCredit(s.credits),
+      });
+    }
+
+    const rateCell = (ok, total) => {
+      const rate = total > 0 ? (ok / total) * 100 : 0;
+      const color = rate >= 95 ? 'var(--success)' : rate >= 80 ? 'var(--warn)' : 'var(--error)';
+      return `<td class="numeric" style="color:${color};font-weight:600">${rate.toFixed(1)}%</td>`;
+    };
+    acctBody.innerHTML = (d.byAccount || []).map((a) => {
+      const active = a.account === this.reqLogAccount;
+      return `<tr class="model-row" role="button" tabindex="0" style="cursor:pointer${active ? ';background:var(--surface-2)' : ''}"`
+        + ` onclick="App.setReqLogFilter('account', '${this.escJsAttr(active ? '' : a.account)}')">`
+        + `<td><b>${this.esc(this._acctLabel(a.account, labels))}</b> <code class="text-xs text-muted">${this.esc(a.account)}</code></td>`
+        + `<td class="numeric">${a.requests}</td>`
+        + `<td class="numeric" style="color:var(--success)">${a.success}</td>`
+        + `<td class="numeric" style="color:${a.errors > 0 ? 'var(--error)' : 'inherit'}">${a.errors}</td>`
+        + rateCell(a.success, a.requests)
+        + `<td class="numeric">${this.esc(this.fmtMs(a.avgMs))}</td>`
+        + `<td class="numeric">${this.esc(this.fmtTokenCount(a.tokensIn))}</td>`
+        + `<td class="numeric">${this.esc(this.fmtTokenCount(a.tokensOut))}</td>`
+        + `<td class="numeric">${this.esc(this.fmtCredit(a.credits))}</td>`
+        + `</tr>`;
+    }).join('') || `<tr class="empty-row"><td colspan="9">${this.esc(I18n.t('section.statsLog.empty'))}</td></tr>`;
+
+    const items = d.items.filter(r => r && typeof r === 'object');
+    body.innerHTML = items.map((r) => {
+      const when = new Date(Number(r.ts) || 0);
+      const status = Number(r.status);
+      const ok = !!r.success;
+      const outcome = `<span class="badge ${ok ? 'success' : 'error'} no-dot">${this.esc(I18n.t(ok ? 'reqlog.success' : 'reqlog.failed'))}`
+        + (Number.isFinite(status) ? ` · ${status}` : '') + `</span>`;
+      return `<tr>`
+        + `<td class="text-sm" style="white-space:nowrap">${this.esc(when.toLocaleString())}</td>`
+        + `<td class="text-sm"><span class="cell-ellipsis" title="${this.esc(r.account || '')}">${this.esc(this._acctLabel(r.account, labels))}</span></td>`
+        + `<td class="text-sm"><span class="cell-ellipsis" title="${this.esc(r.model || '')}">${this.esc(r.model || '-')}</span></td>`
+        + `<td>${outcome}</td>`
+        + `<td class="text-sm numeric">${this.esc(this.fmtMs(r.ms))}</td>`
+        + `<td class="text-sm numeric" title="${this.esc(this._statsTokenTitle(r))}">${this.esc(this.fmtTokenCount(r.tokensIn))}</td>`
+        + `<td class="text-sm numeric">${this.esc(this.fmtTokenCount(r.tokensOut))}</td>`
+        + `<td class="text-sm numeric">${this.esc(this.fmtTokenCount(r.cacheRead))}</td>`
+        + `<td class="text-sm numeric">${this.esc(this.fmtCredit(r.credit))}</td>`
+        + `</tr>`;
+    }).join('') || `<tr class="empty-row"><td colspan="9">${this.esc(I18n.t('section.statsLog.empty'))}</td></tr>`;
+
+    const total = Number(d.total) || 0;
+    const offset = Number(d.offset) || 0;
+    const from = total === 0 || items.length === 0 ? 0 : offset + 1;
+    const to = total === 0 || items.length === 0 ? 0 : Math.min(total, offset + items.length);
+    const label = document.getElementById('reqlog-page-label');
+    if (label) label.textContent = `${from}-${to} / ${total}`;
+    const prev = document.getElementById('reqlog-prev');
+    const next = document.getElementById('reqlog-next');
+    if (prev) prev.disabled = offset <= 0;
+    if (next) next.disabled = !d.hasMore;
+  },
+
   _statsFreeLabel(model) {
     const b = this._statsModelBilling?.[model];
     if (!b || b.freeNow !== true) return '';
@@ -12572,7 +12891,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       return `<tr>`
         + `<td class="text-sm" title="${this.esc(when.toLocaleString())}">${this.esc(when.toLocaleString())}</td>`
         + `<td class="text-sm"><span class="cell-ellipsis" title="${this.esc(r.model || '')}">${this.esc(r.model || '-')}</span></td>`
-        + `<td class="text-sm"><code>${this.esc(r.account || '-')}</code></td>`
+        + `<td class="text-sm"><span class="cell-ellipsis" title="${this.esc(r.account || '')}">${this.esc(r.account ? this._acctLabel(r.account, d.accountLabels) : '-')}</span></td>`
         + `<td><span class="badge ${badge} no-dot">${this.esc(hasStatus ? status : '-')}</span></td>`
         + `<td class="text-sm numeric">${this.esc(this.fmtMs(r.ms))}</td>`
         + `<td class="text-sm numeric" title="${this.esc(this._statsTokenTitle(r))}">${this.esc(this.fmtTokenCount(r.tokensIn))}</td>`
@@ -12631,7 +12950,9 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       const free = tab === 'model' ? this._statsFreeLabel(r.model) : '';
       const freeHtml = free ? ` <span class="chip-badge free">${this.esc(free)}</span>` : '';
       return `<tr>`
-        + `<td>${tab === 'day' ? this.esc(name) : `<code>${this.esc(name)}</code>`}${freeHtml}</td>`
+        + `<td>${tab === 'day' ? this.esc(name)
+          : tab === 'account' ? `${this.esc(this._acctLabel(name, d.accountLabels))} <code class="text-xs text-muted">${this.esc(name)}</code>`
+          : `<code>${this.esc(name)}</code>`}${freeHtml}</td>`
         + `<td class="numeric">${this.esc(r.requests)}</td>`
         + `<td class="numeric" style="color:${rateColor};font-weight:600">${rate}%</td>`
         + `<td class="numeric" style="color:${r.errors > 0 ? 'var(--error)' : 'inherit'}">${this.esc(r.errors)}</td>`
@@ -12758,7 +13079,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     // ring, so this is a local read with no upstream cost.
     this.loadStatsLog();
 
-    this.poll('stats', () => this.loadStats(), 30000);
+    this.poll('stats', () => this.loadStats(), 15000);
   },
 
   _setupCanvas(canvas) {
@@ -12772,7 +13093,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     return { ctx, W: rect.width, H: rect.height };
   },
 
-  _filterBuckets(raw) {
+  _filterBuckets(raw, stepMs = 3600_000) {
     const all = (raw || []).map(b => ({
       hour: b.hour,
       t: new Date(b.hour).getTime(),
@@ -12783,7 +13104,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     if (this.statsRange === 'custom' && this.statsCustomRange) {
       const { start, end } = this.statsCustomRange;
       const inRange = all.filter(b => b.t >= start.getTime() && b.t <= end.getTime());
-      return this._padTimeline(inRange, start.getTime(), end.getTime());
+      return this._padTimeline(inRange, start.getTime(), end.getTime(), stepMs);
     }
     if (this.statsRange === 'all' || this.statsRange === -1) return all;
     // v2.0.59 — fixed-window ranges (6h/24h/7d/30d) now backfill missing
@@ -12792,9 +13113,9 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     // look like "6 pts" with huge gaps when traffic is sparse.
     const n = Number(this.statsRange);
     if (!Number.isFinite(n) || n <= 0) return all.slice(-n);
-    const endMs = Math.floor(Date.now() / 3600_000) * 3600_000;
-    const startMs = endMs - (n - 1) * 3600_000;
-    return this._padTimeline(all.filter(b => b.t >= startMs && b.t <= endMs), startMs, endMs);
+    const endMs = Math.floor(Date.now() / stepMs) * stepMs;
+    const startMs = endMs - n * 3600_000 + stepMs;
+    return this._padTimeline(all.filter(b => b.t >= startMs && b.t <= endMs), startMs, endMs, stepMs);
   },
 
   // Generate a contiguous hourly timeline between [startMs, endMs] (both
@@ -12802,13 +13123,13 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
   // emit a bucket for. Keeps the bar chart visually rhythmic when traffic
   // is sparse — empty bars render as flat baseline ticks instead of huge
   // visible gaps that read as "broken chart".
-  _padTimeline(present, startMs, endMs) {
+  _padTimeline(present, startMs, endMs, stepMs = 3600_000) {
     const map = new Map();
-    for (const b of present) map.set(Math.floor(b.t / 3600_000) * 3600_000, b);
+    for (const b of present) map.set(Math.floor(b.t / stepMs) * stepMs, b);
     const out = [];
-    const startHour = Math.floor(startMs / 3600_000) * 3600_000;
-    const endHour = Math.floor(endMs / 3600_000) * 3600_000;
-    for (let t = startHour; t <= endHour; t += 3600_000) {
+    const startHour = Math.floor(startMs / stepMs) * stepMs;
+    const endHour = Math.floor(endMs / stepMs) * stepMs;
+    for (let t = startHour; t <= endHour; t += stepMs) {
       const hit = map.get(t);
       if (hit) { out.push(hit); continue; }
       out.push({
@@ -12932,14 +13253,13 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
   // ring, ~500) does — bucket it by the same ISO-hour key the backend uses.
   // Returns Map<hourKey, [[model, count], ...] sorted desc>. Cheap, memoized per
   // render on the request array identity so hover repaints don't recompute.
-  _modelsByHour(recentRequests) {
+  _modelsByHour(recentRequests, stepMs = 3600_000) {
     if (!Array.isArray(recentRequests)) return new Map();
-    if (this._mbhCacheSrc === recentRequests && this._mbhCache) return this._mbhCache;
+    if (this._mbhCacheSrc === recentRequests && this._mbhCacheStep === stepMs && this._mbhCache) return this._mbhCache;
     const byHour = new Map();
     for (const r of recentRequests) {
       if (!r || !r.ts || !r.model) continue;
-      const d = new Date(r.ts); d.setMinutes(0, 0, 0);
-      const hour = d.toISOString();
+      const hour = new Date(Math.floor(Number(r.ts) / stepMs) * stepMs).toISOString();
       let m = byHour.get(hour);
       if (!m) { m = new Map(); byHour.set(hour, m); }
       m.set(r.model, (m.get(r.model) || 0) + 1);
@@ -12949,6 +13269,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       out.set(hour, [...m.entries()].sort((a, b) => b[1] - a[1]));
     }
     this._mbhCacheSrc = recentRequests;
+    this._mbhCacheStep = stepMs;
     this._mbhCache = out;
     return out;
   },
@@ -12959,9 +13280,10 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     const rangeIndicator = document.getElementById('stats-range-indicator');
     if (!canvas) return;
 
-    // Per-hour model breakdown for the hover tooltip (B3). Stashed for _bindChartHover.
-    this._modelsByHourMap = this._modelsByHour(d.recentRequests);
-    let buckets = this._filterBuckets(d.hourlyBuckets);
+    // Per-bucket model breakdown for the hover tooltip (B3). Stashed for _bindChartHover.
+    this._chartStepMs = (Number(this.statsBucketMin) || 60) * 60_000;
+    this._modelsByHourMap = this._modelsByHour(d.recentRequests, this._chartStepMs);
+    let buckets = this._chartBuckets(d);
     const MAX_POINTS = 160;
     const originalLength = buckets.length;
     buckets = this._downsample(buckets, MAX_POINTS);
@@ -13311,7 +13633,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       const dt = new Date(b.hour);
       const txt = useDate
         ? `${dt.getMonth() + 1}/${dt.getDate()}`
-        : dt.getHours().toString().padStart(2, '0') + ':00';
+        : dt.getHours().toString().padStart(2, '0') + ':' + dt.getMinutes().toString().padStart(2, '0');
       const x = xAt(i);
       if (txt === lastLabel) return;
       if (x - lastX < minGapPx && i !== buckets.length - 1) return;
@@ -13385,7 +13707,11 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       }
       const b = hm.buckets[best];
       const rate = b.requests > 0 ? ((b.success / b.requests) * 100).toFixed(1) : '—';
-      const time = new Date(b.hour).toLocaleString();
+      const bucketStart = new Date(b.hour);
+      const bucketEnd = new Date(bucketStart.getTime() + (this._chartStepMs || 3600_000));
+      const fmtHm = (dt) => dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const time = `${bucketStart.toLocaleDateString()} ${fmtHm(bucketStart)} – ${fmtHm(bucketEnd)}`
+        + (bucketEnd.getTime() > Date.now() ? ` (${I18n.t('section.requestChart.tooltipInProgress')})` : '');
       const c = this._chartColors;
       // B3: which models were requested in this hour (top 4 from recentRequests).
       // Only present for hours within the recentRequests window; older buckets

@@ -21,6 +21,7 @@ import { fileURLToPath } from 'url';
 import { VERSION, BRAND } from './version.js';
 import { abortActiveSse } from './sse-registry.js';
 import { registerServer } from './server-registry.js';
+import { flushLangfuse, isLangfuseEnabled } from './langfuse.js';
 export { VERSION, BRAND };
 
 // v2.0.146 (audit F-1): last-resort process safety nets. This service must
@@ -237,6 +238,8 @@ async function main() {
     }, 800);
   }
 
+  if (isLangfuseEnabled()) log.info('Langfuse export enabled (request metadata + token usage only)');
+
   let shuttingDown = false;
   const shutdown = (signal) => {
     if (shuttingDown) return;
@@ -264,6 +267,7 @@ async function main() {
       // it lets an external write land safely once the process is stopped.
       try { await stopLanguageServerAndWait({ perProcessTimeoutMs: 1500 }); }
       catch { try { stopLanguageServer(); } catch {} }
+      await flushLangfuse().catch(() => {});
       log.info(`Shutdown complete (${reason})`);
       process.exit(0);
     };

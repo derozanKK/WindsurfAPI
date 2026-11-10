@@ -27,7 +27,8 @@
     "experimental": "实验性功能",
     "credits": "致谢",
     "usage": "用量",
-    "devin": "Devin 面板"
+    "devin": "Devin 面板",
+    "requests": "请求记录"
   },
   "pageTitle": {
     "main": "WindsurfAPI bydwgx1337 控制台"
@@ -45,7 +46,8 @@
     "experimental": "实验性功能",
     "credits": "致谢",
     "usage": "用量",
-    "devin": "Devin 面板"
+    "devin": "Devin 面板",
+    "requests": "请求记录"
   },
   "pageSubtitle": {
     "overview": "系统运行状态与关键指标概览",
@@ -60,7 +62,8 @@
     "settings": "跨浏览器共享的偏好与安全阈值，可自定义",
     "experimental": "尚未稳定的优化项；如果发现异常可以随时关闭",
     "credits": "感谢以下朋友为项目提交 PR / 审计代码 / 修复问题",
-    "devin": "会话与轨迹、模型目录、用量配额、运行时设置。只显示代理真实读到的数据；读不到的项标明原因，不用 0 冒充。"
+    "devin": "会话与轨迹、模型目录、用量配额、运行时设置。只显示代理真实读到的数据；读不到的项标明原因，不用 0 冒充。",
+    "requests": "实时记录每次请求的账号、模型、耗时、Token 与结果（仅元数据，不含提示词）"
   },
   "usage": {
     "title": "用量",
@@ -180,7 +183,8 @@
     "statsLog": "请求日志表格",
     "statsAggGroup": "聚合维度",
     "openNav": "打开导航",
-    "scrollableTable": "可滚动表格"
+    "scrollableTable": "可滚动表格",
+    "statsBucketGroup": "时间粒度"
   },
   "action": {
     "retry": "重试",
@@ -546,7 +550,8 @@
       "tooltipSuccess": "成功",
       "tooltipRate": "成功率",
       "tooltipByModel": "本小时按模型",
-      "tooltipMoreModels": "另 {{count}} 个"
+      "tooltipMoreModels": "另 {{count}} 个",
+      "tooltipInProgress": "进行中"
     },
     "emailOtpLogin": {
       "title": "邮箱验证码登录",
@@ -941,7 +946,10 @@
     "customEnd": "结束日期",
     "customApply": "应用",
     "customCancel": "取消",
-    "customHint": "最多显示最近 30 天数据"
+    "customHint": "最多显示最近 30 天数据",
+    "bucket15m": "15分钟",
+    "bucket30m": "30分钟",
+    "bucket1h": "1小时"
   },
   "poolView": {
     "grid": "发光网格",
@@ -2387,5 +2395,19 @@
       },
       "open": "打开全局设置"
     }
+  },
+  "reqlog": {
+    "autoRefresh": "每 5 秒自动刷新",
+    "byAccountTitle": "按账号汇总",
+    "byAccountDesc": "与下方明细同一筛选窗口；点击某个账号即可只看它的请求",
+    "window": "时间范围",
+    "window1h": "最近 1 小时",
+    "outcome": "结果",
+    "success": "成功",
+    "failed": "失败",
+    "detailTitle": "请求明细",
+    "detailDesc": "每次上游尝试一行（故障切换的重试也会单独记录），最新在前",
+    "cacheRead": "缓存读取",
+    "unattributed": "未归属"
   }
 }

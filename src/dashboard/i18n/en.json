@@ -27,7 +27,8 @@
     "experimental": "Experimental",
     "credits": "Credits",
     "usage": "Usage",
-    "devin": "Devin Panel"
+    "devin": "Devin Panel",
+    "requests": "Requests"
   },
   "page": {
     "overview": "Dashboard",
@@ -42,7 +43,8 @@
     "experimental": "Experimental Features",
     "credits": "Credits",
     "usage": "Usage",
-    "devin": "Devin Panel"
+    "devin": "Devin Panel",
+    "requests": "Request Records"
   },
   "pageTitle": {
     "main": "WindsurfAPI bydwgx1337 Control Panel"
@@ -60,7 +62,8 @@
     "settings": "Shared preferences and security thresholds — customizable",
     "experimental": "Unstable optimizations; disable anytime if issues occur",
     "credits": "Thanks to contributors who submitted PRs / audited code / reported issues",
-    "devin": "Sessions and trajectories, model catalog, usage and quota, runtime settings. Only what the proxy actually reads is shown; anything unreadable is labelled with its reason instead of a zero."
+    "devin": "Sessions and trajectories, model catalog, usage and quota, runtime settings. Only what the proxy actually reads is shown; anything unreadable is labelled with its reason instead of a zero.",
+    "requests": "Live per-request records: account, model, latency, tokens and outcome (metadata only, no prompts)"
   },
   "usage": {
     "title": "Usage",
@@ -180,7 +183,8 @@
     "statsLog": "Request log table",
     "statsAggGroup": "Aggregate dimension",
     "openNav": "Open navigation",
-    "scrollableTable": "Scrollable table"
+    "scrollableTable": "Scrollable table",
+    "statsBucketGroup": "Time granularity"
   },
   "action": {
     "retry": "Retry",
@@ -546,7 +550,8 @@
       "tooltipSuccess": "Success",
       "tooltipRate": "Success Rate",
       "tooltipByModel": "By model this hour",
-      "tooltipMoreModels": "+{{count}} more"
+      "tooltipMoreModels": "+{{count}} more",
+      "tooltipInProgress": "in progress"
     },
     "emailOtpLogin": {
       "title": "Email Code Login",
@@ -941,7 +946,10 @@
     "customEnd": "End Date",
     "customApply": "Apply",
     "customCancel": "Cancel",
-    "customHint": "Showing up to last 30 days"
+    "customHint": "Showing up to last 30 days",
+    "bucket15m": "15 min",
+    "bucket30m": "30 min",
+    "bucket1h": "1 hour"
   },
   "poolView": {
     "grid": "Glow grid",
@@ -2387,5 +2395,19 @@
       },
       "open": "Open global settings"
     }
+  },
+  "reqlog": {
+    "autoRefresh": "Auto-refresh every 5s",
+    "byAccountTitle": "By account",
+    "byAccountDesc": "Same window as the records below; click an account to show only its requests",
+    "window": "Window",
+    "window1h": "Last 1 hour",
+    "outcome": "Outcome",
+    "success": "Success",
+    "failed": "Failed",
+    "detailTitle": "Request details",
+    "detailDesc": "One row per upstream attempt (failover retries are recorded separately), newest first",
+    "cacheRead": "Cache read",
+    "unattributed": "Unattributed"
   }
 }

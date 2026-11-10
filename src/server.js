@@ -39,6 +39,7 @@ import { resolveModel, getModelInfo } from './models.js';
 import { handleDashboardApi, parseProxyUrl, validateProxyHost, verifyAdminRequest, validateDashboardRequestHost } from './dashboard/api.js';
 import { recordRequest, updateRequest } from './dashboard/request-ring.js';
 import { withStatsScope, finalizeStatsScope } from './dashboard/stats.js';
+import { exportRequestToLangfuse } from './langfuse.js';
 import { setAccountProxy } from './dashboard/proxy-config.js';
 import { config, log } from './config.js';
 import { getVersionInfo } from './version.js';
@@ -1264,6 +1265,7 @@ export function startServer() {
           // response that actually went out carries a status worth recording.
           if (res.headersSent || res.writableEnded) scope.status = res.statusCode;
           finalizeStatsScope(scope);
+          exportRequestToLangfuse(scope, { method: req.method, path: String(req.url || '').split('?')[0] });
         }
       });
     } catch (err) {

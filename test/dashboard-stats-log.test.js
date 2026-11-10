@@ -17,6 +17,7 @@ import {
   recordTokenUsage,
   resetStats,
   withStatsScope,
+  RECENT_REQ_CAP,
 } from '../src/dashboard/stats.js';
 import { handleDashboardApi } from '../src/dashboard/api.js';
 import { accountRef } from '../src/log-safety.js';
@@ -172,7 +173,7 @@ describe('GET /stats/log query', () => {
     assert.equal(page.total, 4);
     assert.equal(page.hasMore, true);
     assert.equal(page.retention.stored, 4);
-    assert.equal(page.retention.capacity, 500);
+    assert.equal(page.retention.capacity, RECENT_REQ_CAP);
   });
 
   it('pages by offset and stops claiming more at the end', () => {

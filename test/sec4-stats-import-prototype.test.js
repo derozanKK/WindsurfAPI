@@ -15,7 +15,7 @@
 // `node --import ./test/setup-env.mjs --test`, never bare `node --test`.
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { importStats, exportStats, resetStats } from '../src/dashboard/stats.js';
+import { importStats, exportStats, resetStats, RECENT_REQ_CAP } from '../src/dashboard/stats.js';
 
 // exportStats() carries a per-call timestamp; compare the rest of the snapshot.
 function snapshot() {
@@ -82,14 +82,14 @@ describe('SEC-4 stats import prototype protection (real module)', () => {
   });
 
   it("SEC-4: merge caps recentRequests at the module's real RECENT_REQ_CAP", () => {
-    // The old fixture hardcoded RECENT_REQ_CAP = 200 while the module ships 500;
+    // The old fixture hardcoded RECENT_REQ_CAP = 200 while the module shipped 500;
     // this reads the real constant through the real merge path.
     const incoming = [];
-    for (let i = 0; i < 520; i++) incoming.push({ ts: 1000 + i, model: `m-${i}` });
+    for (let i = 0; i < RECENT_REQ_CAP + 20; i++) incoming.push({ ts: 1000 + i, model: `m-${i}` });
     assert.equal(importStats({ recentRequests: incoming }).ok, true);
     const kept = exportStats().recentRequests;
-    assert.equal(kept.length, 500, 'the cap must be the module value, not a stub');
+    assert.equal(kept.length, RECENT_REQ_CAP, 'the cap must be the module value, not a stub');
     assert.equal(kept[0].ts, 1020, 'oldest entries beyond the cap are dropped first');
-    assert.equal(kept[kept.length - 1].ts, 1519, 'newest entry retained at tail');
+    assert.equal(kept[kept.length - 1].ts, 1000 + RECENT_REQ_CAP + 19, 'newest entry retained at tail');
   });
 });

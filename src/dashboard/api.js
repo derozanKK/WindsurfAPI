@@ -601,6 +601,21 @@ function dashboardUrl(req) {
 const NO_STORE = Object.freeze({ 'Cache-Control': 'no-store' });
 
 /**
+ * acct-<hash> ref → operator-facing account label, for the stats views.
+ * Stats rows only persist the opaque ref; the authed dashboard resolves it
+ * against the live pool so the tables can show which account served. Refs of
+ * deleted accounts are simply absent and the UI falls back to the ref.
+ */
+export function buildAccountLabelIndex(accounts = getAccountList({ view: 'summary' })) {
+  const out = {};
+  for (const a of accounts || []) {
+    if (!a?.id) continue;
+    out[accountRef(a.id)] = a.label || a.email || a.displayName || a.id;
+  }
+  return out;
+}
+
+/**
  * Price annotation for the per-model usage table.
  *
  * The table is keyed by whatever model string the client sent, which is exactly
@@ -2542,7 +2557,11 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // ─── Stats ────────────────────────────────────────────
   if (subpath === '/stats' && method === 'GET') {
     const stats = getStats();
-    return json(res, 200, { ...stats, modelBilling: buildModelBillingIndex(stats.modelCounts) });
+    return json(res, 200, {
+      ...stats,
+      modelBilling: buildModelBillingIndex(stats.modelCounts),
+      accountLabels: buildAccountLabelIndex(),
+    });
   }
 
   // GET /stats/log — newest-first request-log page + aggregates over the whole
@@ -2558,15 +2577,19 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       const n = Number(raw);
       return Number.isFinite(n) ? n : null;
     };
-    return json(res, 200, getRequestLog({
-      from: num('from'),
-      to: num('to'),
-      model: u.searchParams.get('model') || null,
-      account: u.searchParams.get('account') || null,
-      status: u.searchParams.has('status') ? num('status') : null,
-      limit: num('limit') ?? 50,
-      offset: num('offset') ?? 0,
-    }), NO_STORE);
+    return json(res, 200, {
+      ...getRequestLog({
+        from: num('from'),
+        to: num('to'),
+        model: u.searchParams.get('model') || null,
+        account: u.searchParams.get('account') || null,
+        status: u.searchParams.has('status') ? num('status') : null,
+        outcome: u.searchParams.get('outcome') || null,
+        limit: num('limit') ?? 50,
+        offset: num('offset') ?? 0,
+      }),
+      accountLabels: buildAccountLabelIndex(),
+    }, NO_STORE);
   }
 
   // Account usage from app.devin.ai (quota burn-down card). GET-only reads
