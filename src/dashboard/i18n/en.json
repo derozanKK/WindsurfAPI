@@ -2408,6 +2408,10 @@
     "detailTitle": "Request details",
     "detailDesc": "One row per upstream attempt (failover retries are recorded separately), newest first",
     "cacheRead": "Cache read",
-    "unattributed": "Unattributed"
+    "unattributed": "Unattributed",
+    "freshIn": "Fresh input",
+    "cacheWrite": "Cache write",
+    "hitRate": "Hit rate",
+    "hitRateUnknown": "Upstream reported no cache usage; hit rate unavailable"
   }
 }

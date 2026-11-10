@@ -1018,6 +1018,13 @@ function logRowView(row) {
   const status = rawStatus == null || rawStatus === ''
     ? derived
     : (Number.isFinite(Number(rawStatus)) ? Number(rawStatus) : derived);
+  const tokensIn = nonNeg(row?.tokensIn);
+  const cacheRead = nonNeg(row?.cacheRead);
+  const cacheWrite = nonNeg(row?.cacheWrite);
+  // A row with no cache read AND no cache write is indistinguishable from an
+  // upstream that never reported cache usage, so it carries no hit rate (null)
+  // rather than a misleading 0%.
+  const cacheReported = cacheRead > 0 || cacheWrite > 0;
   return {
     ts: Number.isFinite(ts) ? ts : 0,
     model: typeof row?.model === 'string' ? row.model : '',
@@ -1025,10 +1032,13 @@ function logRowView(row) {
     status,
     success: !!row?.success,
     ms: nonNeg(row?.ms),
-    tokensIn: nonNeg(row?.tokensIn),
+    tokensIn,
     tokensOut: nonNeg(row?.tokensOut),
-    cacheRead: nonNeg(row?.cacheRead),
-    cacheWrite: nonNeg(row?.cacheWrite),
+    cacheRead,
+    cacheWrite,
+    freshIn: Math.max(0, tokensIn - cacheRead - cacheWrite),
+    cacheReported,
+    cacheHitRate: cacheReported && tokensIn > 0 ? Math.min(1, cacheRead / tokensIn) : null,
     credit: nonNeg(row?.credit),
   };
 }
@@ -1037,7 +1047,8 @@ function emptyAggregate(extra) {
   return {
     ...extra,
     requests: 0, success: 0, errors: 0,
-    tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, credits: 0, totalMs: 0,
+    tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, freshIn: 0, credits: 0, totalMs: 0,
+    _cacheReportedIn: 0,
     _latencies: [],
   };
 }
@@ -1050,6 +1061,8 @@ function addToAggregate(agg, row) {
   agg.tokensOut += row.tokensOut;
   agg.cacheRead += row.cacheRead;
   agg.cacheWrite += row.cacheWrite;
+  agg.freshIn += row.freshIn;
+  if (row.cacheReported) agg._cacheReportedIn += row.tokensIn;
   agg.credits += row.credit;
   agg.totalMs += row.ms;
   if (row.ms > 0) agg._latencies.push(row.ms);
@@ -1060,8 +1073,11 @@ function finishAggregate(agg) {
   agg.avgMs = agg.requests > 0 ? Math.round(agg.totalMs / agg.requests) : 0;
   agg.p50Ms = percentileOf(latencies, 0.5);
   agg.p95Ms = percentileOf(latencies, 0.95);
+  // Hit rate over rows that reported cache usage only; null when none did.
+  agg.cacheHitRate = agg._cacheReportedIn > 0 ? Math.min(1, agg.cacheRead / agg._cacheReportedIn) : null;
   delete agg.totalMs;
   delete agg._latencies;
+  delete agg._cacheReportedIn;
   return agg;
 }
 

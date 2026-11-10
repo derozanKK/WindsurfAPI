@@ -59,6 +59,7 @@ function render(data, tab = 'account') {
     fmtCredit: (v) => String(v),
     _statsFreeLabel: () => '',
     _statsTokenTitle: () => '',
+    _acctLabel: (ref) => ref,
   };
   fn.call(self, I18n, data);
   return { self, note: element('stats-agg-note') };

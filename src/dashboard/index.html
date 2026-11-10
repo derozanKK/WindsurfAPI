@@ -4321,6 +4321,7 @@ tbody tr:hover td { background: var(--surface-2); }
               <th class="numeric" data-i18n="table.header.avg">平均耗时</th>
               <th class="numeric" data-i18n="table.header.tokensIn">输入 Token</th>
               <th class="numeric" data-i18n="table.header.tokensOut">输出 Token</th>
+              <th class="numeric" data-i18n="reqlog.hitRate">命中率</th>
               <th class="numeric" data-i18n="table.header.cost">费用 (credits)</th>
             </tr></thead>
             <tbody id="reqlog-account-body"></tbody>
@@ -4346,11 +4347,14 @@ tbody tr:hover td { background: var(--surface-2); }
               <th class="numeric" data-i18n="table.header.duration">耗时</th>
               <th class="numeric" data-i18n="table.header.tokensIn">输入 Token</th>
               <th class="numeric" data-i18n="table.header.tokensOut">输出 Token</th>
+              <th class="numeric" data-i18n="reqlog.freshIn">新增输入</th>
               <th class="numeric" data-i18n="reqlog.cacheRead">缓存读取</th>
+              <th class="numeric" data-i18n="reqlog.cacheWrite">缓存写入</th>
+              <th class="numeric" data-i18n="reqlog.hitRate">命中率</th>
               <th class="numeric" data-i18n="table.header.cost">费用 (credits)</th>
             </tr></thead>
             <tbody id="reqlog-body">
-              <tr class="empty-row"><td colspan="9" data-i18n="table.empty.noRequestData">暂无请求数据</td></tr>
+              <tr class="empty-row"><td colspan="12" data-i18n="table.empty.noRequestData">暂无请求数据</td></tr>
             </tbody>
           </table>
         </div>
@@ -10841,18 +10845,6 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       if (s < 86400) return `${Math.floor(s/3600)}h ${T('ago')}`;
       return `${Math.floor(s/86400)}d ${T('ago')}`;
     };
-    // cockpit parity: upstream sends REMAINING percent; its UI shows USED
-    // percent ("每日额度用量 100%"). Compute the used side client-side so even
-    // snapshots persisted before the backend added dailyUsedPercent render it.
-    const usedPct = (remaining) => remaining == null ? null
-      : Math.max(0, Math.min(100, Math.round(100 - remaining)));
-    // "配额周期剩余 N 天" suffix for the plan-period end row.
-    const periodLeftHtml = (endMs) => {
-      const ms = endMs ? new Date(endMs).getTime() : NaN;
-      if (!Number.isFinite(ms)) return '';
-      const days = Math.max(0, Math.ceil((ms - Date.now()) / 86400000));
-      return ` <span style="color:${days <= 3 ? 'var(--error)' : 'var(--text-dim)'};font-size:11px">(${T('plan.periodLeft', { days })})</span>`;
-    };
     const renderBar = (label, pct, resetAt, noDataText) => {
       const isN = pct == null;
       const v = isN ? 0 : Math.max(0, Math.min(100, pct));
@@ -12717,12 +12709,24 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
     this.loadRequests();
   },
 
+  // Cache hit rate cell: null means the upstream reported no cache usage, shown
+  // as "—" instead of a misleading 0%. Colour tracks how much of the input was
+  // served from cache (a low rate means the context was re-written).
+  _hitRateCell(rate, extraClass = 'text-sm numeric') {
+    if (rate == null || !Number.isFinite(Number(rate))) {
+      return `<td class="${extraClass} text-muted" title="${this.esc(I18n.t('reqlog.hitRateUnknown'))}">—</td>`;
+    }
+    const pct = Math.round(Number(rate) * 100);
+    const color = pct >= 70 ? 'var(--success-text)' : pct >= 30 ? 'var(--warn-text)' : 'var(--error-text)';
+    return `<td class="${extraClass}" style="color:${color};font-weight:600">${pct}%</td>`;
+  },
+
   _renderRequests(d) {
     const body = document.getElementById('reqlog-body');
     const acctBody = document.getElementById('reqlog-account-body');
     if (!body || !acctBody) return;
     if (!d || d.success === false || !Array.isArray(d.items)) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="9">${this.esc(I18n.t('section.statsLog.unavailable'))}</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="12">${this.esc(I18n.t('section.statsLog.unavailable'))}</td></tr>`;
       acctBody.innerHTML = '';
       return;
     }
@@ -12760,7 +12764,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
 
     const rateCell = (ok, total) => {
       const rate = total > 0 ? (ok / total) * 100 : 0;
-      const color = rate >= 95 ? 'var(--success)' : rate >= 80 ? 'var(--warn)' : 'var(--error)';
+      const color = rate >= 95 ? 'var(--success-text)' : rate >= 80 ? 'var(--warn-text)' : 'var(--error-text)';
       return `<td class="numeric" style="color:${color};font-weight:600">${rate.toFixed(1)}%</td>`;
     };
     acctBody.innerHTML = (d.byAccount || []).map((a) => {
@@ -12769,15 +12773,16 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
         + ` onclick="App.setReqLogFilter('account', '${this.escJsAttr(active ? '' : a.account)}')">`
         + `<td><b>${this.esc(this._acctLabel(a.account, labels))}</b> <code class="text-xs text-muted">${this.esc(a.account)}</code></td>`
         + `<td class="numeric">${a.requests}</td>`
-        + `<td class="numeric" style="color:var(--success)">${a.success}</td>`
-        + `<td class="numeric" style="color:${a.errors > 0 ? 'var(--error)' : 'inherit'}">${a.errors}</td>`
+        + `<td class="numeric" style="color:var(--success-text)">${a.success}</td>`
+        + `<td class="numeric" style="color:${a.errors > 0 ? 'var(--error-text)' : 'inherit'}">${a.errors}</td>`
         + rateCell(a.success, a.requests)
         + `<td class="numeric">${this.esc(this.fmtMs(a.avgMs))}</td>`
         + `<td class="numeric">${this.esc(this.fmtTokenCount(a.tokensIn))}</td>`
         + `<td class="numeric">${this.esc(this.fmtTokenCount(a.tokensOut))}</td>`
+        + this._hitRateCell(a.cacheHitRate, 'numeric')
         + `<td class="numeric">${this.esc(this.fmtCredit(a.credits))}</td>`
         + `</tr>`;
-    }).join('') || `<tr class="empty-row"><td colspan="9">${this.esc(I18n.t('section.statsLog.empty'))}</td></tr>`;
+    }).join('') || `<tr class="empty-row"><td colspan="10">${this.esc(I18n.t('section.statsLog.empty'))}</td></tr>`;
 
     const items = d.items.filter(r => r && typeof r === 'object');
     body.innerHTML = items.map((r) => {
@@ -12785,7 +12790,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       const status = Number(r.status);
       const ok = !!r.success;
       const outcome = `<span class="badge ${ok ? 'success' : 'error'} no-dot">${this.esc(I18n.t(ok ? 'reqlog.success' : 'reqlog.failed'))}`
-        + (Number.isFinite(status) ? ` · ${status}` : '') + `</span>`;
+        + (Number.isFinite(status) ? ` · ${this.esc(status)}` : '') + `</span>`;
       return `<tr>`
         + `<td class="text-sm" style="white-space:nowrap">${this.esc(when.toLocaleString())}</td>`
         + `<td class="text-sm"><span class="cell-ellipsis" title="${this.esc(r.account || '')}">${this.esc(this._acctLabel(r.account, labels))}</span></td>`
@@ -12794,10 +12799,13 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
         + `<td class="text-sm numeric">${this.esc(this.fmtMs(r.ms))}</td>`
         + `<td class="text-sm numeric" title="${this.esc(this._statsTokenTitle(r))}">${this.esc(this.fmtTokenCount(r.tokensIn))}</td>`
         + `<td class="text-sm numeric">${this.esc(this.fmtTokenCount(r.tokensOut))}</td>`
+        + `<td class="text-sm numeric">${this.esc(this.fmtTokenCount(r.freshIn))}</td>`
         + `<td class="text-sm numeric">${this.esc(this.fmtTokenCount(r.cacheRead))}</td>`
+        + `<td class="text-sm numeric">${this.esc(this.fmtTokenCount(r.cacheWrite))}</td>`
+        + this._hitRateCell(r.cacheHitRate)
         + `<td class="text-sm numeric">${this.esc(this.fmtCredit(r.credit))}</td>`
         + `</tr>`;
-    }).join('') || `<tr class="empty-row"><td colspan="9">${this.esc(I18n.t('section.statsLog.empty'))}</td></tr>`;
+    }).join('') || `<tr class="empty-row"><td colspan="12">${this.esc(I18n.t('section.statsLog.empty'))}</td></tr>`;
 
     const total = Number(d.total) || 0;
     const offset = Number(d.offset) || 0;

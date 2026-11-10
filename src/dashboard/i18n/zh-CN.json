@@ -2408,6 +2408,10 @@
     "detailTitle": "请求明细",
     "detailDesc": "每次上游尝试一行（故障切换的重试也会单独记录），最新在前",
     "cacheRead": "缓存读取",
-    "unattributed": "未归属"
+    "unattributed": "未归属",
+    "freshIn": "新增输入",
+    "cacheWrite": "缓存写入",
+    "hitRate": "命中率",
+    "hitRateUnknown": "上游未返回缓存用量，无法计算命中率"
   }
 }

@@ -82,6 +82,39 @@ describe('request ring', () => {
   });
 });
 
+describe('cache hit accounting', () => {
+  it('derives fresh input and hit rate per row, null when no cache usage was reported', () => {
+    importStats({ recentRequests: [
+      { ts: 1, model: 'm', success: true, account: 'a', tokensIn: 1000, cacheRead: 900, cacheWrite: 50 },
+      { ts: 2, model: 'm', success: true, account: 'a', tokensIn: 400, cacheRead: 0, cacheWrite: 400 },
+      { ts: 3, model: 'm', success: true, account: 'a', tokensIn: 700, cacheRead: 0, cacheWrite: 0 },
+    ] }, { mode: 'replace' });
+    const byTs = Object.fromEntries(getRequestLog({}).items.map(r => [r.ts, r]));
+    assert.equal(byTs[1].freshIn, 50);
+    assert.equal(byTs[1].cacheHitRate, 0.9);
+    assert.equal(byTs[2].freshIn, 0);
+    assert.equal(byTs[2].cacheHitRate, 0, 'a reported full miss is a real 0%');
+    assert.equal(byTs[3].freshIn, 700);
+    assert.equal(byTs[3].cacheHitRate, null, 'no cache fields means unknown, not 0%');
+  });
+
+  it('aggregates the hit rate over reporting rows only', () => {
+    importStats({ recentRequests: [
+      { ts: 1, model: 'm', success: true, account: 'a', tokensIn: 1000, cacheRead: 800, cacheWrite: 0 },
+      { ts: 2, model: 'm', success: true, account: 'a', tokensIn: 9000, cacheRead: 0, cacheWrite: 0 },
+      { ts: 3, model: 'm', success: true, account: 'b', tokensIn: 500, cacheRead: 0, cacheWrite: 0 },
+    ] }, { mode: 'replace' });
+    const log = getRequestLog({});
+    const a = log.byAccount.find(r => r.account === accountRef('a'));
+    const b = log.byAccount.find(r => r.account === accountRef('b'));
+    assert.equal(a.cacheHitRate, 0.8, 'the unreported 9000 must not dilute the rate');
+    assert.equal(b.cacheHitRate, null);
+    assert.equal(a.freshIn, 9200);
+    assert.equal(log.summary.cacheHitRate, 0.8);
+    assert.ok(!('_cacheReportedIn' in log.summary), 'internal accumulator is not exposed');
+  });
+});
+
 describe('account labels', () => {
   it('maps the opaque ref to the operator label, falling back to email then id', () => {
     const labels = buildAccountLabelIndex([
