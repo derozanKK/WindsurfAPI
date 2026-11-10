@@ -12,10 +12,12 @@ import { configureBindHost } from '../src/auth.js';
 import { setRuntimeApiKey, setRuntimeDashboardPassword } from '../src/runtime-config.js';
 import {
   handleDashboardApi,
+  reconcileSelfUpdateJournal,
   setGitExecFileForTest,
   setRollbackPointWriterForTest,
   setDockerSelfUpdateForTest,
   setSelfUpdateRestartSchedulerForTest,
+  setSelfUpdateRunningCommitForTest,
   setSelfUpdateSupervisorDetectorForTest,
 } from '../src/dashboard/api.js';
 import { isolatedGitEnv, REAL_GIT, SAFE_TMP_ROOT, SKIP_REASON } from './git-fixture-env.js';
@@ -39,6 +41,7 @@ mkdirSync(join(SELF_UPDATE_TEST_ROOT, '.git'), { recursive: true });
 process.chdir(SELF_UPDATE_TEST_ROOT);
 const BEFORE_JSON = join(SELF_UPDATE_TEST_ROOT, 'data', 'self-update-before.json');
 const PENDING_JSON = join(SELF_UPDATE_TEST_ROOT, 'data', 'self-update-before.pending.json');
+const JOURNAL_JSON = join(SELF_UPDATE_TEST_ROOT, 'data', 'self-update-journal.json');
 const UPDATE_LOCK_DIR = join(SELF_UPDATE_TEST_ROOT, '.git', 'windsurfapi-update.lock');
 const prevNoAuth = process.env.DASHBOARD_ALLOW_NO_AUTH;
 const origPwd = config.dashboardPassword;
@@ -73,9 +76,11 @@ afterEach(() => {
   setRollbackPointWriterForTest(null);
   setDockerSelfUpdateForTest(null);
   setSelfUpdateRestartSchedulerForTest(null);
+  setSelfUpdateRunningCommitForTest(null);
   setSelfUpdateSupervisorDetectorForTest(null);
   try { rmSync(BEFORE_JSON, { force: true }); } catch {}
   try { rmSync(PENDING_JSON, { force: true }); } catch {}
+  try { rmSync(JOURNAL_JSON, { force: true }); } catch {}
   try { rmSync(UPDATE_LOCK_DIR, { recursive: true, force: true }); } catch {}
   config.dashboardPassword = origPwd;
   config.apiKey = origKey;
@@ -166,6 +171,7 @@ function updateScript(extra) {
     'rev-parse --abbrev-ref HEAD': 'master',
     'fetch --quiet --no-tags origin master': '',
     'rev-parse origin/master': REMOTE,
+    'remote get-url origin': '/tmp/windsurfapi-gate-fixture-origin.git',
     'log -1 --pretty=format:%s': 'local msg',
     'status --porcelain -uno': '',
     'ls-remote --tags origin refs/tags/v[0-9]*': [
@@ -1144,8 +1150,12 @@ describe('gitStatus published field', () => {
 });
 
 describe('self-update rollback', () => {
-  it('rolls back to the persisted before-commit', async () => {
+  it('rolls back to the persisted before-commit and reports a pending restart', async () => {
     openAuth();
+    setSelfUpdateRestartSchedulerForTest((_callback, release) => {
+      release();
+      return true;
+    });
     const prevSup = process.env.WINDSURFAPI_RESTART_SUPERVISED;
     process.env.WINDSURFAPI_RESTART_SUPERVISED = '1';
     mkdirSync(join(process.cwd(), 'data'), { recursive: true });
@@ -1159,13 +1169,27 @@ describe('self-update rollback', () => {
     await handleDashboardApi('POST', '/self-update/rollback', {}, { headers: {}, socket: { remoteAddress: '127.0.0.1' } }, res);
     const body = res.json();
     assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.state, 'pending-restart');
+    assert.equal(body.verified, false, 'a scheduled restart is not a verified rollback');
+    assert.equal(body.restartScheduled, true);
+    assert.equal(body.rollbackPointRetained, true);
     assert.equal(body.rolledBackTo, 'f'.repeat(7));
     assert.equal(resetTarget, 'f'.repeat(40), 'reset must target the recorded commit');
-    assert.equal(existsSync(BEFORE_JSON), false, 'rollback point must be cleared after rollback');
+    assert.equal(existsSync(BEFORE_JSON), true,
+      'rollback point is retry evidence until /health confirms the restarted commit');
+    const journal = JSON.parse(readFileSync(JOURNAL_JSON, 'utf8'));
+    assert.equal(journal.operation, 'rollback');
+    assert.equal(journal.state, 'pending-restart');
+    assert.equal(journal.phase, 'restart-scheduled');
+    assert.equal(journal.expectedCommit, 'f'.repeat(40));
   });
 
   it('recovers a durable pending point left by a crash after HEAD changed', async () => {
     openAuth();
+    setSelfUpdateRestartSchedulerForTest((_callback, release) => {
+      release();
+      return true;
+    });
     setSelfUpdateSupervisorDetectorForTest(() => ({ supervised: true, kind: 'test' }));
     mkdirSync(join(process.cwd(), 'data'), { recursive: true });
     writeFileSync(PENDING_JSON, JSON.stringify({ commit: 'f'.repeat(40), after: HEAD, ts: Date.now() }));
@@ -1179,9 +1203,10 @@ describe('self-update rollback', () => {
     await handleDashboardApi('POST', '/self-update/rollback', {}, { headers: {}, socket: { remoteAddress: '127.0.0.1' } }, res);
     const body = res.json();
     assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.state, 'pending-restart');
     assert.equal(resetTarget, 'f'.repeat(40));
-    assert.equal(existsSync(PENDING_JSON), false);
-    assert.equal(existsSync(BEFORE_JSON), false);
+    assert.equal(existsSync(PENDING_JSON), false, 'the recovered point is promoted to final');
+    assert.equal(existsSync(BEFORE_JSON), true, 'the promoted point is retained until confirmation');
   });
 
   it('returns ERR_NO_ROLLBACK_POINT when no prior update recorded', async () => {
@@ -1331,7 +1356,7 @@ describe('self-update rollback', () => {
     setSelfUpdateRestartSchedulerForTest((_callback, release) => {
       restartCalls++;
       release();
-      return false;
+      return true;
     });
     gitStub({
       'status --porcelain --untracked-files=all': '',
@@ -1339,9 +1364,10 @@ describe('self-update rollback', () => {
     });
     const body = await postRollback({});
     assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.state, 'pending-restart');
     assert.equal(body.rolledBackTo, target.slice(0, 7));
     assert.equal(restartCalls, 1);
-    assert.equal(existsSync(BEFORE_JSON), false);
+    assert.equal(existsSync(BEFORE_JSON), true, 'the point survives until the restart is confirmed');
   });
 
   it('reports ERR_ROLLBACK_PARTIAL when target HEAD remains tracked-dirty', async () => {
@@ -1424,7 +1450,118 @@ describe('self-update rollback', () => {
     releaseHandoff();
     assert.equal(existsSync(UPDATE_LOCK_DIR), false);
 
+    // The rollback retains its point as retry evidence until a restart is
+    // confirmed; this test measures the lock, so clear the point explicitly.
+    rmSync(BEFORE_JSON, { force: true });
+    rmSync(JOURNAL_JSON, { force: true });
     const afterRelease = await postRollback({});
     assert.equal(afterRelease.error, 'ERR_NO_ROLLBACK_POINT');
+  });
+});
+
+// D6 (audit2/Update.md P2-6): `{ok:true}` used to be emitted 800 ms before the
+// restart ran, after deleting the rollback point — so a scheduler failure was
+// indistinguishable from a verified healthy rollback and the retry evidence
+// was already gone. The journal makes the lifecycle explicit: pending until the
+// running process reports the expected commit on /health.
+describe('self-update rollback: truthful pending state and durable retry evidence', () => {
+  const target = 'f'.repeat(40);
+
+  function seedPendingJournal(overrides = {}) {
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    writeFileSync(JOURNAL_JSON, JSON.stringify({
+      version: 1,
+      operation: 'rollback',
+      state: 'pending-restart',
+      phase: 'reset-verified',
+      expectedCommit: target,
+      afterCommit: HEAD,
+      rollbackPointRetained: true,
+      requestedAt: Date.now(),
+      ...overrides,
+    }));
+  }
+
+  it('does not claim success or delete the retry point when the scheduler declines', async () => {
+    openAuth();
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    writeFileSync(BEFORE_JSON, JSON.stringify({ commit: target, after: HEAD, ts: Date.now() }));
+    gitStub({
+      'status --porcelain --untracked-files=all': '',
+      [`reset --hard ${target}`]: '',
+    });
+    const body = await postRollback({});
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.equal(body.error, 'ERR_RESTART_NOT_SCHEDULED');
+    assert.equal(body.state, 'restart-not-scheduled');
+    assert.equal(body.restartScheduled, false);
+    assert.equal(body.verified, false);
+    assert.equal(body.rollbackPointRetained, true);
+    assert.equal(body.rolledBackTo, target.slice(0, 7));
+    assert.equal(existsSync(BEFORE_JSON), true, 'a declined restart must keep the retry point');
+    const journal = JSON.parse(readFileSync(JOURNAL_JSON, 'utf8'));
+    assert.equal(journal.state, 'restart-not-scheduled');
+    assert.equal(journal.expectedCommit, target);
+    assert.equal(journal.operation, 'rollback');
+  });
+
+  it('keeps pre-reset journal evidence and the point when the reset fails', async () => {
+    openAuth();
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    writeFileSync(BEFORE_JSON, JSON.stringify({ commit: target, after: HEAD, ts: Date.now() }));
+    gitStub({
+      'status --porcelain --untracked-files=all': '',
+      [`reset --hard ${target}`]: new Error('cannot lock ref'),
+    });
+    const body = await postRollback({});
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.equal(body.error, 'ERR_GIT_ROLLBACK_FAILED');
+    assert.equal(existsSync(BEFORE_JSON), true);
+    const journal = JSON.parse(readFileSync(JOURNAL_JSON, 'utf8'));
+    assert.equal(journal.state, 'failed', 'a reset that never applied must not read as a pending restart');
+    assert.equal(journal.reason, 'reset-not-verified');
+    assert.equal(journal.phase, 'pre-reset', 'evidence must exist before the destructive step');
+  });
+
+  it('confirms a pending rollback only when the running commit matches, then clears the point', () => {
+    seedPendingJournal();
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    writeFileSync(BEFORE_JSON, JSON.stringify({ commit: target, after: HEAD, ts: Date.now() }));
+    setSelfUpdateRunningCommitForTest(() => target);
+    const journal = reconcileSelfUpdateJournal();
+    assert.equal(journal.state, 'confirmed', JSON.stringify(journal));
+    assert.equal(journal.confirmedCommit, target);
+    assert.equal(existsSync(BEFORE_JSON), false, 'a confirmed rollback no longer needs its retry point');
+    assert.equal(JSON.parse(readFileSync(JOURNAL_JSON, 'utf8')).state, 'confirmed');
+  });
+
+  it('keeps the point and pending state when the running commit has not changed', () => {
+    seedPendingJournal();
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    writeFileSync(BEFORE_JSON, JSON.stringify({ commit: target, after: HEAD, ts: Date.now() }));
+    setSelfUpdateRunningCommitForTest(() => HEAD);
+    const journal = reconcileSelfUpdateJournal();
+    assert.equal(journal.state, 'pending-restart');
+    assert.equal(existsSync(BEFORE_JSON), true, 'an unconfirmed rollback must stay retryable');
+  });
+
+  it('re-confirms a journal left in restart-failed once a later restart serves the commit', () => {
+    seedPendingJournal({ state: 'restart-failed', error: 'boom', phase: 'restart-scheduled' });
+    setSelfUpdateRunningCommitForTest(() => target);
+    const journal = reconcileSelfUpdateJournal();
+    assert.equal(journal.state, 'confirmed');
+  });
+
+  it('surfaces the journal through /self-update/check', async () => {
+    openAuth();
+    seedPendingJournal();
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    writeFileSync(BEFORE_JSON, JSON.stringify({ commit: target, after: HEAD, ts: Date.now() }));
+    setSelfUpdateRunningCommitForTest(() => target);
+    const res = fakeRes();
+    await handleDashboardApi('GET', '/self-update/check', {}, { headers: {}, socket: { remoteAddress: '127.0.0.1' } }, res);
+    const body = res.json();
+    assert.equal(body.selfUpdate?.state, 'confirmed', JSON.stringify(body));
+    assert.equal(existsSync(BEFORE_JSON), false);
   });
 });

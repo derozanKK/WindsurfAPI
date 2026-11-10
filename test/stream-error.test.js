@@ -13,6 +13,7 @@ import {
   redactRequestLogText,
 } from '../src/handlers/chat.js';
 import { handleMessages } from '../src/handlers/messages.js';
+import { serveChatStream } from '../src/server.js';
 
 const createdAccountIds = [];
 
@@ -37,6 +38,19 @@ function fakeRes() {
   return {
     body: '',
     writableEnded: false,
+    headersSent: false,
+    statusCode: null,
+    headers: {},
+    writeHead(status, headers) {
+      this.statusCode = status;
+      Object.assign(this.headers, headers || {});
+      this.headersSent = true;
+      return this;
+    },
+    setHeader(name, value) { this.headers[String(name).toLowerCase()] = value; },
+    getHeader(name) { return this.headers[String(name).toLowerCase()]; },
+    removeHeader(name) { delete this.headers[String(name).toLowerCase()]; },
+    flushHeaders() { this.headersSent = true; },
     write(chunk) { this.body += String(chunk); return true; },
     end(chunk) {
       if (chunk) this.write(chunk);
@@ -128,46 +142,28 @@ describe('stream error protocol', () => {
     assert.equal(events[0].data.error.type, 'overloaded_error');
   });
 
-  it('closes partial OpenAI streams without appending an error JSON frame', () => {
-    const res = fakeRes();
-    const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
-    send({
-      id: 'chatcmpl_partial',
-      object: 'chat.completion.chunk',
-      created: 1,
-      model: 'claude-sonnet-4.6',
-      choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
-    });
-    send({
-      id: 'chatcmpl_partial',
-      object: 'chat.completion.chunk',
-      created: 1,
-      model: 'claude-sonnet-4.6',
-      choices: [{ index: 0, delta: { content: 'partial answer' }, finish_reason: null }],
-    });
-
+  it('partial content then upstream deadline emits a structured error and never finish_reason:stop or [DONE]', async () => {
+    // Direct helper contract: an error after content is an explicit error
+    // frame, not a fabricated successful terminal.
+    const helperRes = fakeRes();
+    const send = (data) => helperRes.write(`data: ${JSON.stringify(data)}\n\n`);
     finishPartialStreamAfterError({
       id: 'chatcmpl_partial',
       created: 1,
       model: 'claude-sonnet-4.6',
       send,
-      res,
+      res: helperRes,
+      error: {
+        message: 'upstream deadline',
+        type: 'upstream_deadline_exceeded',
+        code: 'windsurf_provider_deadline',
+      },
     });
-    res.end();
+    assert.match(helperRes.body, /"error"/);
+    assert.equal(helperRes.body.includes('"finish_reason":"stop"'), false);
+    assert.equal(helperRes.body.includes('[DONE]'), false);
 
-    assert.equal(res.body.includes('"error"'), false);
-    const frames = res.body
-      .split('\n\n')
-      .filter(Boolean)
-      .map(frame => frame.split('\n').find(line => line.startsWith('data: '))?.slice(6))
-      .filter(Boolean);
-    assert.equal(frames.at(-1), '[DONE]');
-    const finish = JSON.parse(frames.at(-2));
-    assert.equal(finish.choices[0].finish_reason, 'stop');
-  });
-
-  it('does not append stream error JSON after content already reached the client', async () => {
+    // Real handler: the failure tail must take the same honest path.
     const account = addAccountByKey(`partial-deadline-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'partial-deadline');
     createdAccountIds.push(account.id);
 
@@ -200,19 +196,14 @@ describe('stream error protocol', () => {
     await result.handler(res);
 
     assert.match(res.body, /partial answer/);
-    assert.equal(res.body.includes('"error"'), false);
-    const frames = res.body
-      .split('\n\n')
-      .filter(Boolean)
-      .filter(frame => !frame.startsWith(':'))
-      .map(frame => frame.split('\n').find(line => line.startsWith('data: '))?.slice(6))
-      .filter(Boolean);
-    assert.equal(frames.at(-1), '[DONE]');
-    const finish = JSON.parse(frames.at(-2));
-    assert.equal(finish.choices[0].finish_reason, 'stop');
+    assert.match(res.body, /"error"/);
+    assert.equal(res.body.includes('"finish_reason":"stop"'), false,
+      'a dead turn must not be closed as a successful stop');
+    assert.equal(res.body.includes('[DONE]'), false,
+      'a failed stream must not claim a clean finish');
   });
 
-  it('still sends a structured stream error when only an empty role chunk was emitted', async () => {
+  it('still sends a structured stream error when only an empty role chunk was emitted, without [DONE]', async () => {
     const account = addAccountByKey(`empty-deadline-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'empty-deadline');
     createdAccountIds.push(account.id);
 
@@ -246,7 +237,57 @@ describe('stream error protocol', () => {
     // error.type; the specific condition is still carried in `code`.
     assert.match(res.body, /"type":"api_error"/);
     assert.match(res.body, /"code":"windsurf_provider_deadline"/);
-    assert.match(res.body, /data: \[DONE\]/);
+    // [DONE] is the OpenAI stream's "completed" marker. A pre-content failure
+    // has not completed anything, so the error frame must be the last signal;
+    // a client (or relay) that sees [DONE] would treat the turn as a clean empty
+    // answer and may drop the error entirely.
+    assert.equal(res.body.includes('data: [DONE]'), false, 'no [DONE] after a pre-content error');
+  });
+
+  it('route: a pre-content failure with no prior write returns the real status, not a committed 200', async () => {
+    const account = addAccountByKey(`late-precontent-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'late-precontent');
+    createdAccountIds.push(account.id);
+
+    class LatePreContentDeadlineClient {
+      async cascadeChat() {
+        // No frame is written before this failure. The gate used to arm its
+        // bootstrap timer at CONSTRUCTION, so `commitMs: 5` committed HTTP 200
+        // before the 20 ms failure and the 504 could only arrive in-band. The
+        // timer now arms on the first write, so the error frame is the first
+        // write and rewrites the status — the measured P0 fix.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        throw new Error('Encountered retryable error from model provider: context deadline exceeded (Client.Timeout or context cancellation while reading body)');
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'gemini-2.5-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, {
+      async waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      async ensureLs() {},
+      getLsFor() {
+        return { port: 17777, csrfToken: 'csrf', generation: 1 };
+      },
+      WindsurfClient: LatePreContentDeadlineClient,
+    });
+
+    const res = fakeRes();
+    let onDoneCalls = 0;
+    await serveChatStream(res, result, {
+      headers: { 'Content-Type': 'text/event-stream' },
+      commitMs: 5,
+      onDone: () => { onDoneCalls += 1; },
+    });
+
+    assert.equal(res.statusCode, 504, 'the uncommitted gate must rewrite the real status');
+    assert.match(res.body, /"error"/);
+    assert.equal(res.body.includes('data: [DONE]'), false, 'a failed request must not gain a success sentinel');
+    assert.equal(res.writableEnded, true, 'the response must be closed');
+    assert.equal(onDoneCalls, 1, 'cleanup must still run exactly once');
   });
 
   it('routes oversized Connect frame parser errors to onError without throwing from data handlers', async () => {

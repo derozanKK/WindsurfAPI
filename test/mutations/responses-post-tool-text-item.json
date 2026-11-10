@@ -4,13 +4,13 @@
     "test/responses.test.js",
     "test/terminal-event-guard.test.js"
   ],
-  "expectBaselinePass": 59,
+  "expectBaselinePass": 84,
   "mutations": [
     {
       "name": "the original defect — no seal at tool-item creation, so post-tool text is appended to the first message item and done comes out [1,0]",
       "file": "src/handlers/responses.js",
-      "anchor": "      this.sealMessageSegment();",
-      "replacement": ""
+      "anchor": "    if (seal) this.sealMessageSegment();",
+      "replacement": "    if (false) this.sealMessageSegment();"
     },
     {
       "name": "the seal fires but does not re-arm the item — messageStarted stays latched, so no second item ever opens",
@@ -43,10 +43,11 @@
       "replacement": "      text: this.text,\n    });"
     },
     {
-      "name": "the store commit takes only the last segment, so a chained next turn loses the pre-tool text",
+      "name": "DOCUMENTED EQUIVALENT after V-12 — the store commit takes only the last segment. The flat `content` is read ONLY when `items` is empty, and every turn that streamed text has a message item: emitTextDelta calls ensureTextPart → ensureMessage (messageStarted=true), and finish() calls finishMessage whenever messageStarted, which pushes the item into outputItems. commit() prefers historyFromResponseItems(items) whenever that list is non-empty, so the mutated value is discarded. In the one branch that does read it (items empty), text is necessarily '' — the mutation changes '' to ''. Not dead code by intent: it is the LEGACY flat fallback for a turn the item list cannot express. If the item commit ever stops being preferred (or finishMessage stops publishing text items), this mutation becomes CAUGHT and this spec will say so.",
       "file": "src/handlers/responses.js",
       "anchor": "            content: translator.text || '',",
-      "replacement": "            content: translator.segmentText || '',"
+      "replacement": "            content: translator.segmentText || '',",
+      "expectCaught": false
     },
     {
       "name": "OVER-REACH CONTROL: the seal runs on every text delta rather than at a tool call, fragmenting every ordinary multi-delta answer",

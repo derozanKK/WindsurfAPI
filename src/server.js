@@ -24,17 +24,21 @@ import {
   checkLockout, failedAuthAttempt, successfulAuthAttempt, refreshCredits,
 } from './auth.js';
 import { trustedClientIp } from './net-safety.js';
-import { handleChatCompletions, normalizeOpenAIErrorBody } from './handlers/chat.js';
+import { handleChatCompletions, normalizeOpenAIErrorBody, normalizeOpenAIErrorType } from './handlers/chat.js';
 import { handleCompletions } from './handlers/completions.js';
-import { handleMessages, handleCountTokens, validateMessagesRequest, validateCountTokensRequest } from './handlers/messages.js';
-import { handleGemini, parseGeminiPath } from './handlers/gemini.js';
+import { handleMessages, handleCountTokens, validateMessagesRequest, validateCountTokensRequest, toAnthropicError } from './handlers/messages.js';
+import { handleGemini, parseGeminiPath, geminiError } from './handlers/gemini.js';
 import { handleResponses, handleGetResponse, handleDeleteResponse } from './handlers/responses.js';
 import { handleModels } from './handlers/models.js';
+import { createDeferredSseResponse } from './sse-commit.js';
+import { createRequestBudget } from './request-budget.js';
 import { resolveClineCompat, stripClineNamespace } from './handlers/cline-compat.js';
 import { resolveCcCompat, stripCcNamespace } from './handlers/cc-compat.js';
-import { isExperimentalEnabled } from './runtime-config.js';
+import { isExperimentalEnabled, getBackendSwitch } from './runtime-config.js';
 import { resolveModel, getModelInfo } from './models.js';
-import { handleDashboardApi, parseProxyUrl, validateProxyHost, verifyAdminRequest } from './dashboard/api.js';
+import { handleDashboardApi, parseProxyUrl, validateProxyHost, verifyAdminRequest, validateDashboardRequestHost } from './dashboard/api.js';
+import { recordRequest, updateRequest } from './dashboard/request-ring.js';
+import { withStatsScope, finalizeStatsScope } from './dashboard/stats.js';
 import { setAccountProxy } from './dashboard/proxy-config.js';
 import { config, log } from './config.js';
 import { getVersionInfo } from './version.js';
@@ -55,6 +59,17 @@ export const MAX_BODY_SIZE = 10 * 1024 * 1024;
 // 分叉,故解析结果仅用于回写响应头 + 诊断日志。
 const ANTHROPIC_DEFAULT_VERSION = '2023-06-01';
 const ANTHROPIC_KNOWN_VERSIONS = new Set(['2023-06-01', '2023-01-01']);
+
+// Single-token DEVIN_CONNECT deploys (DEVIN_CONNECT_TOKEN / WINDSURF_API_KEY)
+// intentionally keep the account pool empty: the connect client falls back to
+// the env token when `acct` is null. The HTTP prechecks below must therefore
+// accept that deploy shape too, or every chat route 503s before the handler
+// that knows how to use the token is reached.
+function hasUsableAccount() {
+  if (isAuthenticated()) return true;
+  return getBackendSwitch('devinConnect')
+    && !!(process.env.DEVIN_CONNECT_TOKEN || process.env.WINDSURF_API_KEY);
+}
 
 // 读取并归一 anthropic-version 请求头。返回生效版本字符串(缺失→默认)。
 // Node 已把头名小写化,直接取 req.headers['anthropic-version']。
@@ -218,6 +233,96 @@ function anthropicModelPayload(id, info) {
     display_name: info?.name || id,
     created_at: '2026-01-01T00:00:00Z',
   };
+}
+
+/**
+ * Serve an OpenAI chat stream through the commit gate.
+ *
+ * Exported so the route wiring itself (not just the wrapper) can be tested:
+ * `commitMs === 0` must restore the legacy raw-res shape, otherwise the gate
+ * buffers the first frames and can rewrite a pre-content error.
+ */
+export function resolveStreamCommitMs(raw = process.env.WINDSURFAPI_STREAM_COMMIT_MS) {
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 14_000) : undefined;
+}
+
+// O10: classify a failed stream with the same failure class the non-stream
+// error rows carry (`result.body.error.code` — the DEVIN_CONNECT
+// classification: RATE_LIMITED, CAPACITY, ...). Gemini's error envelope puts
+// the HTTP-ish numeric status in `code` and the class in `__upstream_code`, so
+// a string `code` wins and the generic 'error' is the fallback the non-stream
+// expression already uses when no class survives.
+function streamFailureClass(error) {
+  if (!error || typeof error !== 'object') return 'error';
+  if (typeof error.code === 'string' && error.code) return error.code;
+  if (typeof error.__upstream_code === 'string' && error.__upstream_code) return error.__upstream_code;
+  return 'error';
+}
+
+// O10: the streaming routes patch their ring row once the handler settles. A
+// stream that fails after the commit gate still ends as HTTP 200, so `status`
+// alone cannot classify it — the failure the gate observed supplies the class.
+function streamRingDone(ringRow, reqStartedAt, res) {
+  return (stream) => updateRequest(ringRow.id, {
+    durationMs: Date.now() - reqStartedAt,
+    status: res.statusCode,
+    ...(stream?.failure ? { class: streamFailureClass(stream.failure) } : {}),
+  });
+}
+
+export async function serveChatStream(res, result, {
+  headers,
+  requestId,
+  commitMs,
+  onDone = null,
+  protocol = 'openai',
+  isBootstrap = null,
+  parseError = null,
+  errorBody = null,
+  mapError = null,
+} = {}) {
+  // Gemini's default response is a JSON array, not SSE. It cannot be parsed by
+  // the deferred SSE gate, so forward it immediately (the gate would hold the
+  // entire answer until upstream completion or the bootstrap cap).
+  if (result.mode === 'array') {
+    if (!res.headersSent) res.writeHead(result.status || 200, headers);
+    try {
+      await result.handler(res);
+    } finally {
+      onDone?.();
+    }
+    return;
+  }
+  if (commitMs === 0) {
+    if (!res.headersSent) res.writeHead(result.status, headers);
+    try {
+      await result.handler(res);
+    } finally {
+      onDone?.();
+    }
+    return;
+  }
+  const streamRes = createDeferredSseResponse(res, {
+    status: result.status,
+    headers,
+    protocol,
+    requestId,
+    bootstrapTimeoutMs: commitMs,
+    ...(isBootstrap ? { isBootstrap } : {}),
+    ...(parseError ? { parseError } : {}),
+    ...(errorBody ? { errorBody } : {}),
+    ...(mapError ? { mapError } : {}),
+  });
+  try {
+    await result.handler(streamRes);
+  } finally {
+    streamRes.dispose();
+    // A handler that throws after committing must not leave the socket open.
+    if (res.headersSent && !res.writableEnded) res.end();
+    onDone?.({ failure: streamRes.failure });
+  }
 }
 
 async function route(req, res) {
@@ -412,6 +517,17 @@ async function route(req, res) {
 
   // ─── API endpoints (require API key) ────────────────────
 
+  // D1 (audit2/Server.md S02): `/auth/*` is an operator surface. In the
+  // documented open-local mode verifyAdminRequest authenticates purely from
+  // the loopback socket, which a DNS-rebinding page also satisfies — so a
+  // rebinding Host could list/add/delete pool accounts. Apply the same
+  // Host/X-Forwarded-Host boundary as `/dashboard/api/*` BEFORE the API-key
+  // gate, the brute-force counters, or any body read: a rejected Host has no
+  // account delta and cannot spend auth attempts.
+  if (path === '/auth' || path.startsWith('/auth/')) {
+    if (!validateDashboardRequestHost(req, res)) return;
+  }
+
   if (!validateApiKey(extractToken(req))) {
     // v2.0.61 (#110): clearer error so operators know the issue is
     // configuration (no API_KEY set on a public-bind instance) rather
@@ -584,7 +700,7 @@ async function route(req, res) {
   }
 
   if (path === '/v1/chat/completions' && method === 'POST') {
-    if (!isAuthenticated()) {
+    if (!hasUsableAccount()) {
       return json(res, 503, {
         error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
       });
@@ -611,15 +727,30 @@ async function route(req, res) {
     // fresh pooled accounts to a dead socket. Guard on !writableEnded so the
     // normal end-of-response 'close' is a no-op.
     const abortController = bindClientAbort(res);
+    // One absolute deadline + upstream-turn budget per request, owned by the
+    // route. Layers (queue admission, cascade poll, connect retries) receive
+    // the remaining time and may only shorten their own bounds.
+    const budget = createRequestBudget({ stream: body.stream === true });
     const result = await handleChatCompletions(body, {
       callerKey,
       nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
       signal: abortController.signal,
+      budget,
       clineCompat,
       ccCompat,
     });
     const processingMs = Date.now() - reqStartedAt;
     const requestId = 'req_' + randomUUID();
+    const ringRow = recordRequest({
+      id: requestId,
+      model: body.model,
+      status: result.status,
+      stream: !!result.stream,
+      durationMs: processingMs,
+      class: result.body?.error?.code || (result.status < 400 ? 'ok' : 'error'),
+      caller: callerKey,
+      protocol: 'openai',
+    });
     const modelHeaders = {
       'x-request-id': requestId,
       'openai-model': body.model || '',
@@ -633,8 +764,18 @@ async function route(req, res) {
       'openai-organization': 'org-windsurf-proxy',
     };
     if (result.stream) {
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers });
-      await result.handler(res);
+      // Commit gate: hold the first frames until a real payload arrives. A
+      // pre-content upstream 429/500 then becomes a real HTTP status instead of
+      // a 200 SSE error frame. Heartbeats/role-only primes are buffered (bounded
+      // by the wrapper) and flushed with the first real frame.
+      const commitMs = resolveStreamCommitMs();
+      const streamHeaders = { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers };
+      await serveChatStream(res, result, {
+        headers: streamHeaders,
+        requestId,
+        commitMs,
+        onDone: streamRingDone(ringRow, reqStartedAt, res),
+      });
     } else {
       for (const [k, v] of Object.entries(modelHeaders)) res.setHeader(k, v);
       if (result.headers) {
@@ -650,7 +791,7 @@ async function route(req, res) {
   }
 
   if (path === '/v1/completions' && method === 'POST') {
-    if (!isAuthenticated()) {
+    if (!hasUsableAccount()) {
       return json(res, 503, {
         error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
       });
@@ -669,15 +810,27 @@ async function route(req, res) {
     const token = extractToken(req);
     const callerKey = callerKeyFromRequest(req, token, body);
     const abortController = bindClientAbort(res);
+    const budget = createRequestBudget({ stream: false });
     const result = await handleCompletions(body, {
       callerKey,
       nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
       signal: abortController.signal,
+      budget,
       clineCompat,
       ccCompat,
     });
     const processingMs = Date.now() - reqStartedAt;
     const requestId = 'req_' + randomUUID();
+    const ringRow = recordRequest({
+      id: requestId,
+      model: body.model,
+      status: result.status,
+      stream: !!result.stream,
+      durationMs: processingMs,
+      class: result.body?.error?.code || (result.status < 400 ? 'ok' : 'error'),
+      caller: callerKey,
+      protocol: 'completions',
+    });
     const modelHeaders = {
       'x-request-id': requestId,
       'openai-model': body.model || '',
@@ -702,7 +855,7 @@ async function route(req, res) {
   }
 
   if (path === '/v1/responses' && method === 'POST') {
-    if (!isAuthenticated()) {
+    if (!hasUsableAccount()) {
       return json(res, 503, {
         error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
       });
@@ -721,16 +874,28 @@ async function route(req, res) {
     const token = extractToken(req);
     const callerKey = callerKeyFromRequest(req, token, body);
     const abortController = bindClientAbort(res);
+    const budget = createRequestBudget({ stream: body.stream === true });
     const result = await handleResponses(body, {
       context: {
         callerKey,
         nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
         ccCompat,
         signal: abortController.signal,
+        budget,
       },
     });
     const processingMs = Date.now() - reqStartedAt;
     const requestId = 'req_' + randomUUID();
+    const ringRow = recordRequest({
+      id: requestId,
+      model: body.model,
+      status: result.status,
+      stream: !!result.stream,
+      durationMs: processingMs,
+      class: result.body?.error?.code || (result.status < 400 ? 'ok' : 'error'),
+      caller: callerKey,
+      protocol: 'responses',
+    });
     const modelHeaders = {
       'x-request-id': requestId,
       'openai-model': body.model || '',
@@ -739,8 +904,27 @@ async function route(req, res) {
       'openai-organization': 'org-windsurf-proxy',
     };
     if (result.stream) {
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers });
-      await result.handler(res);
+      const commitMs = resolveStreamCommitMs();
+      const streamHeaders = { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers };
+      await serveChatStream(res, result, {
+        headers: streamHeaders,
+        requestId,
+        commitMs,
+        protocol: 'responses',
+        // The Responses translator emits response.created/in_progress before any
+        // content, and a pre-content failure as response.failed. Hold only the
+        // lifecycle frames; commit on the first content item.
+        isBootstrap: (obj) => obj?.type === 'response.created' || obj?.type === 'response.in_progress',
+        parseError: (obj) => (obj?.type === 'response.failed' && obj.response?.error ? obj.response.error : null),
+        errorBody: (error, status) => ({
+          error: {
+            message: error?.message || 'Upstream stream error',
+            type: normalizeOpenAIErrorType(error?.type, status),
+            ...(error?.code ? { code: error.code } : {}),
+          },
+        }),
+        onDone: streamRingDone(ringRow, reqStartedAt, res),
+      });
     } else {
       for (const [k, v] of Object.entries(modelHeaders)) res.setHeader(k, v);
       if (result.headers) {
@@ -851,7 +1035,7 @@ async function route(req, res) {
 
   // Anthropic Messages API — Claude Code compatibility
   if (path === '/v1/messages/count_tokens' && method === 'POST') {
-    if (!isAuthenticated()) {
+    if (!hasUsableAccount()) {
       // D2: no-account gate is a transient capacity condition, not a fatal
       // server bug. 503 api_error was self-contradictory (503 isn't in the
       // Anthropic status set; api_error implies 500). 529 overloaded_error is
@@ -875,7 +1059,7 @@ async function route(req, res) {
   }
 
   if (path === '/v1/messages' && method === 'POST') {
-    if (!isAuthenticated()) {
+    if (!hasUsableAccount()) {
       // D2: see count_tokens above — transient capacity → 529 overloaded_error.
       return json(res, 529, { type: 'error', error: { type: 'overloaded_error', message: 'No active accounts available, please retry' } });
     }
@@ -897,15 +1081,29 @@ async function route(req, res) {
     // accept-as-is when unknown). Passed into context as a seam for future
     // version-gated behavior; the translation layer does not branch on it today.
     const anthropicVersion = resolveAnthropicVersion(req);
+    const reqStartedAt = Date.now();
+    const requestId = 'req_' + randomUUID();
     const abortController = bindClientAbort(res);
+    const budget = createRequestBudget({ stream: body.stream === true });
     const result = await handleMessages(body, {
       callerKey,
       nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
       anthropicVersion,
       ccCompat,
       signal: abortController.signal,
+      budget,
     });
-    const requestId = 'req_' + randomUUID();
+    const processingMs = Date.now() - reqStartedAt;
+    const ringRow = recordRequest({
+      id: requestId,
+      model: body.model,
+      status: result.status,
+      stream: !!result.stream,
+      durationMs: processingMs,
+      class: result.body?.error?.code || (result.status < 400 ? 'ok' : 'error'),
+      caller: callerKey,
+      protocol: 'messages',
+    });
     const anthropicHeaders = {
       'request-id': requestId,
       'anthropic-model': body.model || '',
@@ -913,8 +1111,17 @@ async function route(req, res) {
       'anthropic-version': anthropicVersion,
     };
     if (result.stream) {
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...anthropicHeaders, ...result.headers });
-      await result.handler(res);
+      const commitMs = resolveStreamCommitMs();
+      await serveChatStream(res, result, {
+        headers: { 'Access-Control-Allow-Origin': '*', ...anthropicHeaders, ...result.headers },
+        requestId,
+        commitMs,
+        protocol: 'messages',
+        isBootstrap: (obj) => obj?.type === 'message_start' || obj?.type === 'ping',
+        parseError: (obj) => (obj?.type === 'error' && obj.error ? obj.error : null),
+        errorBody: (error, status) => toAnthropicError(status, error?.type, error?.message).body,
+        onDone: streamRingDone(ringRow, reqStartedAt, res),
+      });
     } else {
       for (const [k, v] of Object.entries(anthropicHeaders)) res.setHeader(k, v);
       // Forward the handler's own headers. The STREAM branch above already spreads
@@ -948,7 +1155,7 @@ async function route(req, res) {
   // The {model} segment can carry dots/dashes; the method is the suffix
   // after the final ':'. A v1 alias path is accepted too.
   if (method === 'POST' && /\/models\/[^:/]+:(generateContent|streamGenerateContent)$/.test(path)) {
-    if (!isAuthenticated()) {
+    if (!hasUsableAccount()) {
       return json(res, 503, { error: { code: 503, message: 'No active accounts. POST /auth/login to add accounts.', status: 'UNAVAILABLE' } });
     }
     const parsed = parseGeminiPath(path);
@@ -967,16 +1174,41 @@ async function route(req, res) {
     const alt = new URL(req.url, 'http://localhost').searchParams.get('alt');
     const token = extractToken(req);
     const callerKey = callerKeyFromRequest(req, token, body);
+    const reqStartedAt = Date.now();
+    const geminiHeaders = { 'request-id': 'req_' + randomUUID() };
     const abortController = bindClientAbort(res);
+    const budget = createRequestBudget({ stream: wantStream });
     const result = await handleGemini(parsed.model, body, {
       callerKey,
       nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
       signal: abortController.signal,
+      budget,
     }, { stream: wantStream, alt });
-    const geminiHeaders = { 'request-id': 'req_' + randomUUID() };
+    const processingMs = Date.now() - reqStartedAt;
+    const ringRow = recordRequest({
+      id: geminiHeaders['request-id'],
+      model: parsed.model,
+      status: result.status,
+      stream: !!result.stream,
+      durationMs: processingMs,
+      class: result.body?.error?.code || (result.status < 400 ? 'ok' : 'error'),
+      caller: callerKey,
+      protocol: 'gemini',
+    });
     if (result.stream) {
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...geminiHeaders, ...result.headers });
-      await result.handler(res);
+      const commitMs = resolveStreamCommitMs();
+      await serveChatStream(res, result, {
+        headers: { 'Access-Control-Allow-Origin': '*', ...geminiHeaders, ...result.headers },
+        requestId: geminiHeaders['request-id'],
+        commitMs,
+        protocol: 'gemini',
+        isBootstrap: (obj) => Array.isArray(obj?.candidates)
+          && obj.candidates.length > 0
+          && obj.candidates.every((c) => !c?.finishReason && (c?.content?.parts || []).every((p) => !p?.text && !p?.functionCall)),
+        parseError: (obj) => (obj?.error && typeof obj.error === 'object' ? obj.error : null),
+        errorBody: (error, status) => geminiError(status, error?.type, error?.message).body,
+        onDone: streamRingDone(ringRow, reqStartedAt, res),
+      });
     } else {
       for (const [k, v] of Object.entries(geminiHeaders)) res.setHeader(k, v);
       // Same divergence as the Anthropic route above: the stream branch spreads
@@ -1018,7 +1250,22 @@ export function startServer() {
     activeRequests.add(res);
     res.on('close', () => activeRequests.delete(res));
     try {
-      await route(req, res);
+      // One accounting scope per HTTP request: it joins the attempt row
+      // (recordRequest, called at various depths of the chat handlers) with the
+      // usage block (recordTokenUsage, called at a different depth and possibly
+      // before the row) without relying on a shared "last row" pointer that
+      // concurrent requests would race. The final response status is stamped on
+      // the last attempt before the scope closes.
+      await withStatsScope(async (scope) => {
+        try {
+          await route(req, res);
+        } finally {
+          // A throw before headers is answered by the outer catch below; only a
+          // response that actually went out carries a status worth recording.
+          if (res.headersSent || res.writableEnded) scope.status = res.statusCode;
+          finalizeStatsScope(scope);
+        }
+      });
     } catch (err) {
       log.error('Handler error:', err);
       if (!res.headersSent) {

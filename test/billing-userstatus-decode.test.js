@@ -242,3 +242,22 @@ test('decodeUserStatusFull: catalog entry without selector (skipped in pairing)'
   assert.equal(result.rateTable['claude-sonnet-5-medium'], 6);
   // index 1 skipped (no selector)
 });
+
+test('decodeUserStatusFull: uint64 -1 balance is unknown, not $18,446,744,073,709.43', () => {
+  // #1.13.16 is a uint64 on the wire; -1 (the common "unset/unlimited" sentinel)
+  // arrives as 2^64-1. It must never be formatted as a real on-demand balance.
+  const billing = buildBillingBlock({ balance: 18446744073709551615n });
+  const result = decodeUserStatusFull(buildUserStatusResponse({ billing }));
+
+  assert.equal(result.balance, null);
+  assert.equal(result.balanceUnit, null);
+  assert.equal(result.balanceMicro, undefined);
+});
+
+test('decodeUserStatusFull: a plausible balance still decodes after the sentinel guard', () => {
+  const billing = buildBillingBlock({ balance: 1_500_000 }); // $1.50
+  const result = decodeUserStatusFull(buildUserStatusResponse({ billing }));
+
+  assert.equal(result.balance, 1.5);
+  assert.equal(result.balanceMicro, 1_500_000);
+});

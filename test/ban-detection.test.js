@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
   addAccountByKey, removeAccount, getAccountInternal,
   looksLikeBanSignal, reportBanSignal, reportSuccess,
+  __serializeAccounts, __deserializeAccount,
 } from '../src/auth.js';
 
 const created = [];
@@ -136,5 +137,25 @@ describe('R3: transient-first guard prevents ban promotion of transient errors',
     }
     assert.equal(getAccountInternal(a.id).status, 'banned',
       'a genuine ban signal must still promote — the guard only spares transient errors');
+  });
+
+  it('persists bannedAt/bannedReason across a serialize→deserialize round-trip', () => {
+    const a = mkAccount();
+    reportBanSignal(a.apiKey, 'Account suspended');
+    reportBanSignal(a.apiKey, 'Account suspended');
+    const stored = getAccountInternal(a.id);
+    assert.equal(stored.status, 'banned');
+    assert.ok(stored.bannedAt > 0);
+    assert.equal(stored.bannedReason, 'Account suspended');
+
+    const row = __serializeAccounts().find((x) => x.id === a.id);
+    assert.equal(row.status, 'banned');
+    assert.equal(row.bannedAt, stored.bannedAt);
+    assert.equal(row.bannedReason, 'Account suspended');
+
+    const restored = __deserializeAccount(row);
+    assert.equal(restored.status, 'banned');
+    assert.equal(restored.bannedAt, stored.bannedAt);
+    assert.equal(restored.bannedReason, 'Account suspended');
   });
 });

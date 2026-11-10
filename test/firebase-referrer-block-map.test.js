@@ -117,7 +117,8 @@ describe('Firebase referrer-block — end-to-end via transport seam', () => {
     // so windsurfLoginPrimaryHost falls through to windsurfLoginViaFirebase.
     const t = makeTransport([
       ['SeatManagementService/CheckUserLoginMethod', { status: 200, data: {} }],
-      ['windsurf.com/_devin-auth/connections', { status: 200, data: {} }],
+      // A non-auth1 method routes the flow to the legacy Firebase path.
+      ['windsurf.com/_devin-auth/connections', { status: 200, data: { auth_method: { method: 'firebase' } } }],
       ['identitytoolkit.googleapis.com', {
         status: 403,
         data: { error: { code: 'API_KEY_HTTP_REFERRER_BLOCKED' } },
@@ -147,7 +148,8 @@ describe('Firebase referrer-block — end-to-end via transport seam', () => {
     // the prose string as their error "code". This pins the shape the fix targets.
     const t = makeTransport([
       ['SeatManagementService/CheckUserLoginMethod', { status: 200, data: {} }],
-      ['windsurf.com/_devin-auth/connections', { status: 200, data: {} }],
+      // A non-auth1 method routes the flow to the legacy Firebase path.
+      ['windsurf.com/_devin-auth/connections', { status: 200, data: { auth_method: { method: 'firebase' } } }],
       ['identitytoolkit.googleapis.com', {
         status: 403,
         data: { error: { code: 403, status: 'PERMISSION_DENIED', message: 'Requests from referer <x> are blocked.', details: [{ reason: 'API_KEY_HTTP_REFERRER_BLOCKED' }] } },

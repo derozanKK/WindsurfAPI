@@ -1,6 +1,6 @@
 {
   "name": "windsurf-api",
-  "version": "3.9.38",
+  "version": "3.141.592658",
   "description": "Windsurf/Devin to OpenAI + Anthropic + Gemini compatible API proxy. Turns Devin's 100+ AI models (Claude, GPT, Gemini, DeepSeek, Grok, Qwen, Kimi, GLM, SWE) into multi-protocol API endpoints. Zero npm runtime dependencies (image codecs vendored under src/vendor).",
   "type": "module",
   "main": "src/index.js",
@@ -17,6 +17,10 @@
     "smoke:native-bridge": "node scripts/native-bridge-smoke.mjs",
     "smoke:special-agent": "node scripts/special-agent-smoke.mjs",
     "smoke:devin-connect": "node scripts/devin-connect-smoke.mjs",
+    "smoke:dashboard": "node scripts/dashboard-smoke.mjs",
+    "smoke:matrix": "node scripts/smoke-matrix.mjs",
+    "smoke:matrix:mutants": "node scripts/smoke-matrix-mutants.mjs",
+    "smoke:docker-update": "node --test test/docker-oneclick-update.test.js",
     "verify:devin-paid": "node scripts/devin-connect-paid-verify.mjs",
     "calibrate:devin-image": "node scripts/devin-connect-image-calibrate.mjs",
     "calibrate:devin": "node scripts/devin-connect-calibrate.mjs",
@@ -24,14 +28,18 @@
     "smoke:lsp-matrix": "node scripts/lsp-capacity-matrix.mjs",
     "probe:web-search": "node scripts/web-search-direct-probe.mjs",
     "gate": "node scripts/local-gate.mjs",
+    "gate:release": "node scripts/local-gate.mjs --release",
     "sync:contributors": "node scripts/sync-docs-contributors.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
+    "verify:release-assets": "node scripts/verify-release-assets.mjs",
     "build:bundle": "esbuild src/index.js --bundle --platform=node --format=cjs --target=node22 --outfile=src/_bundle.cjs --external:node:* --define:import.meta.url=__WA_IMPORT_META_URL__ --banner:js=\"const __WA_IMPORT_META_URL__=require('node:url').pathToFileURL(__filename).href;\"",
     "build:exe": "npm run build:bundle && pkg src/_bundle.cjs --config package.json --targets node22-win-x64 --output dist-windows/windsurfapi.exe",
     "build:exe:macos": "npm run build:bundle && pkg src/_bundle.cjs --config package.json --targets node22-macos-arm64 --output dist-macos/windsurfapi-macos-arm64",
     "build:exe:macos-x64": "npm run build:bundle && pkg src/_bundle.cjs --config package.json --targets node22-macos-x64 --output dist-macos/windsurfapi-macos-x64",
     "audit:baselines": "node scripts/spec-baseline-audit.mjs",
     "check:baselines": "node scripts/spec-baseline-check.mjs",
+    "check:copy": "node scripts/check-dashboard-copy.mjs",
+    "check:ui": "node scripts/check-dashboard-scale.mjs && node scripts/check-dashboard-contrast.mjs",
     "smoke:exe": "node scripts/exe-boot-smoke.mjs"
   },
   "pkg": {
@@ -51,7 +59,7 @@
     "outputPath": "dist-windows"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.13.0"
   },
   "license": "MIT",
   "author": "dwgx <somdhmtb@gmail.com> (https://github.com/dwgx)",

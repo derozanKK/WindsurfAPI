@@ -11,6 +11,7 @@ import {
   setAccountTier,
 } from '../src/auth.js';
 import { handleChatCompletions, rateLimitBurstCooldownMs, rateLimitCooldownMs, clientRetryAfterSeconds } from '../src/handlers/chat.js';
+import { __resetRateLimitBurstForTest } from '../src/rate-limit-burst.js';
 import { getExperimental, setExperimental, setBreakerTunables } from '../src/runtime-config.js';
 
 const createdAccountIds = [];
@@ -24,6 +25,7 @@ function addTestAccount(label = 'test-account') {
 
 afterEach(() => {
   setExperimental(originalExperimental);
+  __resetRateLimitBurstForTest();
   while (createdAccountIds.length) {
     removeAccount(createdAccountIds.pop());
   }

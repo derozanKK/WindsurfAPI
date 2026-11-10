@@ -80,6 +80,15 @@ export async function gracefulRestart({
 } = {}) {
   log.info(`restart: begin graceful restart (${reason || 'unspecified'})`);
 
+  // Detach P1: refuse new admissions and drop frozen turns before the LS pool
+  // is stopped. Entries are in-memory, so nothing persists across the restart.
+  try {
+    const registry = await import('./detached-registry.js');
+    registry.beginDetachDrain();
+  } catch (e) {
+    log.warn(`restart: detach drain failed (continuing): ${e.message}`);
+  }
+
   // (a) Abort in-flight SSE streams so long-lived streaming responses don't
   // pin the drain for the full drainMs window.
   if (typeof abortSse === 'function') {

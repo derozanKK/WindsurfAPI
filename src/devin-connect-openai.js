@@ -19,14 +19,18 @@
 
 import { randomUUID } from 'crypto';
 import { filterToolCallsByAllowlist } from './handlers/chat.js';
-import { streamChat as realStreamChat, isRetryable, messageText } from './devin-connect.js';
+import { streamChat as realStreamChat, isRetryable, messageText, applyOutputCap } from './devin-connect.js';
 import { ToolCallStreamParser, parseToolCallsFromText, isWeakEmulationModel } from './handlers/tool-emulation.js';
 import { log } from './config.js';
+import { safeLogValue } from './log-safety.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from './leak-trace.js';
 import { systemFingerprint } from './system-fingerprint.js';
 import { applyStop, StopSequenceGate } from './stop-sequences.js';
 import { normalizeToolCallArgs, recordArgRepair } from './handlers/cline-compat.js';
 import { ThinkTextClassifier } from './response-classifier.js';
+import { budgetExceededError } from './request-budget.js';
+import { bumpConnect } from './devin-connect-metrics.js';
+import { toClientToolCallId, restoreUpstreamToolIds } from './tool-ids.js';
 
 // Gate for the leading think-tag reroute (Item 1, loop break). The classifier
 // lives HERE, in the connect layer, so the DEVIN_CONNECT_ prefix is accurate:
@@ -120,6 +124,114 @@ function isEmptyCompletion(finishEv, sawContent) {
   return true;
 }
 
+// ── #236 prose tool-intent detector (log-only) ─────────────────────────────
+// The rescue gate below requires `sawReasoning && !sawText`. A reasoning-effort
+// `-none` selector (glm-5-2-none and its siblings) can NEVER satisfy it: the
+// upstream emits no reasoning events at all, so a stalled turn in that family
+// arrives as TEXT or as nothing, never as reasoning. The reported shape is the
+// same trap one channel over — the model narrates the tool call in visible text,
+// finishes with `stop` and zero tool calls, and the client waits for a call that
+// never comes.
+//
+// We deliberately do NOT retry on it. "The model answered in prose" and "the
+// model stalled mid-intent" are indistinguishable without a capture of a real
+// stall, and a false-positive nudge would rewrite a legitimate answer (#236
+// thread, 2026-08-03: 60+ direct turns, zero stalls, so the trigger is not even
+// established). What that thread is missing is the capture — so this detector
+// produces one. It logs and counts; it never alters the wire.
+//
+// The criterion is narrow on purpose, and its last two conditions are what keep
+// ordinary final answers out of the log:
+//   - the request declared tools (a request without tools has nothing to stall on);
+//   - finish is `stop`/null with ZERO tool calls (a real call, or a `length` /
+//     `content_filter` terminal state, is not this shape);
+//   - the turn does not END like a finished sentence. A completed answer ends in
+//     `.`/`!`/`?` (or the CJK equivalents); a turn that stops mid-intent ends in
+//     `:`, an ellipsis, or nothing at all. This is what separates
+//     "Let me read the file:" (stall) from "I used read_file to inspect it."
+//     (a normal summary) — the latter names a tool too, and would otherwise
+//     dominate the signal;
+//   - and the tail then names one of THIS request's tools, or carries an intent
+//     phrase. Tool names are matched with explicit ASCII boundaries so `bash`
+//     does not match inside `bashful`, and `read_file` does not match inside
+//     `read_files`.
+//
+// Accepted false negatives: a stall whose text happens to end in a period is not
+// detected. Keeping the counter clean matters more than covering every phrasing,
+// because the counter is what an operator will alarm on.
+const PROSE_INTENT_TAIL_MAX = 400;
+// Sentence-final punctuation, optionally followed by closing quotes/brackets.
+const SENTENCE_FINAL = /[.!?。！？]["'”’`)\]]*\s*$/;
+// Future/present intent markers. `let me` is excluded when followed by "know" —
+// "Let me know if you need anything else" is a closing, not an intent.
+const PROSE_INTENT_VERB = /\b(?:let me(?!\s+know\b)|i(?:'ll| will| am going to|'m going to| need to| should)|next,? i|now,? i)\b|(?:让我|我来|我先|接下来我|我将|我需要|正在)/i;
+
+function proseIntentDetectEnabled(env = process.env) {
+  // Log-only, so it is on by default: a detector that has to be switched on
+  // before it can capture the shape it exists to capture captures nothing.
+  return String(env.DEVIN_CONNECT_PROSE_INTENT_DETECT ?? '1') !== '0';
+}
+
+/** Tool names declared by the request, in declaration order. */
+function requestToolNames(tools) {
+  if (!Array.isArray(tools)) return [];
+  const names = [];
+  for (const tool of tools) {
+    const name = tool?.function?.name || tool?.name;
+    if (typeof name === 'string' && name.trim()) names.push(name.trim());
+  }
+  return names;
+}
+
+/**
+ * Judge a FINISHED turn for the #236 "narrated a tool call, emitted none" shape.
+ * Returns a signal string (`tool_name:<name>` or `intent_verb:<phrase>`) or null.
+ * Pure and synchronous — the caller only logs/counts the result.
+ */
+export function detectProseToolIntent({ text, toolNames = [], finishEv } = {}) {
+  if (!finishEv) return null;
+  if (finishEv.reason != null && finishEv.reason !== 'stop') return null;
+  if (finishEv.toolCalls && finishEv.toolCalls.length) return null;
+  const full = String(text || '');
+  if (!full.trim()) return null;
+  const tail = full.slice(-PROSE_INTENT_TAIL_MAX);
+  if (SENTENCE_FINAL.test(tail)) return null;
+  for (const name of toolNames) {
+    if (!name || name.length < 3) continue;
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`(^|[^A-Za-z0-9_])${escaped}([^A-Za-z0-9_]|$)`, 'i').test(tail)) {
+      return `tool_name:${name}`;
+    }
+  }
+  const verb = tail.match(PROSE_INTENT_VERB);
+  return verb ? `intent_verb:${verb[0].trim().toLowerCase()}` : null;
+}
+
+/**
+ * Log/count the #236 signal for a turn that has ALREADY been delivered.
+ *
+ * MUST run at the adapter layer, after tool-call emulation: before the parser
+ * strips `<tool_call>` markup, a normal emulated call looks like prose that
+ * stops mid-intent, so every emulated call was counted as a stall (the exact
+ * traffic the counter exists to measure). The caller passes the DELIVERED text
+ * and the calls it actually emitted, so a delivered call can never be reported
+ * as "narrated one, emitted none".
+ */
+function reportProseToolIntent({ params, text, finishEv, reasoning }) {
+  if (!proseIntentDetectEnabled()) return;
+  if (!Array.isArray(params?.tools) || params.tools.length === 0) return;
+  const toolNames = requestToolNames(params.tools);
+  const signal = detectProseToolIntent({ text, toolNames, finishEv });
+  if (!signal) return;
+  bumpConnect('prose_tool_intent');
+  log.info(
+    `DEVIN_CONNECT: prose tool intent without a call (#236) — `
+    + `model=${safeLogValue(params?.model)}, finish=${finishEv?.reason ?? 'null'}, `
+    + `signal=${signal}, reasoning=${Boolean(reasoning)}, tools=${toolNames.length}, `
+    + `sample=${JSON.stringify(leakSample(text))}`,
+  );
+}
+
 /**
  * Transparent wrapper around streamChatImpl that heals probabilistic empty
  * completions by re-issuing the identical request, and rescues thinking-only
@@ -135,7 +247,25 @@ function isEmptyCompletion(finishEv, sawContent) {
 // guard aimed at it guards code that cannot be reached (the exact shape of the v3.9.13 medium
 // defect). If a caller ever genuinely needs to opt out, add the option back THEN, with a test
 // that passes `false` — that test is what makes it a knob rather than decoration.
+
+// Egress/ingress boundary for tool-call ids. The client received a normalized
+// `call_…` id (see toClientToolCallId); the upstream issued its own dialect
+// (`get_weather:0#<uuid>` on swe-2). Restore the original id on a COPY of the
+// request right before the wire encode, so native history replay (#6
+// ChatToolCall / #7 tool_call_id) is byte-identical to what the upstream
+// issued. Everything upstream of this point — session continuity, cache keys,
+// the response body — sees the client-visible id.
+function withUpstreamToolIds(params) {
+  const messages = restoreUpstreamToolIds(params?.messages);
+  return messages === params?.messages ? params : { ...params, messages };
+}
+
 async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opts = {}) {
+  // Route-owned request budget. Each internal attempt is one upstream turn; the
+  // cap is per REQUEST, shared with the handler's account failover, so the
+  // empty/rescue retries can no longer multiply into the measured 45/90-turn
+  // products. Backoffs are clamped to the remaining deadline.
+  const budget = opts?.budget || null;
   // Weak models (fable) return DETERMINISTIC empties on complex multi-turn / large
   // system — paid E2E (2026-07-08, 27/27) proved retry never heals them, it only
   // triples the upstream load and burns the account into a 3h rate limit. So for
@@ -216,6 +346,11 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
   // retries that never heal only triple upstream load into a rate limit), and it was
   // already reachable before this change in the empty-first order. Splitting the counters
   // makes the empty budget independent of ORDER; it does not raise what may be spent.
+  // #236's detector is NOT here: it runs in the adapters, after emulation, on
+  // the text and calls the client actually received. Judging the raw upstream
+  // tail here counted every normal emulated `<tool_call>` turn as a stall
+  // (the markup is stripped only downstream).
+  const hasTools = Boolean(params?.tools?.length);
   let rescueAttempt = 0;
   let emptyAttempt = 0;
   for (;;) {
@@ -224,6 +359,20 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
     let sawReasoning = false;
     let sawReasoningText = '';
     let finishEv = null;
+    // P-04: reasoning is provisional until this attempt is committed. A rescue
+    // REPLACES the attempt and a delta already sent cannot be retracted, so a
+    // reasoning-only attempt that is later abandoned used to leave its whole
+    // trace on the wire while the returned/cached/continuity value kept only
+    // the final attempt. Hold reasoning while a rescue is still possible and
+    // release it only when the attempt can no longer be replaced: the first
+    // text delta (sawText closes the rescue gate) or the terminal finish. The
+    // rescue branch below drops the buffer together with the attempt.
+    const rescuePossible = hasTools && rescueAttempt < rescueMax;
+    let pendingReasoning = [];
+    // The thinking signature (opt-in decode, DEVIN_CONNECT_SIGNATURE_TAG) seals
+    // this attempt's reasoning, so it is held and released with it: committed
+    // together, or dropped together when a rescue replaces the attempt.
+    let pendingSignature = '';
     // Item 1 (loop break): leading think-tagged CONTENT is reclassified into the
     // reasoning channel HERE, at the stream-event level, BEFORE the rescue
     // decision below. A whole turn of ` thinking…` therefore stays a
@@ -241,7 +390,31 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
     // family uses `◁think▷…◁/think▷` — extending the classifier to that dialect
     // is left for a future PR.)
     const thinkClassifier = thinkTextRerouteEnabled() ? new ThinkTextClassifier() : null;
-    for await (const ev of streamChatImpl(attemptParams)) {
+    // One turn per upstream call, consumed immediately before it. The cap is
+    // hard: when it is reached the generator throws a 504-class error instead
+    // of starting another turn.
+    if (budget && !budget.takeTurn()) {
+      throw budgetExceededError(
+        budget.expired()
+          ? `request budget exhausted before DEVIN_CONNECT attempt (${budget.describe()})`
+          : `request upstream-turn cap reached before DEVIN_CONNECT attempt (${budget.describe()})`,
+      );
+    }
+    const upstreamParams = withUpstreamToolIds(attemptParams);
+    const callParams = budget
+      ? {
+        ...upstreamParams,
+        // devin-connect.js treats deadlineMs as the total wall clock for THIS
+        // stream. Give it what the request has left, never more.
+        deadlineMs: Math.min(
+          Number.isFinite(upstreamParams?.deadlineMs) && upstreamParams.deadlineMs > 0
+            ? upstreamParams.deadlineMs
+            : Infinity,
+          budget.remainingMs(),
+        ),
+      }
+      : upstreamParams;
+    for await (const ev of streamChatImpl(callParams)) {
       if ((ev.type === 'content' || ev.type === 'reasoning') && leakTraceEnabled(env)) {
         log.info('LEAK_TRACE stream-event', {
           channel: ev.type,
@@ -258,9 +431,16 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
           sawContent = true;
           sawReasoning = true;
           sawReasoningText += routed.thinking;
-          yield { type: 'reasoning', text: routed.thinking };
+          if (rescuePossible && !sawText) pendingReasoning.push(routed.thinking);
+          else yield { type: 'reasoning', text: routed.thinking };
         }
         if (routed.text) {
+          // First text delta: the rescue gate (`!sawText`) is now closed, so
+          // this attempt is committed — release its provisional reasoning
+          // before the text it preceded.
+          for (const text of pendingReasoning) yield { type: 'reasoning', text };
+          pendingReasoning = [];
+          if (pendingSignature) { yield { type: 'signature', reasoning_signature: pendingSignature }; pendingSignature = ''; }
           sawContent = true;
           sawText = true;
           yield { type: 'content', text: routed.text };
@@ -268,15 +448,26 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
       } else if (ev.type === 'content' || ev.type === 'reasoning') {
         if (ev.text) {
           sawContent = true;
-          if (ev.type === 'content') sawText = true;
-          if (ev.type === 'reasoning') {
+          if (ev.type === 'content') {
+            // First text delta commits the attempt — see the classifier branch.
+            for (const text of pendingReasoning) yield { type: 'reasoning', text };
+            pendingReasoning = [];
+            if (pendingSignature) { yield { type: 'signature', reasoning_signature: pendingSignature }; pendingSignature = ''; }
+            sawText = true;
+          } else {
             sawReasoning = true;
             sawReasoningText += ev.text;
+            if (rescuePossible && !sawText) {
+              pendingReasoning.push(ev.text);
+              continue;
+            }
           }
         }
         yield ev;
       } else if (ev.type === 'finish') {
         finishEv = ev; // hold: decide retry after the stream drains
+      } else if (ev.type === 'signature' && rescuePossible && !sawText) {
+        pendingSignature += ev.reasoning_signature || '';
       } else {
         yield ev;
       }
@@ -287,6 +478,11 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
     if (thinkClassifier) {
       const rest = thinkClassifier.flush();
       if (rest) {
+        // The flushed tail is text, so the attempt is committed for the same
+        // reason as a normal content delta.
+        for (const text of pendingReasoning) yield { type: 'reasoning', text };
+        pendingReasoning = [];
+        if (pendingSignature) { yield { type: 'signature', reasoning_signature: pendingSignature }; pendingSignature = ''; }
         sawContent = true;
         sawText = true;
         yield { type: 'content', text: rest };
@@ -300,12 +496,13 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
     // Plain chat requests without tools legitimately end in reasoning/text, so rescue is skipped.
     const isStopOrNull = finishEv && (finishEv.reason == null || finishEv.reason === 'stop');
     const hasNoToolCalls = !finishEv?.toolCalls || finishEv.toolCalls.length === 0;
-    const hasTools = Boolean(params?.tools?.length);
     if (hasTools && rescueAttempt < rescueMax && isStopOrNull && hasNoToolCalls && sawReasoning && !sawText) {
       rescueAttempt++;
       log.warn(`DEVIN_CONNECT: thinking-only completion (reasoning-only, finish=${finishEv?.reason ?? 'null'}) — rescue retry ${rescueAttempt}/${rescueMax} (nudge appended)`);
       const backoff = retryOnEmptyBaseMs(env) * rescueAttempt;
-      if (backoff) await new Promise((r) => setTimeout(r, backoff));
+      if (backoff && !(await budgetedSleep(backoff, budget))) {
+        throw budgetExceededError(`request budget exhausted during DEVIN_CONNECT rescue backoff (${budget.describe()})`);
+      }
       // Rebuild from the ORIGINAL request every rescue: `params` is never mutated (each
       // rescue constructs a fresh attemptParams below), so it always holds the client's
       // messages. Building from attemptParams instead accumulated — previous rescues'
@@ -318,6 +515,7 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
       const filteredMsgs = origMsgs.filter((msg) => {
         if (msg.role !== 'assistant') return true;
         if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) return true;
+        if (msg.reasoning_signature && String(msg.reasoning_content || '').length > 0) return true;
         return messageText(msg.content).trim() !== '';
       });
       let nudgeText = 'Stop reasoning. Emit the tool call markup now.';
@@ -330,6 +528,12 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
         { role: 'user', content: nudgeText },
       ];
       attemptParams = { ...attemptParams, messages: rescued };
+      // The abandoned attempt's provisional reasoning dies with this loop
+      // iteration (`pendingReasoning` is declared inside it): it was never sent
+      // (the buffer is only released at commit), so the client, the returned
+      // result, the cache and session continuity all stay on the replacement
+      // attempt. The attempt_reset below still tells the consumer to clear the
+      // other accumulators (content/tool calls/billing) for the same reason.
       // Tell the consumer to discard what it accumulated: the next attempt REPLACES
       // this one, it does not continue it. Without this every rescue attempt's
       // reasoning was concatenated into a single answer — measured
@@ -348,15 +552,45 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
       // what it did before when `attempt` happened to equal that count. Keying it to the
       // shared counter instead would make an unrelated rescue lengthen the next empty wait.
       const backoff = retryOnEmptyBaseMs(env) * emptyAttempt;
-      if (backoff) await new Promise((r) => setTimeout(r, backoff));
+      if (backoff && !(await budgetedSleep(backoff, budget))) {
+        throw budgetExceededError(`request budget exhausted during DEVIN_CONNECT empty-retry backoff (${budget.describe()})`);
+      }
       continue;
     }
     if (weak && finishEv && isEmptyCompletion(finishEv, sawContent)) {
       log.warn(`DEVIN_CONNECT: weak model ${params.model} empty completion (finish=${finishEv.reason ?? 'null'}) — NOT retrying (deterministic, retry would amplify rate limit)`);
     }
+    // No rescue: this is the committed attempt. Release any reasoning still held
+    // while a rescue was possible, before its terminal finish event.
+    for (const text of pendingReasoning) yield { type: 'reasoning', text };
+    pendingReasoning = [];
+    if (pendingSignature) { yield { type: 'signature', reasoning_signature: pendingSignature }; pendingSignature = ''; }
     if (finishEv) yield finishEv;
     return;
   }
+}
+
+// Sleep that can never outlive the request budget. Returns false when the
+// budget has no time left — including when it cannot cover the full backoff —
+// so the caller stops instead of starting an attempt that the route deadline
+// would kill mid-flight.
+async function budgetedSleep(ms, budget) {
+  if (!ms) return true;
+  if (!budget) {
+    await new Promise((r) => setTimeout(r, ms));
+    return true;
+  }
+  const left = budget.remainingMs();
+  // A backoff the budget cannot fully honour means there is no room left for
+  // the retry it was pacing. Sleeping the clamped remainder and then re-issuing
+  // starts the attempt with a sliver of time, and the deadline kills it
+  // mid-flight — the v3.9.57 CI flake (run 39861008441). The final
+  // `remainingMs() > 0` check cannot catch that: it is the same condition
+  // budgetedSleep already returned, and canStartAttempt() adds only the turn
+  // cap. Stop here; each caller surfaces its own error.
+  if (left < ms) return false;
+  await new Promise((r) => setTimeout(r, ms));
+  return budget.remainingMs() > 0;
 }
 
 const OBJECT_COMPLETION = 'chat.completion';
@@ -382,10 +616,10 @@ function nowSeconds() {
  * @param {boolean} [opts.emulateTools] when true, parse <tool_call> markup out of
  *                                      the buffered answer and surface OpenAI
  *                                      tool_calls (text-emulation, swe-1.6 etc).
- * @returns {Promise<{status:number, body:object}>}
+ * @returns {Promise<{status:number, body:object, stop:string|null}>}
  */
 export async function toChatCompletion(params, opts = {}) {
-  const { id = newId(), created = nowSeconds(), displayModel, maxRetries = 2, retryBaseMs = 400, emulateTools = false, stop = null, clineCompat = false, stopCarrier = false } = opts;
+  const { id = newId(), created = nowSeconds(), displayModel, maxRetries = 1, retryBaseMs = 400, emulateTools = false, stop = null, clineCompat = false, stopCarrier = false, budget = null } = opts;
   const model = displayModel || params.model;
 
   // Non-stream path buffers the whole answer, so a transient failure (network
@@ -394,6 +628,9 @@ export async function toChatCompletion(params, opts = {}) {
   // are not retryable and throw straight through for the handler to map.
   let content = '';
   let reasoning = '';
+  let reasoningSignature = '';
+  let signedSegment = false;
+  let multipleSignedSegments = false;
   let finishReason = 'stop';
   let usage = null;
   // Per-request billing detail (credit / ACU cost) when the operator has calibrated
@@ -407,13 +644,23 @@ export async function toChatCompletion(params, opts = {}) {
   let nativeToolCalls = [];
   for (let attempt = 0; ; attempt++) {
     try {
-      content = ''; reasoning = ''; finishReason = 'stop'; usage = null; nativeToolCalls = [];
+      content = ''; reasoning = ''; reasoningSignature = ''; signedSegment = false; multipleSignedSegments = false; finishReason = 'stop'; usage = null; nativeToolCalls = [];
       for await (const ev of streamChatWithEmptyRetry(params, undefined, opts)) {
         // A rescue attempt REPLACES the previous one; drop what it produced or the
         // client is handed every attempt concatenated.
-        if (ev.type === 'attempt_reset') { content = ''; reasoning = ''; nativeToolCalls = []; billing = null; continue; }
+        if (ev.type === 'attempt_reset') { content = ''; reasoning = ''; reasoningSignature = ''; signedSegment = false; multipleSignedSegments = false; nativeToolCalls = []; billing = null; continue; }
         if (ev.type === 'content') content += ev.text;
-        else if (ev.type === 'reasoning') reasoning += ev.text;
+        else if (ev.type === 'reasoning') {
+          if (signedSegment) multipleSignedSegments = true;
+          reasoning += ev.text;
+        }
+        // Thinking signature (opt-in decode, DEVIN_CONNECT_SIGNATURE_TAG). The
+        // per-frame events are increments; the finish event's total is not used
+        // because a rescue attempt_reset must discard the abandoned increments.
+        else if (ev.type === 'signature') {
+          reasoningSignature += ev.reasoning_signature || '';
+          signedSegment = true;
+        }
         else if (ev.type === 'finish') {
           if (ev.reason) finishReason = ev.reason;
           if (ev.usage) usage = ev.usage;
@@ -424,9 +671,18 @@ export async function toChatCompletion(params, opts = {}) {
       break;
     } catch (err) {
       if (!isRetryable(err) || attempt >= maxRetries) throw err;
+      // The inner generator already consumes a turn per upstream call; when
+      // the route budget has no turn/time left, re-issuing here would only be
+      // refused. Surface the real upstream error instead of a synthetic one.
+      if (budget && !budget.canStartAttempt()) throw err;
       const backoff = retryBaseMs * 2 ** attempt;
       log.warn(`DEVIN_CONNECT: retryable error (${err.code || err.message}); retry ${attempt + 1}/${maxRetries} in ${backoff}ms`);
-      await new Promise((r) => setTimeout(r, backoff));
+      if (!(await budgetedSleep(backoff, budget))) throw err;
+      // Re-read the gate after the wait: the pre-sleep check is a snapshot, and
+      // the retry must be admitted by the budget as it stands now. (The deadline
+      // sliver itself is budgetedSleep()'s job — it refuses a backoff the budget
+      // cannot cover.) The real upstream error is what surfaces.
+      if (budget && !budget.canStartAttempt()) throw err;
     }
   }
 
@@ -533,9 +789,12 @@ export async function toChatCompletion(params, opts = {}) {
   // OpenAI convention: content is a string (may be empty), never undefined.
   const message = { role: 'assistant', content: content || '' };
   if (reasoning && !promotedReasoning) message.reasoning_content = reasoning;
+  // The signature seals exactly this reasoning text; promoted reasoning is no
+  // longer a thinking block, so a signature beside it would seal nothing.
+  if (reasoning && !promotedReasoning && reasoningSignature && !multipleSignedSegments) message.reasoning_signature = reasoningSignature;
   if (toolCalls.length) {
     message.tool_calls = toolCalls.map((tc, i) => ({
-      id: tc.id || `call_${i}_${Date.now().toString(36)}`,
+      id: toClientToolCallId(tc.id, `call_${i}_${Date.now().toString(36)}`),
       type: 'function',
       function: { name: tc.name || 'unknown', arguments: compatArgs(tc.argumentsJson || tc.arguments, clineCompat) },
     }));
@@ -543,6 +802,31 @@ export async function toChatCompletion(params, opts = {}) {
     // a hallucinated preview the caller shouldn't show).
     message.content = null;
     finishReason = 'tool_calls';
+  }
+
+  // Budget honesty (live finding: gemini-3-6-flash-medium). Thinking is counted
+  // in completion_tokens but the upstream does not bound it by max_tokens, so a
+  // turn can overrun the caller's cap and still claim a clean 'stop'. Report
+  // 'length' when the upstream's own count reached or passed the requested cap.
+  // NOT a local truncation: every delta has already been delivered above, and
+  // the exact count only exists on the terminal frame — see applyOutputCap.
+  //
+  // A turn cut by the CLIENT's stop sequence keeps 'stop': the caller asked for
+  // that terminal cause and the Messages route carries it as `stop_sequence`
+  // (the carrier below is gated on 'stop'). Tool calls / content_filter are
+  // stronger states and applyOutputCap leaves them alone.
+  if (!stopHit) finishReason = applyOutputCap(finishReason, usage, params.completion?.maxTokens);
+
+  // #236 log-only detector — AFTER emulation and the stop gate, on the text and
+  // calls the client actually receives. `stopHit` means a local stop sequence
+  // cut the answer, which is not a model stall.
+  if (!stopHit) {
+    reportProseToolIntent({
+      params,
+      text: content,
+      finishEv: { reason: finishReason, toolCalls },
+      reasoning,
+    });
   }
 
   const choice = { index: 0, message, finish_reason: finishReason };
@@ -570,7 +854,7 @@ export async function toChatCompletion(params, opts = {}) {
   // calibrated. Under the _windsurf prefix so it can't be mistaken for an OpenAI
   // field by a downstream relay that metering reads.
   if (billing) body._windsurf_billing = billing;
-  return { status: 200, body };
+  return { status: 200, body, stop: matchedStop };
 }
 
 /**
@@ -584,7 +868,9 @@ export async function toChatCompletion(params, opts = {}) {
  *   1. role-priming chunk (delta {role, content:''}) — DEFERRED until the first
  *      real delta (or the finish tail) so a pre-open transient/dead-token error
  *      leaves the caller's first-connect recovery armed (see `prime` below)
- *   2. reasoning_content deltas as they arrive
+ *   2. reasoning_content deltas — provisional while a rescue could still replace
+ *      the attempt; released only when the attempt is committed (first text
+ *      delta or terminal finish), so an abandoned attempt never reaches the wire
  *   3. content deltas as they arrive
  *   4. finish chunk (delta {}, finish_reason)
  *   5. usage-only chunk (choices [], usage) when usage is known
@@ -593,34 +879,45 @@ export async function toChatCompletion(params, opts = {}) {
  *          the assembled result, so callers can cache it after streaming.
  */
 export async function streamChatCompletion(params, send, opts = {}) {
-  const { id = newId(), created = nowSeconds(), displayModel, emulateTools = false, includeUsage = false, stop = null, clineCompat = false, stopCarrier = false } = opts;
+  const { id = newId(), created = nowSeconds(), displayModel, emulateTools = false, includeUsage = false, stop = null, clineCompat = false, stopCarrier = false, maxRetries = 1, retryBaseMs = 400, budget = null } = opts;
   const model = displayModel || params.model;
   const base = { id, object: OBJECT_CHUNK, created, model, system_fingerprint: systemFingerprint(model) };
 
   // 1. Role-priming chunk. This USED to fire eagerly here, before streamChat
   //    opened the upstream — but the very first send() flips `emitted=true` in
-  //    the caller (handlers/chat.js), which disarms every !emitted-gated
-  //    first-connect recovery branch (transient replay / re-login / failover).
-  //    A transient 5xx/reset or a dead token — which the non-stream path retries
-  //    / re-logs-in / fails over — then surfaced as a hard client error on the
-  //    stream path. So we DEFER the prime behind `primed` until the first REAL
-  //    delta (content / reasoning / tool_call) actually arrives, i.e. until the
-  //    upstream has demonstrably opened. The empty / immediate-finish path primes
-  //    from the finish tail below, so a legitimately empty response is still a
-  //    well-formed OpenAI stream (role → finish → optional usage). Operators who
-  //    relied on the eager role chunk can restore it with DEVIN_CONNECT_EAGER_PRIME=1.
+  //    the caller (handlers/chat.js), which disarms the handler's !emitted-gated
+  //    account recovery branches (re-login / failover). A dead token — which the
+  //    non-stream path re-logs-in / fails over — then surfaced as a hard client
+  //    error on the stream path. So we DEFER the prime behind `primed` until the
+  //    first REAL delta (content / reasoning / tool_call) actually arrives, i.e.
+  //    until the upstream has demonstrably opened. `primed` also gates this
+  //    adapter's own one-shot transport retry (nothing emitted ⇒ safe replay).
+  //    The empty / immediate-finish path primes from the finish tail below, so a
+  //    legitimately empty response is still a well-formed OpenAI stream
+  //    (role → finish → optional usage). Operators who relied on the eager role
+  //    chunk can restore it with DEVIN_CONNECT_EAGER_PRIME=1.
   let primed = false;
-  const prime = () => {
+  // V-08: `send` is the handler's bounded writer and returns a promise once the
+  // socket reports backpressure. Awaiting it here (and in every emitter below)
+  // is what lets a slow reader hold this producer instead of buying unbounded
+  // upstream work. A synchronous consumer returns undefined, so `await` is a
+  // no-op on the direct-Chat wiring that still passes a plain function.
+  const prime = async () => {
     if (primed) return;
     primed = true;
-    send({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+    await send({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
   };
-  if (String(process.env.DEVIN_CONNECT_EAGER_PRIME || '') === '1') prime();
+  if (String(process.env.DEVIN_CONNECT_EAGER_PRIME || '') === '1') await prime();
 
   let content = '';
   let reasoning = '';
   let finishReason = 'stop';
   let usage = null;
+  // Exactly what the client received as visible content, after tool-markup
+  // stripping and the stop gate. `content` is the RAW upstream accumulator and
+  // is used for tool parsing/session continuity; caching must use `delivered`
+  // or a filtered/echoed <tool_call> block becomes the visible cached answer.
+  let delivered = '';
   // Same billing passthrough as the non-stream path.
   let streamBilling = null;
   // Native tool calls (DEVIN_CONNECT_TOOL_CALL_TAGS calibrated) ride the terminal
@@ -629,18 +926,23 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // proto-openai-03: stream-side stop enforcement. The gate holds back a short
   // tail so a stop sequence straddling two content chunks is still caught; on a
   // hit we emit the safe prefix, flip finish_reason:'stop', and stop the stream.
-  const stopGate = new StopSequenceGate(stop);
+  // `let` because a pre-emit transport retry must start from a fresh gate.
+  let stopGate = new StopSequenceGate(stop);
   let stopHit = false;
   let matchedStop = null;
   // Emit content through the stop gate. Returns true when the stream should end.
-  const sendContent = (text) => {
+  const sendContent = async (text) => {
     if (!text) return false;
     if (!stopGate.active) {
-      send({ ...base, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+      await send({ ...base, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+      delivered += text;
       return false;
     }
     const { emit, hit } = stopGate.push(text);
-    if (emit) send({ ...base, choices: [{ index: 0, delta: { content: emit }, finish_reason: null }] });
+    if (emit) {
+      await send({ ...base, choices: [{ index: 0, delta: { content: emit }, finish_reason: null }] });
+      delivered += emit;
+    }
     if (hit) { finishReason = 'stop'; stopHit = true; matchedStop = stopGate.matched; }
     return hit;
   };
@@ -654,58 +956,110 @@ export async function streamChatCompletion(params, send, opts = {}) {
     ? new ToolCallStreamParser({ modelKey: params.model, provider: null, route: 'devin_connect' })
     : null;
   const collectedToolCalls = [];
-  const emitToolCalls = (calls, filter = true) => {
+  const emitToolCalls = async (calls, filter = true) => {
     // ToolGuard: same allowlist filter the chat main path applies — the
     // connect stream path used to emit any EMULATED call without checking it
     // against the client's declared tools[] (audit blind spot). Native calls
     // (structured ev.toolCalls from upstream) are trusted and pass through.
     if (filter) calls = filterToolCallsByAllowlist(calls || [], params.tools || []);
     for (const tc of calls || []) {
-      prime(); // a tool_call is a real delta — open the message before it
+      await prime(); // a tool_call is a real delta — open the message before it
       const idx = collectedToolCalls.length;
-      collectedToolCalls.push(tc);
-      send({ ...base, choices: [{ index: 0, delta: {
+      // Normalize once, before the call is recorded: the emitted delta AND the
+      // returned toolCalls (session-continuity commit, cache) must agree with
+      // what the client saw, or the next turn's echoed id no longer matches.
+      const emitted = {
+        ...tc,
+        id: toClientToolCallId(tc.id, `call_${idx}_${Date.now().toString(36)}`),
+      };
+      collectedToolCalls.push(emitted);
+      await send({ ...base, choices: [{ index: 0, delta: {
         tool_calls: [{
           index: idx,
-          id: tc.id || `call_${idx}_${Date.now().toString(36)}`,
+          id: emitted.id,
           type: 'function',
-          function: { name: tc.name || 'unknown', arguments: compatArgs(tc.argumentsJson, clineCompat) },
+          function: { name: emitted.name || 'unknown', arguments: compatArgs(emitted.argumentsJson, clineCompat) },
         }],
       }, finish_reason: null }] });
     }
   };
 
-  for await (const ev of streamChatWithEmptyRetry(params, undefined, opts)) {
-    // A rescue attempt REPLACES the previous one. The deltas already sent cannot be
-    // retracted (documented at the promotion site below), but the accumulators must
-    // not keep the abandoned attempt — otherwise `content` ends up holding every
-    // attempt concatenated, and the promotion re-sends that pile as the answer.
-    if (ev.type === 'attempt_reset') {
-      reasoning = '';
-      content = '';
-      collectedToolCalls.length = 0;
-      nativeToolCalls = [];
-      continue;
-    }
-    if (ev.type === 'reasoning') {
-      prime(); // first real delta: emit the deferred role chunk first
-      reasoning += ev.text;
-      send({ ...base, choices: [{ index: 0, delta: { reasoning_content: ev.text }, finish_reason: null }] });
-    } else if (ev.type === 'content') {
-      prime(); // first real delta: emit the deferred role chunk first
-      content += ev.text;
-      if (toolParser) {
-        const { text, toolCalls } = toolParser.feed(ev.text);
-        emitToolCalls(toolCalls);
-        if (sendContent(text)) break;
-      } else {
-        if (sendContent(ev.text)) break;
+  // Q5 ownership: the ADAPTER owns transport retries. One bounded retry for a
+  // retryable fault (5xx / ECONNRESET / server unavailable) is safe ONLY while
+  // nothing has crossed the wire — `primed` is flipped by the first real delta
+  // (and by the eager-prime opt-in), so a partial answer is never replayed.
+  // Account failover stays in the handler.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      for await (const ev of streamChatWithEmptyRetry(params, undefined, opts)) {
+        // A rescue attempt REPLACES the previous one. The generator holds
+        // reasoning while an attempt can still be rescued, so no abandoned
+        // reasoning delta ever reaches this consumer; the accumulators are
+        // reset anyway so `content`, `delivered`, tool calls and billing can
+        // never carry a discarded attempt into the returned result, the cache
+        // or session continuity. (`reasoning` is reset for the same contract,
+        // even though the generator already guarantees it is committed-only.)
+        if (ev.type === 'attempt_reset') {
+          reasoning = '';
+          content = '';
+          delivered = '';
+          collectedToolCalls.length = 0;
+          nativeToolCalls = [];
+          continue;
+        }
+        if (ev.type === 'reasoning') {
+          await prime(); // first real delta: emit the deferred role chunk first
+          reasoning += ev.text;
+          await send({ ...base, choices: [{ index: 0, delta: { reasoning_content: ev.text }, finish_reason: null }] });
+        } else if (ev.type === 'signature') {
+          // Opt-in decode (DEVIN_CONNECT_SIGNATURE_TAG). Upstream sends it after
+          // the last reasoning frame and before content, so messages.js can close
+          // the thinking block with a signature_delta. The generator releases it
+          // only with a committed attempt, so it always seals exactly `reasoning`.
+          if (reasoning && ev.reasoning_signature) {
+            await send({ ...base, choices: [{ index: 0, delta: { reasoning_signature: ev.reasoning_signature }, finish_reason: null }] });
+          }
+        } else if (ev.type === 'content') {
+          await prime(); // first real delta: emit the deferred role chunk first
+          content += ev.text;
+          if (toolParser) {
+            const { text, toolCalls } = toolParser.feed(ev.text);
+            await emitToolCalls(toolCalls);
+            if (await sendContent(text)) break;
+          } else {
+            if (await sendContent(ev.text)) break;
+          }
+        } else if (ev.type === 'finish') {
+          if (ev.reason) finishReason = ev.reason;
+          if (ev.usage) usage = ev.usage;
+          if (ev.billing) streamBilling = ev.billing;
+          if (ev.toolCalls && ev.toolCalls.length) nativeToolCalls = ev.toolCalls;
+        }
       }
-    } else if (ev.type === 'finish') {
-      if (ev.reason) finishReason = ev.reason;
-      if (ev.usage) usage = ev.usage;
-      if (ev.billing) streamBilling = ev.billing;
-      if (ev.toolCalls && ev.toolCalls.length) nativeToolCalls = ev.toolCalls;
+      break;
+    } catch (err) {
+      if (primed || attempt >= maxRetries || !isRetryable(err)) throw err;
+      // A client abort during the previous attempt (or during the backoff
+      // below) must not start a fresh upstream call for a caller that is gone.
+      if (params.signal?.aborted) throw err;
+      // The route budget owns the total attempt count: re-issuing with no
+      // turn/time left would only be refused by the next upstream call.
+      if (budget && !budget.canStartAttempt()) throw err;
+      const backoff = retryBaseMs * 2 ** attempt;
+      log.warn(`DEVIN_CONNECT: stream retryable error (${err.code || err.status || err.message}); retry ${attempt + 1}/${maxRetries} in ${backoff}ms`);
+      bumpConnect('transient_replays');
+      if (!(await budgetedSleep(backoff, budget))) throw err;
+      // Same post-wait gate as the non-stream loop: the budget's state after the
+      // sleep, not the pre-sleep snapshot, decides whether the stream may be
+      // re-issued. The real upstream error is what surfaces.
+      if (budget && !budget.canStartAttempt()) throw err;
+      if (params.signal?.aborted) throw err;
+      // Nothing was emitted, so a clean restart cannot duplicate output.
+      content = ''; reasoning = ''; finishReason = 'stop'; usage = null;
+      streamBilling = null; nativeToolCalls = []; delivered = '';
+      collectedToolCalls.length = 0;
+      stopGate = new StopSequenceGate(stop);
+      stopHit = false; matchedStop = null;
     }
   }
 
@@ -714,8 +1068,8 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // the stop must not leak out.
   if (toolParser && !stopHit) {
     const { text, toolCalls } = toolParser.flush();
-    emitToolCalls(toolCalls);
-    sendContent(text);
+    await emitToolCalls(toolCalls);
+    await sendContent(text);
     if (collectedToolCalls.length) finishReason = 'tool_calls';
   }
 
@@ -725,7 +1079,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // twice. Native arrives whole on the finish event, so it's emitted here rather
   // than inline — same wire shape as the emulated deltas above.
   if (nativeToolCalls.length && !collectedToolCalls.length) {
-    emitToolCalls(nativeToolCalls.map((tc) => ({
+    await emitToolCalls(nativeToolCalls.map((tc) => ({
       id: tc.id, name: tc.name, argumentsJson: tc.arguments,
     })), false);   // native calls are trusted (structured upstream data), no allowlist filter
     finishReason = 'tool_calls';
@@ -763,14 +1117,14 @@ export async function streamChatCompletion(params, send, opts = {}) {
       ? parseToolCallsFromText(reasoning, { modelKey: params.model, provider: null, route: 'devin_connect' })
       : { toolCalls: [], text: reasoning };
     if (promotedParse.toolCalls.length) {
-      if (promotedParse.text) sendContent(promotedParse.text);
-      emitToolCalls(promotedParse.toolCalls.map((tc) => ({
+      if (promotedParse.text) await sendContent(promotedParse.text);
+      await emitToolCalls(promotedParse.toolCalls.map((tc) => ({
         id: tc.id, name: tc.name, argumentsJson: tc.argumentsJson ?? tc.arguments,
       })));
       content = promotedParse.text;
       finishReason = 'tool_calls';
     } else {
-      sendContent(reasoning);
+      await sendContent(reasoning);
       content = reasoning;
     }
   }
@@ -779,7 +1133,30 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // withholding in case they started a stop sequence). No-op after a hit.
   if (!stopHit && stopGate.active) {
     const tail = stopGate.flush();
-    if (tail) send({ ...base, choices: [{ index: 0, delta: { content: tail }, finish_reason: null }] });
+    if (tail) {
+      await send({ ...base, choices: [{ index: 0, delta: { content: tail }, finish_reason: null }] });
+      delivered += tail;
+    }
+  }
+
+  // Budget honesty — same rule and same reasons as the non-stream twin above.
+  // Applied only after the gate's held tail has been released, so the terminal
+  // frame still follows every delivered delta: the answer is reported as over
+  // budget, never retracted or cut mid-chunk. A local stop sequence keeps
+  // 'stop' (the caller asked for that cause; the carrier below depends on it).
+  if (!stopHit) finishReason = applyOutputCap(finishReason, usage, params.completion?.maxTokens);
+
+  // #236 log-only detector — AFTER emulation and the stop gate, on what the
+  // client actually received. A delivered call (emulated or native) sets
+  // finish_reason='tool_calls', so it can never be counted as prose intent;
+  // `stopHit` is a local cut, not a stall.
+  if (!stopHit) {
+    reportProseToolIntent({
+      params,
+      text: delivered,
+      finishEv: { reason: finishReason, toolCalls: collectedToolCalls },
+      reasoning,
+    });
   }
 
   // 4. Terminal finish chunk. Reaching here means streamChat drained cleanly
@@ -788,23 +1165,23 @@ export async function streamChatCompletion(params, send, opts = {}) {
   //    caller's `emitted` — still false, leaving first-connect recovery armed.
   //    An empty / immediate-finish response yielded no delta to prime from, so
   //    prime here to keep the stream well-formed: role → finish → optional usage.
-  prime();
+  await prime();
   const finishChoice = { index: 0, delta: {}, finish_reason: finishReason };
   // SEED-C3a carrier — see the non-stream twin above. This frame is what the
   // internal Messages translator sees (chat.js serialises it onto the `data:`
   // line, messages.js parses it back), so the field must survive JSON round-trip
   // and is emitted only on the route opt-in and only for a genuine local stop.
   if (stopCarrier && matchedStop && finishReason === 'stop') finishChoice._windsurf_stop_sequence = matchedStop;
-  send({ ...base, choices: [finishChoice] });
+  await send({ ...base, choices: [finishChoice] });
 
   // 5. Usage-only chunk (OpenAI streams usage in a trailing choices:[] frame).
   //    O1: only when the caller opted in via stream_options.include_usage;
   //    OpenAI omits this frame by default.
   if (usage && includeUsage) {
-    send({ ...base, choices: [], usage });
+    await send({ ...base, choices: [], usage });
   }
 
-  return { content, reasoning, finish_reason: finishReason, usage, billing: streamBilling, toolCalls: collectedToolCalls };
+  return { content, delivered, reasoning, finish_reason: finishReason, usage, billing: streamBilling, toolCalls: collectedToolCalls, stop: matchedStop };
 }
 
 export const __testing = {

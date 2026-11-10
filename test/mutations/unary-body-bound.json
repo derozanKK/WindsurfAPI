@@ -1,0 +1,32 @@
+{
+  "tests": [
+    "test/devin-connect-unary-body-bound.test.js"
+  ],
+  "expectBaselinePass": 9,
+  "mutations": [
+    {
+      "name": "the ceiling is ignored: every reader accumulates the whole body again, which is the 600MiB ERR_STRING_TOO_LONG crash on the catalog probe and 600MiB retained for a discarded GetUserJwt body",
+      "file": "src/devin-connect.js",
+      "anchor": "      const room = MAX_ERROR_BODY_BYTES - bytes;",
+      "replacement": "      const room = Number.MAX_SAFE_INTEGER;"
+    },
+    {
+      "name": "the crossing chunk is kept whole instead of sliced at the ceiling: the kept prefix runs past the bound by the remainder of that chunk, so the body described to the operator is larger than the ceiling allows",
+      "file": "src/devin-connect.js",
+      "anchor": "      if (room > 0) chunks.push(chunk.subarray(0, room));",
+      "replacement": "      if (room > 0) chunks.push(chunk);"
+    },
+    {
+      "name": "a truncated unary frame is parsed from its prefix as if it were the whole message: mintUserJwt returns a credential off a response the ceiling already discarded as incomplete",
+      "file": "src/devin-connect.js",
+      "anchor": "          if (truncated) {\n            log.warn(`[devin-connect] ${path} response body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated`);\n            return done(null);\n          }",
+      "replacement": "          if (truncated) {\n            log.warn(`[devin-connect] ${path} response body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated`);\n          }"
+    },
+    {
+      "name": "the catalog error text drops the truncation marker: a clipped error body is silently described as the whole upstream error, and an operator cannot tell it from a short one",
+      "file": "src/devin-connect-catalog.js",
+      "anchor": "            + (truncated ? ERROR_BODY_TRUNCATION_MARKER : '');",
+      "replacement": "            + '';"
+    }
+  ]
+}

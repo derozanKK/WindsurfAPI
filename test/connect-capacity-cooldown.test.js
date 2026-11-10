@@ -11,12 +11,25 @@
 // cooldown is written under the connect SELECTOR and selection checks that
 // dimension too.
 
+// ⚠️ sticky-session.js reads STICKY_SESSION_ENABLED into a module-load `const`
+// (src/account/sticky-session.js:73) and auth.js statically imports it (:14), so the
+// env has to be set BEFORE the first import of either — every src import below must
+// stay dynamic for exactly that reason. This file used to set the env inside the
+// sticky test body, after auth.js had already frozen the const to false: the guard
+// `if (!sticky.isStickyEnabled()) return;` then returned before a single assertion ran
+// (measured: the case took 0.65ms and never reached its body, vs 5.7ms once the env is
+// armed ahead of the import). The precondition assert inside the case now fails loudly
+// if that ordering is ever broken again.
+process.env.STICKY_SESSION_ENABLED = '1';
+
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+
+const {
   addAccountByKey, removeAccount, getAccountInternal,
   getApiKey, releaseAccountById, markRateLimited,
-} from '../src/auth.js';
+} = await import('../src/auth.js');
+const sticky = await import('../src/account/sticky-session.js');
 
 const created = [];
 function seed(label) {
@@ -61,19 +74,35 @@ describe('CAPACITY cooldown visibility on the connect path', () => {
     releaseAccountById(picked.id);
   });
 
-  it('a sticky-bound account that is capacity-cooled falls through instead of being re-pinned', async () => {
+  it('a sticky-bound account that is capacity-cooled falls through instead of being re-pinned', () => {
     // The sticky fast path must honor the selector dimension too — otherwise a
     // binding deterministically re-pins the exact overloaded account for the exact
     // overloaded selector, making the 60s window a guaranteed no-op.
-    process.env.STICKY_SESSION_ENABLED = '1';
-    const sticky = await import('../src/account/sticky-session.js');
-    if (!sticky.isStickyEnabled()) return; // module-load const already false in this process
+    assert.equal(sticky.isStickyEnabled(), true,
+      'precondition: STICKY_SESSION_ENABLED must be set before the first src import '
+      + '(module-load const) — if this fails the case below would silently not run');
 
     sticky.resetAllBindings();
     const hot = seed('sticky-cooled');
     const healthy = seed('sticky-healthy');
     const caller = 'api:capacitycapacitycapacitycapacity:user:u1';
-    sticky.setStickyBinding(caller, null, hot.id, hot.apiKey);
+    // Key shape matters: bindConnectSticky writes `(callerKey, modelKey=null,
+    // selector)` — bindingKey() is `caller\0*\0<selector>`, and the connect
+    // acquisition looks the SAME selector up. Binding with selector=null here
+    // writes `caller\0*\0*`, which the connect lookup can never resolve: the
+    // fast path is then never entered and the case passes for the wrong reason.
+    sticky.setStickyBinding(caller, null, hot.id, hot.apiKey, SELECTOR);
+
+    // Positive control: with no cooldown the binding IS the answer, so the
+    // fall-through asserted below is caused by the selector cooldown and not by a
+    // binding that never resolves (wrong key shape / sticky path never entered).
+    // `_sticky` is set only by the sticky fast path (auth.js:2071), so it proves
+    // this acquisition went through the code under test rather than normal selection.
+    const pinned = getApiKey([], null, caller, SELECTOR);
+    assert.equal(pinned?._sticky, true, 'precondition: the live binding answered this acquisition');
+    assert.equal(pinned.id, hot.id, 'precondition: the live binding wins selection');
+    releaseAccountById(pinned.id);
+
     markRateLimited(hot.apiKey, 60 * 1000, SELECTOR, 'c');
 
     const picked = getApiKey([], null, caller, SELECTOR);

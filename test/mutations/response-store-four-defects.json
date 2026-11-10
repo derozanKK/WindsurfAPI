@@ -44,11 +44,11 @@
     {
       "name": "D2 original defect: the field walk only looks at the top level, so array content is invisible again",
       "file": "src/response-store.js",
-      "anchor": "depth > 5 || node == null",
-      "replacement": "depth > 0 || node == null"
+      "anchor": "if (depth > MAX_RETAINED_DEPTH || seen.has(node)) return out;",
+      "replacement": "if (depth > 0 || seen.has(node)) return out;"
     },
     {
-      "name": "SURVIVOR (documented): D2 picks the FIRST oversized field instead of the largest. This is an efficiency term, not a correctness one, and the premise that makes it harmless is measurable: the shrink loop runs up to 64 iterations and halves the chosen field each time, so the entry reaches the cap regardless of which candidate is picked first. Measured with the mutation applied — five 60000-char array fields (worst case for first-candidate) still settle at 60263 bytes against a 102400 MAX_ENTRY_BYTES. Picking the largest converges in fewer passes; it does not change whether the entry fits, which is the property the assertions guard. The guard=64 bound is what keeps this true — if that ever shrinks, re-run this mutation.",
+      "name": "SURVIVOR (documented): D2 picks the FIRST oversized field instead of the largest. This is an efficiency term, not a correctness one: trimContentToFit now runs until CONVERGENCE and every pass strictly shortens the chosen field, so the entry reaches the cap regardless of which candidate is picked first. Measured with the mutation applied — five 60000-char array fields (worst case for first-candidate) still settle under a 102400 MAX_ENTRY_BYTES; picking the largest converges in fewer passes, which no assertion observes. If the loop ever regains a fixed pass bound, re-run this mutation.",
       "file": "src/response-store.js",
       "anchor": "if (!biggest || slot.len > biggest.len) biggest = slot;",
       "replacement": "if (!biggest) biggest = slot;",
@@ -69,7 +69,7 @@
     {
       "name": "D2 the copy-on-write write becomes an in-place one — the caller's own request messages get rewritten",
       "file": "src/response-store.js",
-      "anchor": "  const copy = Array.isArray(node) ? [...node] : { ...node };\n  copy[key] = rest.length ? withStringAt(node[key], rest, value) : value;\n  return copy;",
+      "anchor": "  const copy = Array.isArray(node) ? [...node] : { ...node };\n  Object.defineProperty(copy, key, {\n    value: rest.length ? withStringAt(node[key], rest, value) : value,\n    enumerable: true,\n    configurable: true,\n    writable: true,\n  });\n  return copy;",
       "replacement": "  node[key] = rest.length ? withStringAt(node[key], rest, value) : value;\n  return node;"
     },
     {

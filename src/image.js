@@ -9,10 +9,13 @@ import { decodePng } from './vendor/png.js';
 import jpegDecode from './vendor/jpeg-js/decoder.js';
 import jpegEncode from './vendor/jpeg-js/encoder.js';
 
-const MAX_SIZE = 5 * 1024 * 1024; // 5 MB
-const MAX_BASE64_LEN = Math.ceil(MAX_SIZE * 4 / 3) + 100;
+// Exported because the connect route (devin-connect.js:inlineRemoteImages) reuses
+// fetchImageUrl and re-checks its result: one SSRF/size/content-type policy for
+// both routes instead of a second copy that can drift.
+export const MAX_SIZE = 5 * 1024 * 1024; // 5 MB
+export const MAX_BASE64_LEN = Math.ceil(MAX_SIZE * 4 / 3) + 100;
 const MAX_REDIRECTS = 3;
-const MIME_OK = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+export const MIME_OK = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
 // ---------------------------------------------------------------------------
 // Inbound image inspection (pure-Node header parsing — NO pixel decode)
@@ -472,13 +475,37 @@ function safeLookup(hostname, options, callback) {
   });
 }
 
-function validateImageUrl(url) {
+// Plaintext http image bytes are a MITM surface: any middlebox between us and the
+// image host can replace what is later inlined into the model's context (#10 /
+// Cascade image blocks). https is the default. This escape hatch re-allows
+// plaintext http for PUBLIC hosts only — private/loopback targets are rejected
+// by the SSRF check below regardless of the switch — and is read live (exactly
+// `1`, like net-safety's trustedProxyHops) so an operator or a test can flip it.
+function allowPlaintextImageUrls(env = process.env) {
+  return env.WINDSURFAPI_ALLOW_HTTP_IMAGES === '1';
+}
+
+/** Host only — never log a full URL, which may carry a signed query string. */
+function imageUrlHost(url) {
+  try { return new URL(url).host || '(unparseable)'; } catch { return '(unparseable)'; }
+}
+
+function validateImageUrl(url, env = process.env) {
   let parsed;
   try { parsed = new URL(url); } catch { throw new Error('Invalid image URL'); }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')
     throw new Error('Image URL must be http or https');
+  // Private/internal is checked BEFORE the plaintext gate on purpose: an http URL
+  // aimed at an internal address is refused as SSRF first, and no escape hatch can
+  // make that address reachable.
   if (String(parsed.hostname).toLowerCase() === 'localhost' || isPrivateIp(parsed.hostname))
     throw new Error('Image URL targets a private/internal address');
+  // fetchImageHop calls this on EVERY hop, so an https -> http redirect is caught
+  // by the same check as a direct http URL.
+  if (parsed.protocol === 'http:' && !allowPlaintextImageUrls(env)) {
+    log.warn(`Image URL rejected: plaintext http (${imageUrlHost(url)}) — set WINDSURFAPI_ALLOW_HTTP_IMAGES=1 to allow it`);
+    throw new Error('Image URL must use https (plaintext http is rejected; set WINDSURFAPI_ALLOW_HTTP_IMAGES=1 to allow it)');
+  }
   return parsed;
 }
 
@@ -723,7 +750,12 @@ export async function extractImages(contentBlocks) {
           }
           const parsed = parseDataUrl(url);
           if (parsed) await pushImage(images, parsed);
-        } else if (url.startsWith('https://') || url.startsWith('http://')) {
+        } else if (/^https?:\/\//i.test(url)) {
+          // Schemes are case-insensitive (RFC 3986 §3.1) and `new URL()` normalizes
+          // them, so a case-sensitive prefix test only SKIPPED the block: uppercase
+          // HTTPS never fetched, uppercase HTTP never reached the https-only gate —
+          // both vanished silently. The plaintext rejection still comes from
+          // validateImageUrl, unchanged.
           await pushImage(images, await fetchImageUrl(url));
         }
       } catch (e) { log.warn(`Image fetch failed: ${e.message}`); }

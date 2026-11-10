@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { selectBackend, usesCascadeFlow, BACKEND } from '../src/backend-router.js';
+import { MODELS } from '../src/models.js';
 
 // Behaviour-preserving decision table. These cases mirror the inline routing
 // logic in handlers/chat.js (isSpecialAgentModelInfo → special-agent, then
@@ -74,6 +75,60 @@ describe('backend-router selectBackend — behaviour parity with legacy', () => 
     assert.equal(withUid.flow, 'cascade');
     assert.equal(withUid.reason, 'modelUid');
     assert.notEqual(withUid.reason, 'devin_local_only');
+  });
+
+  it('every catalogued gpt-6 SKU → Devin Local when the CLI is enabled (DEVIN_CONNECT=0)', () => {
+    const keys = Object.keys(MODELS).filter((k) => k.startsWith('gpt-6'));
+    assert.ok(keys.length >= 20, `expected the gpt-6 family in MODELS, found ${keys.length}`);
+    for (const key of keys) {
+      const sel = selectBackend({
+        modelInfo: MODELS[key],
+        env: { DEVIN_CONNECT: '0', DEVIN_CLI_ENABLED: '1', DEVIN_CLI_MODE: 'acp' },
+      });
+      assert.equal(sel.backend, BACKEND.DEVIN_ACP, key);
+      assert.equal(sel.flow, 'special_agent', key);
+      assert.equal(sel.reason, 'devin_local_only', key);
+    }
+  });
+
+  it('gpt-6-luna-max → print when the CLI is on but mode is not acp', () => {
+    const sel = selectBackend({
+      modelInfo: MODELS['gpt-6-luna-max'],
+      env: { DEVIN_CONNECT: '0', DEVIN_CLI_ENABLED: '1' },
+    });
+    assert.equal(sel.backend, BACKEND.DEVIN_PRINT);
+    assert.equal(sel.reason, 'devin_local_only');
+  });
+
+  it('gpt-6-luna-max → devin-connect when DEVIN_CONNECT=1 (connect wins)', () => {
+    const sel = selectBackend({
+      modelInfo: MODELS['gpt-6-luna-max'],
+      env: { DEVIN_CONNECT: '1', DEVIN_CLI_ENABLED: '1', DEVIN_CLI_MODE: 'acp' },
+    });
+    assert.equal(sel.backend, BACKEND.DEVIN_CONNECT);
+    assert.equal(sel.flow, 'devin_connect');
+    assert.equal(sel.reason, 'devin_connect');
+  });
+
+  it('gpt-6 lookalikes are not hijacked into the local-only branch', () => {
+    const env = { DEVIN_CONNECT: '0', DEVIN_CLI_ENABLED: '1', DEVIN_CLI_MODE: 'acp' };
+    for (const name of ['gpt-6', 'gpt-60-luna', 'gpt-6-lunar', 'gpt-6.0-luna']) {
+      const sel = selectBackend({ modelInfo: { name, modelUid: name }, env });
+      assert.equal(sel.reason, 'modelUid', name);
+      assert.equal(sel.flow, 'cascade', name);
+    }
+  });
+
+  it('gpt-6-luna-max stays on cascade when no Devin backend is configured', () => {
+    // DEVIN_CONNECT=0 with the CLI off leaves no Devin transport, so the
+    // documented operator fix is to enable one (DEVIN_CONNECT=1 or
+    // DEVIN_CLI_ENABLED=1). Pinned so this fall-through stays deliberate.
+    const sel = selectBackend({
+      modelInfo: MODELS['gpt-6-luna-max'],
+      env: { DEVIN_CONNECT: '0' },
+    });
+    assert.equal(sel.flow, 'cascade');
+    assert.equal(sel.reason, 'modelUid');
   });
 
   it('swe-2 catalog entries use backend=special_agent (not the gpt-5.6 local-only branch)', () => {

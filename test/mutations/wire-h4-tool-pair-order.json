@@ -1,0 +1,57 @@
+{
+  "tests": [
+    "test/wire-h4-tool-pair-order.test.js"
+  ],
+  "expectBaselinePass": 8,
+  "mutations": [
+    {
+      "name": "H4-M1: native normalization stops repairing call/result order",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "    messages = orderToolResultsAfterCalls(messages);\n    messages = interleaveParallelToolMessages(messages);",
+      "replacement": "    messages = interleaveParallelToolMessages(messages);",
+      "expectCaught": true
+    },
+    {
+      "name": "H4-M2: order repair defers nothing",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "      if (id && at !== undefined && at > i && !emittedCalls.has(id)) {",
+      "replacement": "      if (false && id && at !== undefined && at > i && !emittedCalls.has(id)) {",
+      "expectCaught": true
+    },
+    {
+      "name": "H4-M3: a deferred result is dropped instead of moved",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "        const waiting = deferred.get(id);\n        if (waiting) waiting.push(m);\n        else deferred.set(id, [m]);\n        moved += 1;\n        continue;",
+      "replacement": "        moved += 1;\n        continue;",
+      "expectCaught": true
+    },
+    {
+      "name": "H4-M4: only an immediately adjacent reversal is repaired",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "      if (id && at !== undefined && at > i && !emittedCalls.has(id)) {",
+      "replacement": "      if (id && at !== undefined && at === i + 1 && !emittedCalls.has(id)) {",
+      "expectCaught": true
+    },
+    {
+      "name": "H4-M5: the order repair runs on the text-emulation path too",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  if (options.nativeStructured === true) {\n    // A reversed pair (result before its call) must be repaired BEFORE the",
+      "replacement": "  messages = orderToolResultsAfterCalls(messages);\n  if (options.nativeStructured === true) {\n    // A reversed pair (result before its call) must be repaired BEFORE the",
+      "expectCaught": true
+    },
+    {
+      "name": "H4-M6: deferred results are left for the final flush",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "      for (const id of flushed) {\n        const waiting = deferred.get(id);\n        if (!waiting) continue;\n        deferred.delete(id);\n        for (const tm of waiting) out.push(tm);\n      }",
+      "replacement": "      for (const id of flushed) {\n        const waiting = deferred.get(id);\n        if (!waiting) continue;\n      }",
+      "expectCaught": true
+    },
+    {
+      "name": "H4-M7: the native no-tools branch skips the repair again (P2-1)",
+      "file": "src/handlers/chat.js",
+      "anchor": "      : nativeFlag\n        ? interleaveParallelToolMessages(orderToolResultsAfterCalls(messages))\n        : interleaveParallelToolMessages(messages);",
+      "replacement": "      : interleaveParallelToolMessages(messages);",
+      "expectCaught": true
+    }
+  ]
+}

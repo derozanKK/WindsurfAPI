@@ -1,0 +1,68 @@
+{
+  "tests": [
+    "test/parallel-tool-calls-connect.test.js"
+  ],
+  "expectBaselinePass": 12,
+  "mutations": [
+    {
+      "name": "REGRESSION: the 400 comes back for parallel_tool_calls:false — the exact P1 that made Codex CLI 0.164 unusable on its first turn (evidence/ClientSandboxes.md §3.3 C1)",
+      "file": "src/handlers/chat.js",
+      "anchor": "    if (isParallelToolCallsHintIgnored(body.parallel_tool_calls, process.env)) {\n      bumpConnect('parallel_tool_calls_hint_ignored');",
+      "replacement": "    if (isParallelToolCallsHintIgnored(body.parallel_tool_calls, process.env)) {\n      return { status: 400, body: { error: { message: 'cannot honour parallel_tool_calls:false', type: 'invalid_request_error', param: 'parallel_tool_calls', code: 'unsupported_parameter' } } };\n      bumpConnect('parallel_tool_calls_hint_ignored');"
+    },
+    {
+      "name": "the drop goes silent again: the predicate never fires, so a Codex turn is served with no counter and no warn — indistinguishable from an honoured hint",
+      "file": "src/devin-connect.js",
+      "anchor": "  return parallelToolCalls === false && !isToolChoicePassthroughEnabled(env);",
+      "replacement": "  return false;"
+    },
+    {
+      "name": "the predicate ignores the passthrough switch — an operator who set DEVIN_CONNECT_TOOL_CHOICE=1 gets the hint honoured AND counted/warned as dropped, so the counter can no longer tell an ignored hint from an honoured one",
+      "file": "src/devin-connect.js",
+      "anchor": "  return parallelToolCalls === false && !isToolChoicePassthroughEnabled(env);",
+      "replacement": "  return parallelToolCalls === false;"
+    },
+    {
+      "name": "the counter is dropped — the only rate signal for an ignored hint is gone; the once-per-process warn then hides every occurrence after the first",
+      "file": "src/handlers/chat.js",
+      "anchor": "      bumpConnect('parallel_tool_calls_hint_ignored');\n",
+      "replacement": ""
+    },
+    {
+      "name": "the warn fires on every request instead of once per process — every Codex turn logs a warning for a preference the proxy deliberately accepts, which is exactly the cry-wolf noise that makes real warnings invisible",
+      "file": "src/handlers/chat.js",
+      "anchor": "      if (!_parallelHintWarned) {",
+      "replacement": "      if (true) {"
+    },
+    {
+      "name": "the warn stops naming the event and the switch — the line becomes ungreppable and no longer says how to make the hint honourable",
+      "file": "src/handlers/chat.js",
+      "anchor": "        log.warn(`Chat[${reqId}]: DEVIN_CONNECT event=parallel_tool_calls_hint_ignored — caller asked for parallel_tool_calls:false and the #11 passthrough is off (DEVIN_CONNECT_TOOL_CHOICE is not \"1\"; tag unconfirmed), so the request is served without the hint and the upstream may return several calls per turn. Counted per request; logged once per process.`);",
+      "replacement": "        log.warn(`Chat[${reqId}]: DEVIN_CONNECT hint dropped`);"
+    },
+    {
+      "name": "streamChat stops forwarding the opt-in fields — the switch is inert on the live route again (DEVIN_CONNECT_TOOL_CHOICE=1 produces no #11)",
+      "file": "src/devin-connect.js",
+      "anchor": "continuityTrail, toolChoice, parallelToolCalls });",
+      "replacement": "continuityTrail, toolChoice });"
+    },
+    {
+      "name": "the handler stops threading parallel_tool_calls into connectParams — the parameter is accepted, counted, and dropped one layer below where the switch could honour it",
+      "file": "src/handlers/chat.js",
+      "anchor": "      parallelToolCalls: body.parallel_tool_calls,\n      toolChoice: tool_choice,",
+      "replacement": "      parallelToolCalls: undefined,\n      toolChoice: tool_choice,"
+    },
+    {
+      "name": "the handler stops threading tool_choice — the other field behind the same switch stays inert",
+      "file": "src/handlers/chat.js",
+      "anchor": "      parallelToolCalls: body.parallel_tool_calls,\n      toolChoice: tool_choice,",
+      "replacement": "      parallelToolCalls: body.parallel_tool_calls,\n      toolChoice: undefined,"
+    },
+    {
+      "name": "the /v1/messages F2 mapping is dropped — an Anthropic caller's tool_choice.disable_parallel_tool_use never becomes the OpenAI-shaped field, so it is neither honoured nor counted",
+      "file": "src/handlers/messages.js",
+      "anchor": "      ? { parallel_tool_calls: false }",
+      "replacement": "      ? {}"
+    }
+  ]
+}

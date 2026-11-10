@@ -210,6 +210,10 @@ describe('byte eviction is tenant-fair (found by adversarial review of the first
     assert.equal(ok, true);
     assert.equal(store.getResponse('mine', 'api:t7:user:1').ok, true,
       'a write that returns true must be readable — otherwise the caller holds an id that 404s');
+    const st = store.getResponseStoreStats();
+    assert.ok(st.bytes <= st.maxBytes,
+      `the no-own-victim path must fall back to another victim, not exit over budget (${st.bytes} vs ${st.maxBytes})`);
+    assert.ok(st.evictions > 0, 'and it must actually have evicted someone');
   });
 
   it('the budget still holds with HUNDREDS of tenants (the fair share has a floor)', () => {
@@ -348,7 +352,7 @@ describe('byte accounting covers every string, not just .text', () => {
 
   it('never UNDERcounts non-Latin1 text (V8 stores it 2 bytes/char)', () => {
     store.resetResponseStore();
-    store.putResponse('cjk', [{ role: 'user', content: '中'.repeat(100000) }], 'api:cjk:user:1');
+    store.putResponse('cjkxx', [{ role: 'user', content: '中'.repeat(100000) }], 'api:cjkxx:user:1');
     const cjk = store.getResponseStoreStats().bytes;
     store.resetResponseStore();
     store.putResponse('ascii', [{ role: 'user', content: 'a'.repeat(100000) }], 'api:ascii:user:1');

@@ -695,7 +695,11 @@ export function checkin(fingerprint, entry, callerKey = '', ttlHintMs) {
       callerKey: callerKey || entry.callerKey || '',
       modelKey: entry.modelKey || '',
       stepOffset: Number.isFinite(entry.stepOffset) ? entry.stepOffset : 0,
-      generatorOffset: Number.isFinite(entry.generatorOffset) ? entry.generatorOffset : 0,
+      // D5/F6: null means "unknown window start", not record 0. Coercing it to 0
+      // made the next resume ask the metadata RPC for the whole cascade and
+      // report every earlier turn's tokens as that turn's usage. Keeping null
+      // makes the client re-derive the count (or abstain from aggregate usage).
+      generatorOffset: Number.isFinite(entry.generatorOffset) ? entry.generatorOffset : null,
       historyCoverage: entry.historyCoverage || null,
       createdAt: entry.createdAt || now,
       lastAccess: now,

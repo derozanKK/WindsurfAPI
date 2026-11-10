@@ -3,8 +3,11 @@
 Per-version release notes for WindsurfAPI. Filenames follow the pattern
 `RELEASE_NOTES_<major>.<minor>.<patch>.md` and are picked up automatically
 by `.github/workflows/release.yml` when a `v*` tag is pushed — the file
-becomes the GitHub Release body. Historical exception: v3.9.22 shipped as
-`RELEASE_NOTES_v3.9.22.md` (a `v` prefix). Do not repeat that spelling.
+becomes the GitHub Release body. Historical exception: v3.9.22's notes sit in
+`RELEASE_NOTES_v3.9.22.md` (a `v` prefix). Do not repeat that spelling — the
+workflow looks only for the exact unprefixed names (`release.yml:329-330`), so a
+`v`-prefixed file is silently ignored and the release falls back to GitHub's
+generated notes (`release.yml:378-379`).
 
 The latest version's notes are also surfaced on the project homepage and
 in the dashboard "About" panel.
@@ -50,6 +53,11 @@ while it runs.
 **4. Bump the version in BOTH files.** `package.json` once, `package-lock.json`
 **twice** (top level and `packages.""`). `src/version.js` reads from `package.json`,
 so that is the single source — do not hardcode a version anywhere else.
+
+The live handoff's §0 (the `HANDOFF-*.md` the index's first row links) carries the version
+twice as well: `产品 tag` and `package.json`. Update both in the release commit.
+`test/docs-consistency-guard.test.js` compares them against the packaged version and the
+newest reachable tag; before the tag exists, the tag line may still name the previous release.
 
 **5. Write `RELEASE_NOTES_<new-version>.md`** in this folder. House style below.
 
@@ -97,6 +105,29 @@ identically to the previous tag, the release asks users to download nothing.
 
 The release workflow builds the GHCR image and publishes the GitHub Release. The body
 comes from the matching file in this folder.
+
+### Release assets and verification
+
+The release job attaches four assets plus `SHA256SUMS`, and — from v3.10.0 —
+cosign keyless signature bundles for each of the five signed blobs
+(`<name>.sigstore.json` — signature, Fulcio certificate and Rekor proof in one
+file; since v3.10.0 this is the only signature artifact attached). The manifest uses the **flat asset names**
+(`windsurfapi.exe`, `windsurfapi-windows.zip`, `windsurfapi-macos-arm64`,
+`windsurfapi-macos.zip`), so `sha256sum -c SHA256SUMS` works in the directory
+where the files were downloaded. Do not change it back to build-tree paths
+(`dist-windows/...`): v3.9.53, the first release with a manifest, shipped that
+shape, and it made the documented command fail for three of the four files.
+`test/release-workflow.test.js` pins the flat form; `test/release-signing.test.js`
+pins the signed file list and the upload globs.
+
+Releases from v3.10.0 are signed with cosign keyless (GitHub OIDC; no repository
+key or signing secret). Verify `SHA256SUMS.sigstore.json` first, then the hashes,
+or run `node scripts/verify-release-assets.mjs <download-dir>`. A signing failure
+fails the release job: never publish assets whose notes claim signatures but
+which carry no `.sigstore.json`. The git and Docker OTA paths still verify
+tags/ancestry and health, not these signatures, because they do not download
+release assets. The trust boundary and the exact commands are in
+[RELEASE-SIGNING.md](../RELEASE-SIGNING.md).
 
 ## House style for the notes themselves
 

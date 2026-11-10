@@ -82,7 +82,7 @@ describe('v2.0.29 model catalog correctness', () => {
   it('supports adaptive as explicit model for dynamic routing', () => {
     assert.equal(resolveModel('adaptive'), 'adaptive');
     assert.equal(getModelInfo('adaptive')?.enumValue, 0);
-    assert.equal(getModelInfo('adaptive')?.credit, 1);
+    assert.equal(getModelInfo('adaptive')?.credit, 1.5);
   });
 
   // GPT-5.5 + Opus 4.7 max showed up in the live GetCascadeModelConfigs response

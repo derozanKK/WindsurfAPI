@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http2 from 'http2';
+import { terminateRpcWithStatus, isConnectContentType } from './helpers/fake-grpc-trailers.mjs';
 import { endOfStreamEnvelope, unwrapRequest, wrapEnvelope } from '../src/connect.js';
 import { getField, parseFields, writeMessageField, writeStringField, writeVarintField } from '../src/proto.js';
 
@@ -36,7 +37,7 @@ function extractGrpcFrames(buf) {
 
 function responseBody(payload, headers) {
   const contentType = String(headers['content-type'] || '');
-  if (contentType.includes('application/connect+proto')) {
+  if (isConnectContentType(contentType)) {
     return Buffer.concat([wrapEnvelope(payload, { compress: false }), endOfStreamEnvelope()]);
   }
   return grpcFrame(payload);
@@ -44,7 +45,7 @@ function responseBody(payload, headers) {
 
 function errorBody(message, headers) {
   const contentType = String(headers['content-type'] || '');
-  if (contentType.includes('application/connect+proto')) {
+  if (isConnectContentType(contentType)) {
     const body = Buffer.from(JSON.stringify({ error: { message } }));
     const frame = Buffer.alloc(5 + body.length);
     frame[0] = 0x02;
@@ -57,7 +58,7 @@ function errorBody(message, headers) {
 
 function requestPayload(body, headers) {
   const contentType = String(headers['content-type'] || '');
-  if (contentType.includes('application/connect+proto')) {
+  if (isConnectContentType(contentType)) {
     return unwrapRequest(body, headers);
   }
   const frames = extractGrpcFrames(body);
@@ -195,7 +196,7 @@ async function withFakeLanguageServer(handler, fn) {
     sessions.add(session);
     session.on('close', () => sessions.delete(session));
   });
-  server.on('stream', handler);
+  server.on('stream', (stream, headers) => { terminateRpcWithStatus(stream); handler(stream, headers); });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   try {
@@ -871,6 +872,7 @@ describe('WindsurfClient cascade panel retry', () => {
         stream.on('data', chunk => chunks.push(chunk));
         stream.on('end', () => {
           const method = String(headers[':path'] || '').split('/').pop();
+          const payload = requestPayload(Buffer.concat(chunks), headers);
           if (method === 'StartCascade') {
             stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
             stream.end(responseBody(startCascadeResponse('webfetch-completed-cascade'), headers));
@@ -882,8 +884,11 @@ describe('WindsurfClient cascade panel retry', () => {
             return;
           }
           if (method === 'GetCascadeTrajectorySteps') {
+            // Return the two steps once; the client advances step_offset, so a
+            // second batch must be empty or the planner text is replayed.
+            const stepOffset = readStepOffset(payload);
             stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/grpc' });
-            stream.end(responseBody(Buffer.concat([
+            stream.end(responseBody(stepOffset ? Buffer.alloc(0) : Buffer.concat([
               readUrlContentDoneWithEchoStepResponse(),
               trajectoryStepsResponse('Natural answer using Example Domain.'),
             ]), headers));

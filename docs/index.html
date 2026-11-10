@@ -503,7 +503,7 @@ footer{border-top:1px solid var(--rule);padding:3rem 0 2.5rem;margin-top:2rem}
 <section class="hero">
   <div class="container">
     <div class="hero-inner reveal">
-      <div class="hero-badge">v3.9.37 — Devin 云端直连 · 零二进位 · 四协议</div>
+      <div class="hero-badge">v3.141.592658 — Devin 云端直连 · 零二进位 · 四协议</div>
       <h1>
         把 <em>Devin</em> 雲端的 AI 模型<br>
         變成你熟悉的 <span class="hl">API</span>。
@@ -527,7 +527,7 @@ footer{border-top:1px solid var(--rule);padding:3rem 0 2.5rem;margin-top:2rem}
       </div>
       <div class="hero-meta">
         <span>零 npm 依賴</span>
-        <span>Node.js &ge; 20</span>
+        <span>Node.js &ge; 22.13</span>
         <span>MIT License</span>
         <span>Docker 就緒</span>
       </div>
@@ -641,22 +641,24 @@ footer{border-top:1px solid var(--rule);padding:3rem 0 2.5rem;margin-top:2rem}
   <div class="container">
     <div class="reveal">
       <div class="kicker">模型 · Models</div>
-      <h2 class="section-title">一個端點，<em>162 個模型</em>。</h2>
-      <p class="section-sub">橫跨 9 家供應商的 <b>162</b> 個現役模型，一致計費、即時切換，不必為每家重接一次 API。最新上線 <b>Claude Opus 4.8</b>（low→max 與 fast 全通道）、<b>GPT-5.5 全系</b>、<b>Gemini 3.1 Pro</b>與 <b>SWE-2</b>；另有思考型變體。清單由 <code>src/models.js</code> 權威生成、後端雲端目錄自動發現。頁面載入後數字跟陣列走。</p>
+      <h2 class="section-title">一個端點，<em>283 個模型</em>。</h2>
+      <p class="section-sub">橫跨 11 家供應商的 <b>283</b> 個現役模型，一致計費、即時切換，不必為每家重接一次 API。最新入列 <b>Claude Opus 5.5 / Fable 5.1</b>、<b>GPT-6 全系</b>（sol / luna / astra）、<b>Gemini 4 Argon</b>與 <b>DeepSeek V4.1</b>；另有思考型變體。清單由 <code>src/models.js</code> 權威生成、後端雲端目錄自動發現。頁面載入後數字跟陣列走。</p>
     </div>
 
     <div class="ms-model-filters reveal" role="group" aria-label="依供應商篩選模型" id="model-filters">
-      <button type="button" class="ms-model-filter is-active" data-filter="all" aria-pressed="true">全部 <span class="ms-count" id="count-all">162</span></button>
-      <button type="button" class="ms-model-filter" data-filter="anthropic" aria-pressed="false">Claude <span class="ms-count" id="count-anthropic">55</span></button>
-      <button type="button" class="ms-model-filter" data-filter="openai" aria-pressed="false">GPT <span class="ms-count" id="count-openai">72</span></button>
-      <button type="button" class="ms-model-filter" data-filter="google" aria-pressed="false">Gemini <span class="ms-count" id="count-google">9</span></button>
-      <button type="button" class="ms-model-filter" data-filter="xai" aria-pressed="false">Grok <span class="ms-count" id="count-xai">3</span></button>
-      <button type="button" class="ms-model-filter" data-filter="moonshot" aria-pressed="false">Kimi <span class="ms-count" id="count-moonshot">5</span></button>
-      <button type="button" class="ms-model-filter" data-filter="zhipu" aria-pressed="false">GLM <span class="ms-count" id="count-zhipu">5</span></button>
+      <button type="button" class="ms-model-filter is-active" data-filter="all" aria-pressed="true">全部 <span class="ms-count" id="count-all">283</span></button>
+      <button type="button" class="ms-model-filter" data-filter="anthropic" aria-pressed="false">Claude <span class="ms-count" id="count-anthropic">77</span></button>
+      <button type="button" class="ms-model-filter" data-filter="openai" aria-pressed="false">GPT <span class="ms-count" id="count-openai">107</span></button>
+      <button type="button" class="ms-model-filter" data-filter="google" aria-pressed="false">Gemini <span class="ms-count" id="count-google">26</span></button>
+      <button type="button" class="ms-model-filter" data-filter="deepseek" aria-pressed="false">DeepSeek <span class="ms-count" id="count-deepseek">9</span></button>
+      <button type="button" class="ms-model-filter" data-filter="moonshot" aria-pressed="false">Kimi <span class="ms-count" id="count-moonshot">8</span></button>
+      <button type="button" class="ms-model-filter" data-filter="zhipu" aria-pressed="false">GLM <span class="ms-count" id="count-zhipu">16</span></button>
+      <button type="button" class="ms-model-filter" data-filter="xai" aria-pressed="false">Grok <span class="ms-count" id="count-xai">14</span></button>
       <button type="button" class="ms-model-filter" data-filter="minimax" aria-pressed="false">MiniMax <span class="ms-count" id="count-minimax">1</span></button>
-      <button type="button" class="ms-model-filter" data-filter="astraflow" aria-pressed="false">Astraflow <span class="ms-count" id="count-astraflow">9</span></button>
-      <button type="button" class="ms-model-filter" data-filter="windsurf" aria-pressed="false">SWE <span class="ms-count" id="count-windsurf">11</span></button>
-      <button type="button" class="ms-model-filter" data-filter="thinking" aria-pressed="false">思考型 <span class="ms-count" id="count-thinking">14</span></button>
+      <button type="button" class="ms-model-filter" data-filter="thinking_machines" aria-pressed="false">Inkling <span class="ms-count" id="count-thinking_machines">6</span></button>
+      <button type="button" class="ms-model-filter" data-filter="nvidia" aria-pressed="false">Nemotron <span class="ms-count" id="count-nvidia">3</span></button>
+      <button type="button" class="ms-model-filter" data-filter="windsurf" aria-pressed="false">SWE <span class="ms-count" id="count-windsurf">16</span></button>
+      <button type="button" class="ms-model-filter" data-filter="thinking" aria-pressed="false">思考型 <span class="ms-count" id="count-thinking">15</span></button>
       <button type="button" class="ms-model-filter" data-filter="free" aria-pressed="false">免費 <span class="ms-count" id="count-free">4</span></button>
     </div>
 
@@ -856,9 +858,9 @@ footer{border-top:1px solid var(--rule);padding:3rem 0 2.5rem;margin-top:2rem}
       <div class="deploy-content active" id="tab-manual">
         <div class="deploy-steps">
           <div class="step"><div class="step-num"></div><div class="step-body">
-            <h3>安裝 Node.js 20+</h3>
+            <h3>安裝 Node.js 24（最低 22.13）</h3>
             <div class="code-box"><div class="code-box-head"><span class="lang">bash</span><button class="copy-btn" data-copy>複製</button></div>
-<pre><span class="c-prompt">$</span> <span class="c-cmd">curl</span> -fsSL https://deb.nodesource.com/setup_20.x | bash -
+<pre><span class="c-prompt">$</span> <span class="c-cmd">curl</span> -fsSL https://deb.nodesource.com/setup_24.x | bash -
 <span class="c-prompt">$</span> <span class="c-cmd">apt install</span> -y nodejs</pre>
             </div>
           </div></div>
@@ -1123,14 +1125,16 @@ client = OpenAI(
     {k:'claude-sonnet-4.6-thinking-1m',p:'anthropic',c:16,thinking:1},
     {k:'claude-opus-4.6',p:'anthropic',c:6},
     {k:'claude-opus-4.6-thinking',p:'anthropic',c:8,thinking:1},
-    {k:'claude-opus-4-7-medium',p:'anthropic',c:8},
-    {k:'claude-opus-4-7-low',p:'anthropic',c:6},
-    {k:'claude-opus-4-7-high',p:'anthropic',c:10},
-    {k:'claude-opus-4-7-xhigh',p:'anthropic',c:12},
+    {k:'claude-opus-4-6-1m',p:'anthropic',c:10},
+    {k:'claude-opus-4-6-thinking-1m',p:'anthropic',c:12,thinking:1},
+    {k:'claude-opus-4-7-medium',p:'anthropic',c:40},
+    {k:'claude-opus-4-7-low',p:'anthropic',c:20},
+    {k:'claude-opus-4-7-high',p:'anthropic',c:60},
+    {k:'claude-opus-4-7-xhigh',p:'anthropic',c:65},
     {k:'claude-opus-4-7-medium-thinking',p:'anthropic',c:10,thinking:1},
     {k:'claude-opus-4-7-high-thinking',p:'anthropic',c:12,thinking:1},
     {k:'claude-opus-4-7-xhigh-thinking',p:'anthropic',c:16,thinking:1},
-    {k:'claude-opus-4-7-max',p:'anthropic',c:16},
+    {k:'claude-opus-4-7-max',p:'anthropic',c:75},
     {k:'claude-opus-4-8-low',p:'anthropic',c:20},
     {k:'claude-opus-4-8-medium',p:'anthropic',c:25},
     {k:'claude-opus-4-8-high',p:'anthropic',c:35},
@@ -1141,6 +1145,26 @@ client = OpenAI(
     {k:'claude-opus-4-8-high-fast',p:'anthropic',c:70},
     {k:'claude-opus-4-8-xhigh-fast',p:'anthropic',c:80},
     {k:'claude-opus-4-8-max-fast',p:'anthropic',c:100},
+    {k:'claude-fable-5-1-low',p:'anthropic',c:150},
+    {k:'claude-fable-5-1-medium',p:'anthropic',c:175},
+    {k:'claude-fable-5-1-high',p:'anthropic',c:200},
+    {k:'claude-fable-5-1-xhigh',p:'anthropic',c:225},
+    {k:'claude-fable-5-1-max',p:'anthropic',c:250},
+    {k:'claude-opus-5-5-low',p:'anthropic',c:35},
+    {k:'claude-opus-5-5-medium',p:'anthropic',c:45},
+    {k:'claude-opus-5-5-high',p:'anthropic',c:65},
+    {k:'claude-opus-5-5-xhigh',p:'anthropic',c:125},
+    {k:'claude-opus-5-5-max',p:'anthropic',c:150},
+    {k:'claude-sonnet-5-5-low',p:'anthropic',c:12},
+    {k:'claude-sonnet-5-5-medium',p:'anthropic',c:15},
+    {k:'claude-sonnet-5-5-high',p:'anthropic',c:20},
+    {k:'claude-sonnet-5-5-xhigh',p:'anthropic',c:30},
+    {k:'claude-sonnet-5-5-max',p:'anthropic',c:40},
+    {k:'claude-haiku-5-5-low',p:'anthropic',c:3},
+    {k:'claude-haiku-5-5-medium',p:'anthropic',c:4},
+    {k:'claude-haiku-5-5-high',p:'anthropic',c:5},
+    {k:'claude-haiku-5-5-xhigh',p:'anthropic',c:8},
+    {k:'claude-haiku-5-5-max',p:'anthropic',c:10},
     {k:'claude-5-fable-low',p:'anthropic',c:40},
     {k:'claude-5-fable-medium',p:'anthropic',c:50},
     {k:'claude-5-fable-high',p:'anthropic',c:70},
@@ -1151,16 +1175,16 @@ client = OpenAI(
     {k:'claude-sonnet-5-high',p:'anthropic',c:20},
     {k:'claude-sonnet-5-xhigh',p:'anthropic',c:30},
     {k:'claude-sonnet-5-max',p:'anthropic',c:40},
-    {k:'claude-opus-5-low',p:'anthropic',c:20},
-    {k:'claude-opus-5-medium',p:'anthropic',c:25},
-    {k:'claude-opus-5-high',p:'anthropic',c:35},
-    {k:'claude-opus-5-xhigh',p:'anthropic',c:40},
-    {k:'claude-opus-5-max',p:'anthropic',c:50},
-    {k:'claude-opus-5-low-fast',p:'anthropic',c:40},
-    {k:'claude-opus-5-medium-fast',p:'anthropic',c:50},
-    {k:'claude-opus-5-high-fast',p:'anthropic',c:70},
-    {k:'claude-opus-5-xhigh-fast',p:'anthropic',c:80},
-    {k:'claude-opus-5-max-fast',p:'anthropic',c:100},
+    {k:'claude-opus-5-low',p:'anthropic',c:75},
+    {k:'claude-opus-5-medium',p:'anthropic',c:80},
+    {k:'claude-opus-5-high',p:'anthropic',c:115},
+    {k:'claude-opus-5-xhigh',p:'anthropic',c:155},
+    {k:'claude-opus-5-max',p:'anthropic',c:160},
+    {k:'claude-opus-5-low-fast',p:'anthropic',c:150},
+    {k:'claude-opus-5-medium-fast',p:'anthropic',c:160},
+    {k:'claude-opus-5-high-fast',p:'anthropic',c:230},
+    {k:'claude-opus-5-xhigh-fast',p:'anthropic',c:310},
+    {k:'claude-opus-5-max-fast',p:'anthropic',c:320},
     {k:'gpt-5',p:'openai',c:0.5},
     {k:'gpt-5-medium',p:'openai',c:1},
     {k:'gpt-5-high',p:'openai',c:2},
@@ -1198,41 +1222,76 @@ client = OpenAI(
     {k:'gpt-5.2-codex-medium-fast',p:'openai',c:2},
     {k:'gpt-5.2-codex-high-fast',p:'openai',c:4},
     {k:'gpt-5.2-codex-xhigh-fast',p:'openai',c:6},
-    {k:'gpt-5.3-codex',p:'openai',c:1},
-    {k:'gpt-5.4-none',p:'openai',c:0.5},
-    {k:'gpt-5.4-low',p:'openai',c:1},
-    {k:'gpt-5.4-medium',p:'openai',c:2},
+    {k:'gpt-5.3-codex',p:'openai',c:2},
+    {k:'gpt-5.4-none',p:'openai',c:1.5},
+    {k:'gpt-5.4-low',p:'openai',c:1.5},
+    {k:'gpt-5.4-medium',p:'openai',c:3},
     {k:'gpt-5.4-high',p:'openai',c:4},
-    {k:'gpt-5.4-xhigh',p:'openai',c:8},
+    {k:'gpt-5.4-xhigh',p:'openai',c:12},
     {k:'gpt-5.4-mini-low',p:'openai',c:1.5},
     {k:'gpt-5.4-mini-medium',p:'openai',c:1.5},
     {k:'gpt-5.4-mini-high',p:'openai',c:4.5},
     {k:'gpt-5.4-mini-xhigh',p:'openai',c:12},
-    {k:'gpt-5.5',p:'openai',c:2},
-    {k:'gpt-5.5-none',p:'openai',c:1},
-    {k:'gpt-5.5-low',p:'openai',c:1},
-    {k:'gpt-5.5-medium',p:'openai',c:2},
-    {k:'gpt-5.5-high',p:'openai',c:4},
-    {k:'gpt-5.5-xhigh',p:'openai',c:8},
-    {k:'gpt-5.5-none-fast',p:'openai',c:2},
-    {k:'gpt-5.5-low-fast',p:'openai',c:2},
-    {k:'gpt-5.5-medium-fast',p:'openai',c:4},
-    {k:'gpt-5.5-high-fast',p:'openai',c:8},
-    {k:'gpt-5.5-xhigh-fast',p:'openai',c:16},
+    {k:'gpt-5.5',p:'openai',c:15},
+    {k:'gpt-5.5-none',p:'openai',c:9},
+    {k:'gpt-5.5-low',p:'openai',c:12},
+    {k:'gpt-5.5-medium',p:'openai',c:15},
+    {k:'gpt-5.5-high',p:'openai',c:24},
+    {k:'gpt-5.5-xhigh',p:'openai',c:36},
+    {k:'gpt-5.5-none-fast',p:'openai',c:22.5},
+    {k:'gpt-5.5-low-fast',p:'openai',c:30},
+    {k:'gpt-5.5-medium-fast',p:'openai',c:37.5},
+    {k:'gpt-5.5-high-fast',p:'openai',c:60},
+    {k:'gpt-5.5-xhigh-fast',p:'openai',c:90},
     {k:'gpt-5.6-luna',p:'openai',c:5},
     {k:'gpt-5.6-luna-none',p:'openai',c:3},
     {k:'gpt-5.6-luna-low',p:'openai',c:4},
     {k:'gpt-5.6-luna-medium',p:'openai',c:5},
     {k:'gpt-5.6-luna-high',p:'openai',c:6},
     {k:'gpt-5.6-luna-xhigh',p:'openai',c:8},
-    {k:'gpt-5.3-codex-low',p:'openai',c:0.5},
-    {k:'gpt-5.3-codex-high',p:'openai',c:2},
-    {k:'gpt-5.3-codex-xhigh',p:'openai',c:4},
-    {k:'gpt-5.3-codex-low-fast',p:'openai',c:1},
-    {k:'gpt-5.3-codex-medium-fast',p:'openai',c:2},
-    {k:'gpt-5.3-codex-high-fast',p:'openai',c:4},
+    {k:'gpt-5.3-codex-low',p:'openai',c:1.5},
+    {k:'gpt-5.3-codex-high',p:'openai',c:2.5},
+    {k:'gpt-5.3-codex-xhigh',p:'openai',c:3},
+    {k:'gpt-5.3-codex-low-fast',p:'openai',c:3},
+    {k:'gpt-5.3-codex-medium-fast',p:'openai',c:4},
+    {k:'gpt-5.3-codex-high-fast',p:'openai',c:5},
     {k:'gpt-5.3-codex-xhigh-fast',p:'openai',c:6},
     {k:'gpt-oss-120b',p:'openai',c:0.25},
+    {k:'gpt-5-6-luna-max',p:'openai',c:30},
+    {k:'gpt-5-6-sol-none',p:'openai',c:10},
+    {k:'gpt-5-6-sol-low',p:'openai',c:30},
+    {k:'gpt-5-6-sol-medium',p:'openai',c:50},
+    {k:'gpt-5-6-sol-high',p:'openai',c:90},
+    {k:'gpt-5-6-sol-xhigh',p:'openai',c:150},
+    {k:'gpt-5-6-sol-max',p:'openai',c:200},
+    {k:'gpt-5-6-terra-none',p:'openai',c:4},
+    {k:'gpt-5-6-terra-low',p:'openai',c:8},
+    {k:'gpt-5-6-terra-medium',p:'openai',c:10},
+    {k:'gpt-5-6-terra-high',p:'openai',c:20},
+    {k:'gpt-5-6-terra-xhigh',p:'openai',c:30},
+    {k:'gpt-5-6-terra-max',p:'openai',c:50},
+    {k:'gpt-6-1-sol-low',p:'openai',c:30},
+    {k:'gpt-6-1-sol-medium',p:'openai',c:40},
+    {k:'gpt-6-1-sol-high',p:'openai',c:50},
+    {k:'gpt-6-1-sol-xhigh',p:'openai',c:70},
+    {k:'gpt-6-1-sol-max',p:'openai',c:100},
+    {k:'gpt-6-astra-low',p:'openai',c:100},
+    {k:'gpt-6-astra-medium',p:'openai',c:200},
+    {k:'gpt-6-astra-high',p:'openai',c:400},
+    {k:'gpt-6-astra-xhigh',p:'openai',c:375},
+    {k:'gpt-6-astra-max',p:'openai',c:500},
+    {k:'gpt-6-luna-none',p:'openai',c:2},
+    {k:'gpt-6-luna-low',p:'openai',c:3},
+    {k:'gpt-6-luna-medium',p:'openai',c:4},
+    {k:'gpt-6-luna-high',p:'openai',c:5},
+    {k:'gpt-6-luna-xhigh',p:'openai',c:6},
+    {k:'gpt-6-luna-max',p:'openai',c:7},
+    {k:'gpt-6-sol-none',p:'openai',c:65},
+    {k:'gpt-6-sol-low',p:'openai',c:135},
+    {k:'gpt-6-sol-medium',p:'openai',c:145},
+    {k:'gpt-6-sol-high',p:'openai',c:150},
+    {k:'gpt-6-sol-xhigh',p:'openai',c:190},
+    {k:'gpt-6-sol-max',p:'openai',c:200},
     {k:'gemini-2.5-pro',p:'google',c:1},
     {k:'gemini-2.5-flash',p:'google',c:0.5,free:1},
     {k:'gemini-3.0-pro',p:'google',c:1},
@@ -1242,43 +1301,110 @@ client = OpenAI(
     {k:'gemini-3.0-flash-high',p:'google',c:1.75},
     {k:'gemini-3.1-pro-low',p:'google',c:1},
     {k:'gemini-3.1-pro-high',p:'google',c:2},
+    {k:'gemini-3-5-flash-minimal',p:'google',c:2},
+    {k:'gemini-3-5-flash-low',p:'google',c:4},
+    {k:'gemini-3-5-flash-medium',p:'google',c:8},
+    {k:'gemini-3-5-flash-high',p:'google',c:9},
+    {k:'gemini-3-6-flash-minimal',p:'google',c:2},
+    {k:'gemini-3-6-flash-low',p:'google',c:4},
+    {k:'gemini-3-6-flash-medium',p:'google',c:8},
+    {k:'gemini-3-6-flash-high',p:'google',c:9},
+    {k:'gemini-3-7-flash-low',p:'google',c:6},
+    {k:'gemini-3-7-flash-medium',p:'google',c:8},
+    {k:'gemini-3-7-flash-high',p:'google',c:10},
+    {k:'gemini-3-8-flash-low',p:'google',c:6},
+    {k:'gemini-3-8-flash-medium',p:'google',c:8},
+    {k:'gemini-3-8-flash-high',p:'google',c:10},
+    {k:'gemini-4-argon-low',p:'google',c:50},
+    {k:'gemini-4-argon-medium',p:'google',c:70},
+    {k:'gemini-4-argon-high',p:'google',c:90},
     {k:'deepseek-v4',p:'deepseek',c:0.5},
+    {k:'deepseek-v4-flash-low',p:'deepseek',c:0.25},
+    {k:'deepseek-v4-flash-high',p:'deepseek',c:0.5},
+    {k:'deepseek-v4-flash-max',p:'deepseek',c:1},
+    {k:'deepseek-v4-pro-low',p:'deepseek',c:3},
+    {k:'deepseek-v4-pro-high',p:'deepseek',c:3},
+    {k:'deepseek-v4-pro-max',p:'deepseek',c:3},
+    {k:'deepseek-v4-1-flash-high',p:'deepseek',c:2},
+    {k:'deepseek-v4-1-flash-max',p:'deepseek',c:3},
     {k:'grok-3',p:'xai',c:1},
     {k:'grok-3-mini-thinking',p:'xai',c:0.125,thinking:1},
     {k:'grok-code-fast-1',p:'xai',c:0.5},
+    {k:'grok-4-5-low',p:'xai',c:5},
+    {k:'grok-4-5-medium',p:'xai',c:8},
+    {k:'grok-4-5-high',p:'xai',c:10},
+    {k:'grok-4-6-low',p:'xai',c:10},
+    {k:'grok-4-6-medium',p:'xai',c:20},
+    {k:'grok-4-6-high',p:'xai',c:25},
+    {k:'grok-4-6-xhigh',p:'xai',c:30},
+    {k:'grok-4-7-low',p:'xai',c:15},
+    {k:'grok-4-7-medium',p:'xai',c:20},
+    {k:'grok-4-7-high',p:'xai',c:30},
+    {k:'grok-4-7-xhigh',p:'xai',c:55},
     {k:'kimi-k2',p:'moonshot',c:0.5},
     {k:'kimi-k2-thinking',p:'moonshot',c:1,thinking:1},
     {k:'kimi-k2.5',p:'moonshot',c:1},
     {k:'kimi-k2-6',p:'moonshot',c:1},
     {k:'kimi-k2-7',p:'moonshot',c:1},
+    {k:'kimi-k3-low',p:'moonshot',c:4},
+    {k:'kimi-k3-high',p:'moonshot',c:6},
+    {k:'kimi-k3-max',p:'moonshot',c:9},
     {k:'glm-4.7',p:'zhipu',c:0.25,free:1},
     {k:'glm-4.7-fast',p:'zhipu',c:0.5},
     {k:'glm-5',p:'zhipu',c:1.5},
     {k:'glm-5.1',p:'zhipu',c:1.5},
     {k:'glm-5.2',p:'zhipu',c:1.5},
+    {k:'glm-5-2-none',p:'zhipu',c:1},
+    {k:'glm-5-2-none-1m',p:'zhipu',c:2},
+    {k:'glm-5-2-1m',p:'zhipu',c:3},
+    {k:'glm-5-2-max',p:'zhipu',c:3},
+    {k:'glm-5-2-max-1m',p:'zhipu',c:6},
+    {k:'glm-5-3-flash-low',p:'zhipu',c:1},
+    {k:'glm-5-3-flash-high',p:'zhipu',c:1},
+    {k:'glm-5-3-flash-max',p:'zhipu',c:1},
+    {k:'glm-5-3-low',p:'zhipu',c:1},
+    {k:'glm-5-3-high',p:'zhipu',c:1},
+    {k:'glm-5-3-max',p:'zhipu',c:1},
     {k:'minimax-m2.5',p:'minimax',c:1},
+    {k:'inkling-none',p:'thinking_machines',c:2},
+    {k:'inkling-low',p:'thinking_machines',c:4},
+    {k:'inkling-medium',p:'thinking_machines',c:6},
+    {k:'inkling-high',p:'thinking_machines',c:8},
+    {k:'inkling-xhigh',p:'thinking_machines',c:10},
+    {k:'inkling-max',p:'thinking_machines',c:14},
+    {k:'nemotron-3-ultra-none',p:'nvidia',c:1},
+    {k:'nemotron-3-ultra-medium',p:'nvidia',c:1},
+    {k:'nemotron-3-ultra-high',p:'nvidia',c:1},
     {k:'swe-1.5',p:'windsurf',c:0.5},
     {k:'swe-1.5-fast',p:'windsurf',c:0.5,free:1},
     {k:'swe-1.5-thinking',p:'windsurf',c:0.75,thinking:1},
-    {k:'swe-1.6',p:'windsurf',c:0.5},
-    {k:'swe-1.6-fast',p:'windsurf',c:0.5},
-    {k:'swe-1-7',p:'windsurf',c:0.5},
-    {k:'swe-1-7-lightning',p:'windsurf',c:0.5},
+    {k:'swe-1.6',p:'windsurf',c:3},
+    {k:'swe-1.6-fast',p:'windsurf',c:3},
+    {k:'swe-1-7',p:'windsurf',c:9},
+    {k:'swe-1-7-lightning',p:'windsurf',c:18},
     {k:'swe-2',p:'windsurf',c:6},
     {k:'swe-2-medium',p:'windsurf',c:6},
     {k:'swe-2-high',p:'windsurf',c:9},
     {k:'swe-2-max',p:'windsurf',c:12},
+    {k:'swe-2-medium-lightning',p:'windsurf',c:12},
+    {k:'swe-2-high-lightning',p:'windsurf',c:18},
+    {k:'swe-2-max-lightning',p:'windsurf',c:24},
+    {k:'swe-1-7-lightning-medium',p:'windsurf',c:9},
+    {k:'swe-1-7-medium',p:'windsurf',c:3},
   ];
 
   const groups = document.getElementById('model-groups');
   if(!groups) return;
-  const PROVIDER_LABEL = {anthropic:'Claude', openai:'GPT', google:'Gemini', xai:'Grok', moonshot:'Kimi', zhipu:'GLM', minimax:'MiniMax', astraflow:'AstraFlow', windsurf:'Windsurf'};
+  const PROVIDER_LABEL = {anthropic:'Claude', openai:'GPT', google:'Gemini', xai:'Grok', moonshot:'Kimi', zhipu:'GLM', minimax:'MiniMax', deepseek:'DeepSeek', thinking_machines:'Inkling', nvidia:'Nemotron', astraflow:'AstraFlow', windsurf:'Windsurf'};
   // Brand accent per provider (dark-mode-safe: xai/moonshot lightened from pure black).
-  const PROVIDER_COLOR = {anthropic:'#CC785C', openai:'#10A37F', google:'#4285F4', xai:'#8A8F98', moonshot:'#7C6FF0', zhipu:'#3B82F6', minimax:'#FF6B35', astraflow:'#0EA5A5', windsurf:'#9A8FD8'};
+  const PROVIDER_COLOR = {anthropic:'#CC785C', openai:'#10A37F', google:'#4285F4', xai:'#8A8F98', moonshot:'#7C6FF0', zhipu:'#3B82F6', minimax:'#FF6B35', deepseek:'#5E6AD2', thinking_machines:'#E0B252', nvidia:'#76B900', astraflow:'#0EA5A5', windsurf:'#9A8FD8'};
   const PROVIDER_LOGOS = {"anthropic":"<svg fill=\"#000\" fill-rule=\"evenodd\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M13.827 3.52h3.603L24 20h-3.603l-6.57-16.48zm-7.258 0h3.767L16.906 20h-3.674l-1.343-3.461H5.017l-1.344 3.46H0L6.57 3.522zm4.132 9.959L8.453 7.687 6.205 13.48H10.7z\"></path></svg>","openai":"<svg xmlns=\"http://www.w3.org/2000/svg\" preserveAspectRatio=\"xMidYMid\" viewBox=\"0 0 256 260\"><path d=\"M239.184 106.203a64.716 64.716 0 0 0-5.576-53.103C219.452 28.459 191 15.784 163.213 21.74A65.586 65.586 0 0 0 52.096 45.22a64.716 64.716 0 0 0-43.23 31.36c-14.31 24.602-11.061 55.634 8.033 76.74a64.665 64.665 0 0 0 5.525 53.102c14.174 24.65 42.644 37.324 70.446 31.36a64.72 64.72 0 0 0 48.754 21.744c28.481.025 53.714-18.361 62.414-45.481a64.767 64.767 0 0 0 43.229-31.36c14.137-24.558 10.875-55.423-8.083-76.483Zm-97.56 136.338a48.397 48.397 0 0 1-31.105-11.255l1.535-.87 51.67-29.825a8.595 8.595 0 0 0 4.247-7.367v-72.85l21.845 12.636c.218.111.37.32.409.563v60.367c-.056 26.818-21.783 48.545-48.601 48.601Zm-104.466-44.61a48.345 48.345 0 0 1-5.781-32.589l1.534.921 51.722 29.826a8.339 8.339 0 0 0 8.441 0l63.181-36.425v25.221a.87.87 0 0 1-.358.665l-52.335 30.184c-23.257 13.398-52.97 5.431-66.404-17.803ZM23.549 85.38a48.499 48.499 0 0 1 25.58-21.333v61.39a8.288 8.288 0 0 0 4.195 7.316l62.874 36.272-21.845 12.636a.819.819 0 0 1-.767 0L41.353 151.53c-23.211-13.454-31.171-43.144-17.804-66.405v.256Zm179.466 41.695-63.08-36.63L161.73 77.86a.819.819 0 0 1 .768 0l52.233 30.184a48.6 48.6 0 0 1-7.316 87.635v-61.391a8.544 8.544 0 0 0-4.4-7.213Zm21.742-32.69-1.535-.922-51.619-30.081a8.39 8.39 0 0 0-8.492 0L99.98 99.808V74.587a.716.716 0 0 1 .307-.665l52.233-30.133a48.652 48.652 0 0 1 72.236 50.391v.205ZM88.061 139.097l-21.845-12.585a.87.87 0 0 1-.41-.614V65.685a48.652 48.652 0 0 1 79.757-37.346l-1.535.87-51.67 29.825a8.595 8.595 0 0 0-4.246 7.367l-.051 72.697Zm11.868-25.58 28.138-16.217 28.188 16.218v32.434l-28.086 16.218-28.188-16.218-.052-32.434Z\"/></svg>","google":"<svg viewBox=\"0 0 296 298\" xmlns=\"http://www.w3.org/2000/svg\" fill=\"none\"><mask id=\"a\" x=\"0\" y=\"0\" maskUnits=\"userSpaceOnUse\"><path fill=\"#3186FF\" d=\"M141.201 4.886c2.282-6.17 11.042-6.071 13.184.148l5.985 17.37a184.004 184.004 0 0 0 111.257 113.049l19.304 6.997c6.143 2.227 6.156 10.91.02 13.155l-19.35 7.082a184.001 184.001 0 0 0-109.495 109.385l-7.573 20.629c-2.241 6.105-10.869 6.121-13.133.025l-7.908-21.296a184 184 0 0 0-109.02-108.658l-19.698-7.239c-6.102-2.243-6.118-10.867-.025-13.132l20.083-7.467A183.998 183.998 0 0 0 133.291 26.28l7.91-21.394Z\"/></mask><g mask=\"url(#a)\"><g filter=\"url(#b)\"><ellipse cx=\"163\" cy=\"149\" fill=\"#3689FF\" rx=\"196\" ry=\"159\"/></g><g filter=\"url(#c)\"><ellipse cx=\"33.5\" cy=\"142.5\" fill=\"#F6C013\" rx=\"68.5\" ry=\"72.5\"/></g><g filter=\"url(#d)\"><ellipse cx=\"19.5\" cy=\"148.5\" fill=\"#F6C013\" rx=\"68.5\" ry=\"72.5\"/></g><g filter=\"url(#e)\"><path fill=\"#FA4340\" d=\"M194 10.5C172 82.5 65.5 134.333 22.5 135L144-66l50 76.5Z\"/></g><g filter=\"url(#f)\"><path fill=\"#FA4340\" d=\"M190.5-12.5C168.5 59.5 62 111.333 19 112L140.5-89l50 76.5Z\"/></g><g filter=\"url(#g)\"><path fill=\"#14BB69\" d=\"M194.5 279.5C172.5 207.5 66 155.667 23 155l121.5 201 50-76.5Z\"/></g><g filter=\"url(#h)\"><path fill=\"#14BB69\" d=\"M196.5 320.5C174.5 248.5 68 196.667 25 196l121.5 201 50-76.5Z\"/></g></g><defs><filter id=\"b\" x=\"-69\" y=\"-46\" color-interpolation-filters=\"sRGB\" filterUnits=\"userSpaceOnUse\"><feFlood flood-opacity=\"0\" result=\"BackgroundImageFix\"/><feBlend in=\"SourceGraphic\" in2=\"BackgroundImageFix\" result=\"shape\"/><feGaussianBlur result=\"effect1_foregroundBlur_69_17998\" stdDeviation=\"18\"/></filter><filter id=\"c\" x=\"-99\" y=\"6\" color-interpolation-filters=\"sRGB\" filterUnits=\"userSpaceOnUse\"><feFlood flood-opacity=\"0\" result=\"BackgroundImageFix\"/><feBlend in=\"SourceGraphic\" in2=\"BackgroundImageFix\" result=\"shape\"/><feGaussianBlur result=\"effect1_foregroundBlur_69_17998\" stdDeviation=\"32\"/></filter><filter id=\"d\" x=\"-113\" y=\"12\" color-interpolation-filters=\"sRGB\" filterUnits=\"userSpaceOnUse\"><feFlood flood-opacity=\"0\" result=\"BackgroundImageFix\"/><feBlend in=\"SourceGraphic\" in2=\"BackgroundImageFix\" result=\"shape\"/><feGaussianBlur result=\"effect1_foregroundBlur_69_17998\" stdDeviation=\"32\"/></filter><filter id=\"e\" x=\"-41.5\" y=\"-130\" color-interpolation-filters=\"sRGB\" filterUnits=\"userSpaceOnUse\"><feFlood flood-opacity=\"0\" result=\"BackgroundImageFix\"/><feBlend in=\"SourceGraphic\" in2=\"BackgroundImageFix\" result=\"shape\"/><feGaussianBlur result=\"effect1_foregroundBlur_69_17998\" stdDeviation=\"32\"/></filter><filter id=\"f\" x=\"-45\" y=\"-153\" color-interpolation-filters=\"sRGB\" filterUnits=\"userSpaceOnUse\"><feFlood flood-opacity=\"0\" result=\"BackgroundImageFix\"/><feBlend in=\"SourceGraphic\" in2=\"BackgroundImageFix\" result=\"shape\"/><feGaussianBlur result=\"effect1_foregroundBlur_69_17998\" stdDeviation=\"32\"/></filter><filter id=\"g\" x=\"-41\" y=\"91\" color-interpolation-filters=\"sRGB\" filterUnits=\"userSpaceOnUse\"><feFlood flood-opacity=\"0\" result=\"BackgroundImageFix\"/><feBlend in=\"SourceGraphic\" in2=\"BackgroundImageFix\" result=\"shape\"/><feGaussianBlur result=\"effect1_foregroundBlur_69_17998\" stdDeviation=\"32\"/></filter><filter id=\"h\" x=\"-39\" y=\"132\" color-interpolation-filters=\"sRGB\" filterUnits=\"userSpaceOnUse\"><feFlood flood-opacity=\"0\" result=\"BackgroundImageFix\"/><feBlend in=\"SourceGraphic\" in2=\"BackgroundImageFix\" result=\"shape\"/><feGaussianBlur result=\"effect1_foregroundBlur_69_17998\" stdDeviation=\"32\"/></filter></defs></svg>","xai":"<svg viewBox=\"0 0 1024 1024\" fill=\"#111\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M395.479 633.828L735.91 381.105C752.599 368.715 776.454 373.548 784.406 392.792C826.26 494.285 807.561 616.253 724.288 699.996C641.016 783.739 525.151 802.104 419.247 760.277L303.556 814.143C469.49 928.202 670.987 899.995 796.901 773.282C896.776 672.843 927.708 535.937 898.785 412.476L899.047 412.739C857.105 231.37 909.358 158.874 1016.4 10.6326C1018.93 7.11771 1021.47 3.60279 1024 0L883.144 141.651V141.212L395.392 633.916\" fill=\"#0A0A0A\"/><path d=\"M325.226 695.251C206.128 580.84 226.662 403.776 328.285 301.668C403.431 226.097 526.549 195.254 634.026 240.596L749.454 186.994C728.657 171.88 702.007 155.623 671.424 144.2C533.19 86.9942 367.693 115.465 255.323 228.382C147.234 337.081 113.244 504.215 171.613 646.833C215.216 753.423 143.739 828.818 71.7385 904.916C46.2237 931.893 20.6216 958.87 0 987.429L325.139 695.339\" fill=\"#0A0A0A\"/></svg>","moonshot":"<svg viewBox=\"0 0 512 512\" xmlns=\"http://www.w3.org/2000/svg\" fill-rule=\"evenodd\" clip-rule=\"evenodd\" stroke-linejoin=\"round\" stroke-miterlimit=\"2\"><path d=\"M503 114.333v280c0 60.711-49.29 110-110 110H113c-60.711 0-110-49.289-110-110v-280c0-60.71 49.289-110 110-110h280c60.71 0 110 49.29 110 110z\"/><path d=\"M342.065 189.759c1.886-2.42 3.541-4.63 5.289-6.77.81-1.007.74-1.771-.046-2.824-7.58-9.965-8.298-21.028-3.935-32.254 3.275-8.448 10.52-12.406 19.373-13.25 5.52-.521 10.936.046 15.959 2.73 6.596 3.53 10.438 8.912 11.688 16.341.995 5.926.81 11.712-.868 17.452-2.974 10.161-10.277 15.427-20.287 16.758-8.31 1.11-16.734 1.25-25.113 1.817-.648.046-1.308 0-2.06 0z\" fill=\"#027aff\"/><path d=\"M321.512 144.254h-50.064l-39.637 90.384h-56.036v-89.99H131v232.868h44.787v-98.103h78.973c13.598 0 26.015-7.927 31.744-20.252v118.355h44.787v-98.103c0-23.342-18.239-42.97-41.523-44.671v-.116h-24.593a45.577 45.577 0 0026.884-24.534l29.453-65.838z\" fill=\"#fff\"/></svg>","minimax":"<svg fill=\"#E73562\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M11.43 3.92a.86.86 0 1 0-1.718 0v14.236a1.999 1.999 0 0 1-3.997 0V9.022a.86.86 0 1 0-1.718 0v3.87a1.999 1.999 0 0 1-3.997 0V11.49a.57.57 0 0 1 1.139 0v1.404a.86.86 0 0 0 1.719 0V9.022a1.999 1.999 0 0 1 3.997 0v9.134a.86.86 0 0 0 1.719 0V3.92a1.998 1.998 0 1 1 3.996 0v11.788a.57.57 0 1 1-1.139 0zm10.572 3.105a2 2 0 0 0-1.999 1.997v7.63a.86.86 0 0 1-1.718 0V3.923a1.999 1.999 0 0 0-3.997 0v16.16a.86.86 0 0 1-1.719 0V18.08a.57.57 0 1 0-1.138 0v2a1.998 1.998 0 0 0 3.996 0V3.92a.86.86 0 0 1 1.719 0v12.73a1.999 1.999 0 0 0 3.996 0V9.023a.86.86 0 1 1 1.72 0v6.686a.57.57 0 0 0 1.138 0V9.022a2 2 0 0 0-1.998-1.997\"/></svg>","windsurf":"<svg viewBox=\"0 0 1024 1024\" fill=\"#111\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M897.246 286.869H889.819C850.735 286.808 819.017 318.46 819.017 357.539V515.589C819.017 547.15 792.93 572.716 761.882 572.716C743.436 572.716 725.02 563.433 714.093 547.85L552.673 317.304C539.28 298.16 517.486 286.747 493.895 286.747C457.094 286.747 423.976 318.034 423.976 356.657V515.619C423.976 547.181 398.103 572.746 366.842 572.746C348.335 572.746 329.949 563.463 319.021 547.881L138.395 289.882C134.316 284.038 125.154 286.93 125.154 294.052V431.892C125.154 438.862 127.285 445.619 131.272 451.34L309.037 705.2C319.539 720.204 335.033 731.344 352.9 735.392C397.616 745.557 438.77 711.135 438.77 667.278V508.406C438.77 476.845 464.339 451.279 495.904 451.279H495.995C515.02 451.279 532.857 460.562 543.785 476.145L705.235 706.661C718.659 725.835 739.327 737.218 763.983 737.218C801.606 737.218 833.841 705.9 833.841 667.308V508.376C833.841 476.815 859.41 451.249 890.975 451.249H897.276C901.233 451.249 904.43 448.053 904.43 444.097V294.021C904.43 290.065 901.233 286.869 897.276 286.869H897.246Z\" fill=\"#0b100f\"/></svg>"};
-  const MONOGRAM = {zhipu:"GLM", astraflow:"AF"};
+  const MONOGRAM = {zhipu:"GLM", astraflow:"AF", deepseek:"DS", thinking_machines:"INK", nvidia:"NV"};
   function logoChip(key){ if(PROVIDER_LOGOS[key]) return '<span class="ms-model-logo">'+PROVIDER_LOGOS[key]+'</span>'; if(MONOGRAM[key]) return '<span class="ms-model-logo is-mono">'+MONOGRAM[key]+'</span>'; return ''; }
-  const PROVIDER_ORDER = ['anthropic','openai','google','astraflow','moonshot','zhipu','xai','minimax','windsurf'];
+  // Order of the rendered provider bands. Every provider the generator emits must be listed here,
+  // or its models count toward "全部" but never render (astraflow dropped 2026-10-16: all 9 rows
+  // are deprecated, so the generator emits none).
+  const PROVIDER_ORDER = ['anthropic','openai','google','deepseek','moonshot','zhipu','xai','minimax','thinking_machines','nvidia','windsurf'];
 
   function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
@@ -1295,7 +1421,8 @@ client = OpenAI(
       .replace(/^claude-sonnet-4\.6/,'Sonnet 4.6').replace(/^claude-4-sonnet/,'Sonnet 4').replace(/^claude-4-opus/,'Opus 4')
       .replace(/^claude-4\.1-opus/,'Opus 4.1').replace(/^claude-4\.5-sonnet/,'Sonnet 4.5').replace(/^claude-4\.5-opus/,'Opus 4.5').replace(/^claude-4\.5-haiku/,'Haiku 4.5')
       .replace(/^gpt-/,'GPT-').replace(/^gemini-/,'Gemini ').replace(/^grok-/,'Grok ').replace(/^kimi-/,'Kimi ')
-      .replace(/^glm-/,'GLM ').replace(/^swe-/,'SWE ').replace(/^minimax-/,'MiniMax ').replace(/^qwen-?/,'Qwen ').replace(/^astraflow\//,'');
+      .replace(/^glm-/,'GLM ').replace(/^swe-/,'SWE ').replace(/^minimax-/,'MiniMax ').replace(/^qwen-?/,'Qwen ').replace(/^astraflow\//,'')
+      .replace(/^deepseek-/,'DeepSeek ').replace(/^inkling/,'Inkling').replace(/^nemotron-/,'Nemotron ');
   }
   // Suffix shown for a variant inside an open family (the part after the family key).
   function variantSuffix(name, fk){

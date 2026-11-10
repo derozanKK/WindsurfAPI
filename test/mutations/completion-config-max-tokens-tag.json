@@ -5,16 +5,22 @@
   "expectBaselinePass": 6,
   "mutations": [
     {
-      "name": "the original swap restored — #2 carries the context window, so max_tokens is effectively uncapped",
+      "name": "the calibrated max_newlines default is dropped — a defaulted call writes no #3 at all",
       "file": "src/devin-connect.js",
-      "anchor": "    writeVarintField(2, maxTokens ?? WIRE_DEFAULT_MAX_TOKENS),\n    writeVarintField(3, contextWindow ?? DEFAULT_CONTEXT_WINDOW),",
-      "replacement": "    writeVarintField(2, contextWindow ?? DEFAULT_CONTEXT_WINDOW),\n    writeVarintField(3, maxTokens ?? WIRE_DEFAULT_MAX_TOKENS),"
+      "anchor": "    writeVarintField(3, maxNewlines ?? DEFAULT_MAX_NEWLINES),",
+      "replacement": "    ...(Number.isInteger(maxNewlines) && maxNewlines > 0 ? [writeVarintField(3, maxNewlines)] : []),"
     },
     {
-      "name": "half-swap: #2 gets the cap but #3 also gets it — max_newlines silently clamped to the output cap",
+      "name": "an explicit max_newlines is ignored — #3 always carries the default",
       "file": "src/devin-connect.js",
-      "anchor": "    writeVarintField(3, contextWindow ?? DEFAULT_CONTEXT_WINDOW),",
-      "replacement": "    writeVarintField(3, maxTokens ?? DEFAULT_MAX_TOKENS),"
+      "anchor": "    writeVarintField(3, maxNewlines ?? DEFAULT_MAX_NEWLINES),",
+      "replacement": "    writeVarintField(3, DEFAULT_MAX_NEWLINES),"
+    },
+    {
+      "name": "the output cap rides max_newlines — #3 receives maxTokens instead of max_newlines",
+      "file": "src/devin-connect.js",
+      "anchor": "    writeVarintField(3, maxNewlines ?? DEFAULT_MAX_NEWLINES),",
+      "replacement": "    writeVarintField(3, maxTokens ?? DEFAULT_MAX_NEWLINES),"
     }
   ]
 }

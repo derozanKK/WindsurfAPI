@@ -3,7 +3,7 @@
     "test/usage-unknown-not-zero.test.js",
     "test/responses.test.js"
   ],
-  "expectBaselinePass": 49,
+  "expectBaselinePass": 74,
   "mutations": [
     {
       "name": "the original defect on the streaming path — usage is always emitted, so a silent upstream is reported as 0 tokens",

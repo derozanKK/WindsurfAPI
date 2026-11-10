@@ -27,24 +27,26 @@ afterEach(() => clearLiveCatalogSelectors());
 
 describe('/v1/models — live-catalog synthesis (audit v3.2.4)', () => {
   it('lists a live-only selector that is NOT in the MODELS table nor the snapshot', () => {
-    // grok-4-5-medium: proven live-catalog-only 2026-07-12 (runs at chat, absent
-    // from the 130-model MODELS table and the 105-model snapshot).
+    // Suffixed synthetic selectors: live-only fixtures that must stay absent from MODELS
+    // and the snapshot — a real selector can be covered by a later model sync (the
+    // 2026-10-16 sync landed grok-4-5-medium / gpt-5-6-sol-medium). Same convention as
+    // dashboard-models-connect-parity.test.js.
     setLiveCatalogSelectors([
-      { selector: '  grok-4-5-medium  ', provider: 'xai', label: 'Grok 4.5 (medium)', supportsImages: true },
-      { selector: 'gpt-5-6-sol-medium', provider: 'openai', label: 'GPT-5.6 Sol (medium)', supportsImages: false },
+      { selector: '  grok-4-5-medium-live-catalog  ', provider: 'xai', label: 'Grok 4.5 (medium)', supportsImages: true },
+      { selector: 'gpt-5-6-sol-medium-live-catalog', provider: 'openai', label: 'GPT-5.6 Sol (medium)', supportsImages: false },
     ]);
     const { data } = handleModels(ENV_ON);
     const ids = new Set(data.map((m) => m.id));
-    assert.ok(ids.has('grok-4-5-medium'), 'grok-4-5-medium must appear in /v1/models');
-    assert.ok(ids.has('gpt-5-6-sol-medium'), 'gpt-5-6-sol-medium must appear in /v1/models');
-    const grok = data.find((m) => m.id === 'grok-4-5-medium');
+    assert.ok(ids.has('grok-4-5-medium-live-catalog'), 'grok-4-5-medium-live-catalog must appear in /v1/models');
+    assert.ok(ids.has('gpt-5-6-sol-medium-live-catalog'), 'gpt-5-6-sol-medium-live-catalog must appear in /v1/models');
+    const grok = data.find((m) => m.id === 'grok-4-5-medium-live-catalog');
     assert.equal(grok.object, 'model');
     assert.equal(grok.owned_by, 'xai');
     assert.equal(grok._source, 'live_catalog');
     assert.equal(grok.supports_images, true);
     assert.equal(data.some((m) => m.id !== m.id.trim()), false,
       'live catalog whitespace must not leak into public model ids');
-    assert.equal(data.find((m) => m.id === 'gpt-5-6-sol-medium').supports_images, false);
+    assert.equal(data.find((m) => m.id === 'gpt-5-6-sol-medium-live-catalog').supports_images, false);
   });
 
   it('does NOT duplicate a selector already emitted by the MODELS table', () => {

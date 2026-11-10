@@ -4,7 +4,10 @@ services:
     # `build:` is kept for local dev: `docker compose up --build` rebuilds from source,
     # and Compose will fall back to building when the image isn't available locally
     # AND can't be pulled (e.g. before the first stable tag exists, or on a fork).
-    image: ghcr.io/dwgx/windsurf-api:latest
+    # Overridable so `deploy/update.sh --tag <version>` can pin a release and
+    # so the updater can retag the previous image for a rollback without
+    # editing this file. Defaults to the moving `latest` tag.
+    image: ${WINDSURFAPI_IMAGE:-ghcr.io/dwgx/windsurf-api:latest}
     build:
       context: .
       dockerfile: Dockerfile

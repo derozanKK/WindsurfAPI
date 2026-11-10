@@ -20,9 +20,10 @@ import assert from 'node:assert/strict';
 import {
   TOOL_MAP, CASCADE_STEP,
   canMapAllTools, partitionTools, shouldUseNativeBridge,
-  buildAdditionalStep, buildAdditionalStepsFromHistory, buildReverseLookup,
+  buildAdditionalStep, buildAdditionalStepsFromHistory, buildNativeToolHistory, buildReverseLookup,
   parseNativeFunctionCallsFromText, NativeFunctionCallStreamParser,
 } from '../src/cascade-native-bridge.js';
+import { normalizeMessagesForCascade } from '../src/handlers/tool-emulation.js';
 import {
   parseTrajectorySteps,
   buildSendCascadeMessageRequest,
@@ -387,15 +388,15 @@ describe('parseNativeFunctionCallsFromText', () => {
 });
 
 describe('buildAdditionalStep / buildAdditionalStepsFromHistory', () => {
-  it('view_file step encodes envelope with type=14 + content overlay', () => {
+  it('view_file step encodes CortexStepType=8 with the body on oneof field 14', () => {
     const buf = buildAdditionalStep('view_file', {
       absolute_path_uri: 'file:///foo.ts',
       content: 'console.log("hi")',
-    });
+    }, { observed: true });
     assert.ok(Buffer.isBuffer(buf));
     const fields = parseFields(buf);
     const typeField = getField(fields, 1, 0);
-    assert.equal(typeField.value, 14);
+    assert.equal(typeField.value, 8, 'CortexStepType.VIEW_FILE is 8, not the oneof field 14');
     const oneof = getField(fields, 14, 2);
     assert.ok(oneof, 'view_file body should be on field 14');
     const body = parseFields(oneof.value);
@@ -408,9 +409,9 @@ describe('buildAdditionalStep / buildAdditionalStepsFromHistory', () => {
       command_line: 'echo hi',
       full_output: 'hi\n',
       exit_code: 0,
-    });
+    }, { observed: true });
     const fields = parseFields(buf);
-    assert.equal(getField(fields, 1, 0).value, 28);
+    assert.equal(getField(fields, 1, 0).value, 21, 'CortexStepType.RUN_COMMAND is 21');
     const body = parseFields(getField(fields, 28, 2).value);
     assert.equal(getField(body, 23, 2).value.toString('utf8'), 'echo hi');
     const combined = parseFields(getField(body, 21, 2).value);
@@ -434,7 +435,7 @@ describe('buildAdditionalStep / buildAdditionalStepsFromHistory', () => {
     const steps = buildAdditionalStepsFromHistory(messages);
     assert.equal(steps.length, 1);
     const fields = parseFields(steps[0]);
-    assert.equal(getField(fields, 1, 0).value, 14); // CortexStepType view_file = 14
+    assert.equal(getField(fields, 1, 0).value, 8, 'CortexStepType.VIEW_FILE is 8');
     const body = parseFields(getField(fields, 14, 2).value);
     assert.equal(getField(body, 4, 2).value.toString('utf8'), '127.0.0.1 localhost\n');
   });
@@ -455,7 +456,7 @@ describe('buildAdditionalStep / buildAdditionalStepsFromHistory', () => {
     const steps = buildAdditionalStepsFromHistory(messages);
     assert.equal(steps.length, 1);
     const fields = parseFields(steps[0]);
-    assert.equal(getField(fields, 1, 0).value, 40);
+    assert.equal(getField(fields, 1, 0).value, 31, 'CortexStepType.READ_URL_CONTENT is 31');
     const body = parseFields(getField(fields, 40, 2).value);
     assert.equal(getField(body, 1, 2).value.toString('utf8'), 'https://example.com/docs');
     assert.equal(getField(body, 5, 2), null, 'read_url_content must not encode legacy top-level summary field 5');
@@ -477,6 +478,179 @@ describe('buildAdditionalStep / buildAdditionalStepsFromHistory', () => {
     ];
     const steps = buildAdditionalStepsFromHistory(messages);
     assert.equal(steps.length, 0);
+  });
+});
+
+// V-13 (KH-034) — history truth: a step is only complete when the caller
+// actually reported a result; a failed shell command keeps its non-zero
+// status; unmapped history stays visible to the emulation path; and a
+// reused cascade receives only the rounds it has not already seen.
+describe('native history truth (V-13)', () => {
+  const callMsg = (id, name, args, extra = {}) => ({
+    role: 'assistant',
+    content: null,
+    tool_calls: [{
+      id,
+      type: 'function',
+      function: { name, arguments: JSON.stringify(args) },
+    }],
+    ...extra,
+  });
+  const resultMsg = (id, content, extra = {}) => ({ role: 'tool', tool_call_id: id, content, ...extra });
+
+  function decodeRunCommand(buf) {
+    const fields = parseFields(buf);
+    assert.equal(getField(fields, 1, 0).value, 21, 'CortexStepType.RUN_COMMAND is 21');
+    return {
+      status: getField(fields, 4, 0).value,
+      body: parseFields(getField(fields, 28, 2).value),
+    };
+  }
+
+  it('an unobserved call never becomes DONE and a failed Bash keeps its non-zero exit_code', () => {
+    // Layer 1: the encoder itself refuses to stamp DONE without an observation.
+    assert.equal(
+      buildAdditionalStep('run_command', { command_line: 'ls' }),
+      null,
+      'no observation means no completed step',
+    );
+
+    // Layer 2: history conversion drops the unobserved call instead of
+    // telling the planner it ran with empty output.
+    const unobserved = buildAdditionalStepsFromHistory([
+      { role: 'user', content: 'go' },
+      callMsg('call_unobserved', 'Bash', { command: 'ls' }),
+    ]);
+    assert.equal(unobserved.length, 0, 'an assistant tool_call with no result is not a DONE step');
+
+    // A failed Bash result carries its exit status. The step is DONE because
+    // the command completed — not because it succeeded.
+    const failedText = 'Exit code: 2\nOutput:\nls: cannot access /nope';
+    const failed = buildAdditionalStepsFromHistory([
+      { role: 'user', content: 'go' },
+      callMsg('call_failed', 'Bash', { command: 'ls /nope' }),
+      resultMsg('call_failed', failedText),
+    ]);
+    assert.equal(failed.length, 1);
+    const decoded = decodeRunCommand(failed[0]);
+    assert.equal(decoded.status, 3, 'status DONE means the step completed, not that it succeeded');
+    assert.equal(getField(decoded.body, 6, 0).value, 2, 'a failed Bash keeps its non-zero exit_code');
+    const combined = parseFields(getField(decoded.body, 21, 2).value);
+    assert.equal(getField(combined, 1, 2).value.toString('utf8'), failedText);
+    assert.equal(
+      getField(decoded.body, 4, 2),
+      null,
+      'one authoritative output field: combined_output only, no duplicated stdout',
+    );
+
+    // Success keeps 0 — the fix must not turn every command into a failure.
+    const ok = buildAdditionalStepsFromHistory([
+      { role: 'user', content: 'go' },
+      callMsg('call_ok', 'Bash', { command: 'true' }),
+      resultMsg('call_ok', 'Exit code: 0\n'),
+    ]);
+    assert.equal(getField(decodeRunCommand(ok[0]).body, 6, 0).value, 0);
+
+    // Anthropic-style failures carry no numeric code; they must still not be
+    // replayed as success (proto3 reads an absent field as 0).
+    const toolError = buildAdditionalStepsFromHistory([
+      { role: 'user', content: 'go' },
+      callMsg('call_err', 'Bash', { command: 'nope' }),
+      resultMsg('call_err', '[tool error] bash: nope: command not found'),
+    ]);
+    assert.equal(
+      getField(decodeRunCommand(toolError[0]).body, 6, 0).value,
+      1,
+      'a signalled failure without a numeric code is encoded non-zero, never 0',
+    );
+
+    const flagged = buildAdditionalStepsFromHistory([
+      { role: 'user', content: 'go' },
+      callMsg('call_flag', 'Bash', { command: 'nope' }),
+      resultMsg('call_flag', 'bash: nope: command not found', { is_error: true }),
+    ]);
+    assert.equal(getField(decodeRunCommand(flagged[0]).body, 6, 0).value, 1);
+
+    // codex-style structured shell results keep their exit status too.
+    const json = buildAdditionalStepsFromHistory([
+      { role: 'user', content: 'go' },
+      callMsg('call_json', 'Bash', { command: 'nope' }),
+      resultMsg('call_json', JSON.stringify({ output: 'boom', metadata: { exit_code: 127 } })),
+    ]);
+    assert.equal(getField(decodeRunCommand(json[0]).body, 6, 0).value, 127);
+  });
+
+  it('a reused cascade receives only the new tool round, not the already-injected prefix', () => {
+    const messages = [
+      { role: 'user', content: 'u1' },
+      callMsg('call_1', 'Read', { file_path: '/a' }),
+      resultMsg('call_1', 'A'),
+      { role: 'assistant', content: 'read a' },
+      callMsg('call_2', 'Read', { file_path: '/b' }),
+      resultMsg('call_2', 'B'),
+    ];
+
+    // A fresh cascade never saw the earlier round, so it gets the full history.
+    const fresh = buildNativeToolHistory(messages);
+    assert.equal(fresh.steps.length, 2);
+    // The full build exposes where the new round starts, so the wire can
+    // slice instead of encoding the history a second time.
+    assert.equal(fresh.deltaStart, 1);
+    assert.deepEqual(fresh.steps.slice(fresh.deltaStart), buildAdditionalStepsFromHistory(messages, { reuse: true }));
+
+    // The reused cascade already holds call_1's step; re-injecting it would
+    // duplicate the observation in its trajectory.
+    const delta = buildAdditionalStepsFromHistory(messages, { reuse: true });
+    assert.equal(delta.length, 1, 'only the newest pending round is new');
+    const body = parseFields(getField(parseFields(delta[0]), 14, 2).value);
+    assert.equal(getField(body, 4, 2).value.toString('utf8'), 'B');
+
+    // A reused cascade whose newest turn is a user message has nothing new.
+    assert.equal(
+      buildAdditionalStepsFromHistory([...messages, { role: 'user', content: 'next' }], { reuse: true }).length,
+      0,
+    );
+
+    // The trailing round is only a delta when it has observations; an
+    // unanswered proposal is not a completed step.
+    assert.equal(
+      buildAdditionalStepsFromHistory(messages.slice(0, 5), { reuse: true }).length,
+      0,
+    );
+  });
+
+  it('unmapped and orphan tool history survives in the emulation message list', () => {
+    const messages = [
+      { role: 'user', content: 'u1' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'call_mapped', type: 'function', function: { name: 'Bash', arguments: '{"command":"ls"}' } },
+          { id: 'call_unmapped', type: 'function', function: { name: 'get_weather', arguments: '{"city":"x"}' } },
+        ],
+      },
+      resultMsg('call_mapped', 'Exit code: 0\nok'),
+      resultMsg('call_unmapped', 'sunny'),
+      resultMsg('call_orphan', 'orphan output'),
+    ];
+
+    const history = buildNativeToolHistory(messages);
+    assert.equal(history.steps.length, 1, 'only the mapped+observed call becomes a step');
+
+    // The mapped pair belongs to the bridge and must not be duplicated into
+    // the text history; the unmapped pair and the orphan result are retained.
+    const retained = history.emulationMessages;
+    assert.equal(retained.length, 4, 'user + assistant(unmapped call) + unmapped result + orphan result');
+    assert.deepEqual(retained[1].tool_calls.map(tc => tc.id), ['call_unmapped']);
+    assert.equal(retained[2].tool_call_id, 'call_unmapped');
+    assert.equal(retained[3].tool_call_id, 'call_orphan');
+
+    const folded = normalizeMessagesForCascade(retained, [fnTool('get_weather')], { injectUserPreamble: false });
+    const text = folded.map(m => (typeof m.content === 'string' ? m.content : '')).join('\n');
+    assert.match(text, /sunny/, 'the unmapped result reaches the model as emulated history');
+    assert.match(text, /orphan output/, 'an orphan result is not silently dropped');
+    assert.doesNotMatch(text, /Exit code: 0/, 'the bridge-owned result is not duplicated as text');
   });
 });
 
@@ -502,7 +676,7 @@ describe('parseTrajectorySteps — native step recognition', () => {
       writeVarintField(12, 100),
       writeStringField(4, 'console.log("hi")\n'),
     ]);
-    const resp = wrapResponse(wrapStep(14, 14, body));
+    const resp = wrapResponse(wrapStep(8, 14, body));
     const steps = parseTrajectorySteps(resp);
     assert.equal(steps.length, 1);
     const calls = steps[0].toolCalls.filter(tc => tc.cascade_native);
@@ -520,7 +694,7 @@ describe('parseTrajectorySteps — native step recognition', () => {
       writeStringField(23, 'echo hi'),
       writeMessageField(21, combinedOutput),
     ]);
-    const resp = wrapResponse(wrapStep(28, 28, body));
+    const resp = wrapResponse(wrapStep(21, 28, body));
     const steps = parseTrajectorySteps(resp);
     const calls = steps[0].toolCalls.filter(tc => tc.cascade_native);
     assert.equal(calls.length, 1);
@@ -536,7 +710,7 @@ describe('parseTrajectorySteps — native step recognition', () => {
       writeStringField(3, 'src'),
       writeStringField(15, 'src/foo.ts:10:// todo\n'),
     ]);
-    const resp = wrapResponse(wrapStep(105, 105, body));
+    const resp = wrapResponse(wrapStep(91, 105, body));
     const steps = parseTrajectorySteps(resp);
     const calls = steps[0].toolCalls.filter(tc => tc.cascade_native);
     assert.equal(calls.length, 1);
@@ -550,7 +724,7 @@ describe('parseTrajectorySteps — native step recognition', () => {
       writeStringField(2, 'foo.ts'),
       writeStringField(2, 'bar.ts'),
     ]);
-    const resp = wrapResponse(wrapStep(15, 15, body));
+    const resp = wrapResponse(wrapStep(9, 15, body));
     const steps = parseTrajectorySteps(resp);
     const calls = steps[0].toolCalls.filter(tc => tc.cascade_native);
     assert.equal(calls.length, 1);
@@ -561,7 +735,7 @@ describe('parseTrajectorySteps — native step recognition', () => {
   it('multiple native steps in same trajectory all surface', () => {
     const viewBody = Buffer.concat([writeStringField(1, 'file:///a.ts'), writeStringField(4, 'A')]);
     const cmdBody = Buffer.concat([writeStringField(23, 'ls'), writeMessageField(21, writeStringField(1, 'a.ts\n'))]);
-    const resp = wrapResponse(wrapStep(14, 14, viewBody), wrapStep(28, 28, cmdBody));
+    const resp = wrapResponse(wrapStep(8, 14, viewBody), wrapStep(21, 28, cmdBody));
     const steps = parseTrajectorySteps(resp);
     assert.equal(steps.length, 2);
     assert.equal(steps[0].toolCalls.filter(tc => tc.cascade_native).length, 1);
@@ -631,8 +805,8 @@ describe('buildSendCascadeMessageRequest — additional_steps on field 9', () =>
   });
 
   it('includes each step as repeated field 9', () => {
-    const stepA = buildAdditionalStep('view_file', { absolute_path_uri: 'file:///a', content: 'A' });
-    const stepB = buildAdditionalStep('run_command', { command_line: 'ls', full_output: 'a\n' });
+    const stepA = buildAdditionalStep('view_file', { absolute_path_uri: 'file:///a', content: 'A' }, { observed: true });
+    const stepB = buildAdditionalStep('run_command', { command_line: 'ls', full_output: 'a\n' }, { observed: true });
     const proto = buildSendCascadeMessageRequest(
       'k', 'cid', 'hi', 12345, 'MODEL_TEST', 'sess',
       { additionalSteps: [stepA, stepB] },
@@ -795,12 +969,12 @@ describe('buildSendCascadeMessageRequest — additional_steps on field 9', () =>
 
 describe('CASCADE_STEP type constants — sanity', () => {
   it('matches proto field numbers used in oneof', () => {
-    assert.equal(CASCADE_STEP.view_file.typeEnum, 14);
-    assert.equal(CASCADE_STEP.run_command.typeEnum, 28);
-    assert.equal(CASCADE_STEP.grep_search_v2.typeEnum, 105);
-    assert.equal(CASCADE_STEP.find.typeEnum, 34);
-    assert.equal(CASCADE_STEP.list_directory.typeEnum, 15);
-    assert.equal(CASCADE_STEP.write_to_file.typeEnum, 23);
+    assert.equal(CASCADE_STEP.view_file.typeEnum, 8);
+    assert.equal(CASCADE_STEP.run_command.typeEnum, 21);
+    assert.equal(CASCADE_STEP.grep_search_v2.typeEnum, 91);
+    assert.equal(CASCADE_STEP.find.typeEnum, 25);
+    assert.equal(CASCADE_STEP.list_directory.typeEnum, 9);
+    assert.equal(CASCADE_STEP.write_to_file.typeEnum, 16);
   });
 });
 
@@ -909,16 +1083,26 @@ describe('mergeReasoningEffortIntoModel — v2.0.66 reasoning_effort fold-in', (
     );
   });
 
-  it('replaces an existing effort suffix when the caller sends an explicit effort field', async () => {
+  it('an explicit effort suffix is authoritative over the effort field (CompatClients F1)', async () => {
     const { mergeReasoningEffortIntoModel } = await import('../src/handlers/chat.js');
+    // This case used to pin the OPPOSITE (suffix stripped and replaced), which
+    // is the defect Codex hit: it sends reasoning.effort=medium on every turn,
+    // so gpt-6-luna-max was served as gpt-6-luna-medium. An explicit tier in
+    // the model id is the caller's selection and must win in both directions —
+    // a -medium request must not be promoted either.
+    assert.equal(
+      mergeReasoningEffortIntoModel('gpt-6-luna-max', { reasoning: { effort: 'medium' } }),
+      'gpt-6-luna-max',
+    );
     assert.equal(
       mergeReasoningEffortIntoModel('gpt-5.5-xhigh', { reasoning: { effort: 'medium' } }),
-      'gpt-5.5-medium',
+      'gpt-5.5-xhigh',
     );
     assert.equal(
       mergeReasoningEffortIntoModel('claude-opus-4-8-medium', { reasoning: { effort: 'xhigh' } }),
-      'claude-opus-4-8-xhigh',
+      'claude-opus-4-8-medium',
     );
+    // No suffix in the request → the effort field still supplies the tier.
     assert.equal(
       mergeReasoningEffortIntoModel('claude-opus-4.8', { reasoning_effort: 'max' }),
       'claude-opus-4.8-max',

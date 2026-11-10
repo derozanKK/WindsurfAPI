@@ -1,0 +1,89 @@
+{
+  "tests": [
+    "test/cascade-turn-snapshot-v2.test.js",
+    "test/detached-registry.test.js",
+    "test/cascade-detach-lazy-resume.test.js"
+  ],
+  "expectBaselinePass": 59,
+  "mutations": [
+    {
+      "name": "M1 cursor completeness: snapshot() drops generatorOffset",
+      "file": "src/cascade-turn.js",
+      "anchor": "      // v2: the metadata RPC is offset-scoped. Resuming from 0 re-sums every\n      // prior turn of the cascade and over-bills it (src/windsurf.js:947-951).\n      generatorOffset: this.generatorOffset,",
+      "replacement": "      // v2: the metadata RPC is offset-scoped. Resuming from 0 re-sums every\n      // prior turn of the cascade and over-bills it (src/windsurf.js:947-951)."
+    },
+    {
+      "name": "M2a cursor validity: snapshot() mid-batch guard removed",
+      "file": "src/cascade-turn.js",
+      "anchor": "    if (this.consumedThrough !== this.stepOffset) {\n      throw new CascadeTurnCursorError(\n        `CascadeTurn cannot snapshot a mid-batch turn: consumedThrough ${this.consumedThrough} != stepOffset ${this.stepOffset}`,\n      );\n    }",
+      "replacement": "    /* MUTANT: consumedThrough guard removed */"
+    },
+    {
+      "name": "M2b cursor validity: admit() consumedThrough guard removed",
+      "file": "src/detached-registry.js",
+      "anchor": "    if (!Number.isInteger(snapshot.consumedThrough) || snapshot.consumedThrough !== snapshot.stepOffset) {\n      this.counters.refuse.bad_snapshot++;\n      return { refused: 'bad_snapshot' };\n    }",
+      "replacement": "    /* MUTANT: admit consumedThrough guard removed */"
+    },
+    {
+      "name": "M3 tenancy: detachedKey ignores callerKey",
+      "file": "src/detached-registry.js",
+      "anchor": "  return sha256(`detached\\0${computeCacheKey(body, scope)}\\0${digest}`);",
+      "replacement": "  return sha256(`detached\\0${computeCacheKey(body, 'shared-scope')}\\0${digest}`);"
+    },
+    {
+      "name": "M4 single writer: claim CAS removed",
+      "file": "src/detached-registry.js",
+      "anchor": "    if (entry.state !== 'running') {\n      this.counters.claim.busy++;\n      return { refused: 'busy' };\n    }",
+      "replacement": "    /* MUTANT: claim CAS removed */"
+    },
+    {
+      "name": "M5b lease: resume takes no beginLsUse before claim",
+      "file": "src/handlers/chat.js",
+      "anchor": "              const leased = beginLsUseFn(found.pin.lsPort);",
+      "replacement": "              const leased = lsEntry;"
+    },
+    {
+      "name": "M6 lease: producer finally no longer releases (endLsUse)",
+      "file": "src/client.js",
+      "anchor": "    } finally {\n      releaseLease(this.port);\n    }",
+      "replacement": "    } finally {\n      /* MUTANT: endLsUse at claim/evict removed */\n    }"
+    },
+    {
+      "name": "M7 lease: leaseHeld ignored (double acquire)",
+      "file": "src/client.js",
+      "anchor": "    if (!leaseHeld) acquireLease(this.port);",
+      "replacement": "    acquireLease(this.port);"
+    },
+    {
+      "name": "M8 billing: resume bills acct (no owner branch)",
+      "file": "src/handlers/chat.js",
+      "anchor": "                } else if (resumeBillingAccountId) {\n                  const ownerKey = currentApiKeyForId(resumeBillingAccountId);\n                  if (ownerKey) {\n                    recordAccountSpend({ accountId: resumeBillingAccountId, apiKey: ownerKey }, usage);\n                    detachedRegistry.noteBilled();\n                  }\n                }",
+      "replacement": "                }"
+    },
+    {
+      "name": "M9a eligibility: tool-chunk scan removed (EQUIVALENT: the toolCalls guard independently refuses)",
+      "file": "src/client.js",
+      "anchor": "        if (turn.chunks.some(chunk => chunk?.nativeToolCall || chunk?.nativeToolResult)) return null;",
+      "replacement": "        /* MUTANT: tool-chunk scan removed */",
+      "expectCaught": false
+    },
+    {
+      "name": "M9b eligibility: tool-chunk scan + toolCalls guard removed",
+      "file": "src/client.js",
+      "anchor": "        if (turn.chunks.some(chunk => chunk?.nativeToolCall || chunk?.nativeToolResult)) return null;\n        if (toolCalls.length) return null;",
+      "replacement": "        /* MUTANT: both tool eligibility guards removed */"
+    },
+    {
+      "name": "M10 cause: shutdown classified as client_gone",
+      "file": "src/handlers/chat.js",
+      "anchor": "          detachCause = 'shutdown';",
+      "replacement": "          detachCause = 'client_gone';"
+    },
+    {
+      "name": "M11 replay: prefix bypasses onChunk (raw send, no sanitizer)",
+      "file": "src/handlers/chat.js",
+      "anchor": "          for (const chunk of resumeClaim.entry.snapshot.chunks) {\n            await onChunk(chunk);",
+      "replacement": "          for (const chunk of resumeClaim.entry.snapshot.chunks) {\n            if (chunk?.text) await send({ id, object: 'chat.completion.chunk', created, model,\n              choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }] });"
+    }
+  ]
+}

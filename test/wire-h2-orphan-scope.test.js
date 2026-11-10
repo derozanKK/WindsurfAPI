@@ -29,22 +29,25 @@ const roles = (items) => items.map((f) => getField(f, 2, 0).value);
 const strings = (fields, tag) => getAllFields(fields, tag)
   .filter((f) => f.wireType === 2).map((f) => f.value.toString('utf8'));
 
-test('H2-T1: a future call prevents whole-history orphanhood without reordering', () => {
+test('H2-T1: a future call prevents whole-history orphanhood; the native normalizer restores call-then-result order', () => {
   const input = [result('a'), assistant('a'), user];
+  // The strip itself still uses the whole history and never reorders: the call
+  // exists, so the result is not an orphan.
   assert.strictEqual(stripOrphanedToolResults(input), input);
-  for (const history of [
-    normalize(input, { stripOrphans: true }),
-    interleaveParallelToolMessages(input),
-  ]) {
-    assert.deepEqual(history, input);
-    const items = frames(history);
-    assert.deepEqual(roles(items), [4, 2, 1]);
-    assert.deepEqual(strings(items[0], 7), ['a']);
-    assert.deepEqual(strings(items[0], 3), ['output']);
-    const calls = getAllFields(items[1], 6);
-    assert.equal(calls.length, 1);
-    assert.deepEqual(strings(parseFields(calls[0].value), 1), ['a']);
-  }
+  // The native normalization repairs the chronology (#273.1, measured 2026-10-25:
+  // the upstream rejects [4,2] with invalid_argument and accepts [2,4]).
+  const normalized = normalize(input, { stripOrphans: true });
+  assert.deepEqual(normalized.map((m) => m.role), ['assistant', 'tool', 'user']);
+  const items = frames(normalized);
+  assert.deepEqual(roles(items), [2, 4, 1]);
+  assert.deepEqual(strings(items[1], 7), ['a']);
+  assert.deepEqual(strings(items[1], 3), ['output']);
+  const calls = getAllFields(items[0], 6);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(strings(parseFields(calls[0].value), 1), ['a']);
+  // interleave alone still cannot see a result above the call; it is the
+  // explicit order repair that fixes this shape, not a side effect of interleave.
+  assert.deepEqual(interleaveParallelToolMessages(input), input);
 });
 
 test('H2-T2: opted-in stripping removes results with no call anywhere', () => {

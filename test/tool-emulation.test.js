@@ -61,7 +61,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('handles GLM47 call split across chunks', () => {
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const r1 = parser.feed('<tool_call>Read<arg_key>file_path</arg_key>');
     const r2 = parser.feed('<arg_value>README.md</arg_value></tool_call>');
     const r3 = parser.flush();
@@ -73,7 +73,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('parses GLM47 zero-arg <tool_call> block', () => {
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const r = parser.feed('<tool_call>pwd</tool_call>');
     const flush = parser.flush();
     const allCalls = [...r.toolCalls, ...flush.toolCalls];
@@ -84,7 +84,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('parses GLM47 single-arg block with arg_key / arg_value format', () => {
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const input = '<tool_call>Read<arg_key>file_path</arg_key><arg_value>README.md</arg_value></tool_call>';
     const r = parser.feed(input);
     const flush = parser.flush();
@@ -95,7 +95,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('parses GLM47 multi-arg block and number values', () => {
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const input = '<tool_call>Bash<arg_key>command</arg_key><arg_value>ls -la</arg_value><arg_key>timeout</arg_key><arg_value>5000</arg_value></tool_call>';
     const { toolCalls } = parser.feed(input);
     const flush = parser.flush();
@@ -108,7 +108,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('parses multiple GLM47 tool calls back-to-back', () => {
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const input = '<tool_call>Read<arg_key>file_path</arg_key><arg_value>README.md</arg_value></tool_call><tool_call>Bash<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>';
     const { toolCalls } = parser.feed(input);
     const flush = parser.flush();
@@ -135,7 +135,7 @@ describe('ToolCallStreamParser', () => {
     // flush(), so a non-tool prose response from GLM looked silent in SSE
     // until end-of-stream. Now we emit text up to a hold-back tail so
     // partial open tags still get caught on the next chunk.
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const r1 = parser.feed('Hello world ');
     assert.equal(r1.text, 'Hello world ');
     const r2 = parser.feed('and goodbye.');
@@ -145,7 +145,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('emits prefix text then parses GLM47 tool call from the same stream', () => {
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const r1 = parser.feed('Sure, reading the file. ');
     assert.equal(r1.text, 'Sure, reading the file. ');
     const r2 = parser.feed('<tool_call>Read<arg_key>file_path</arg_key><arg_value>x.md</arg_value></tool_call>');
@@ -157,7 +157,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('holds back partial GLM47 open-tag prefix at chunk boundary', () => {
-    const parser = new ToolCallStreamParser({ modelKey: 'glm-5.1' });
+    const parser = new ToolCallStreamParser({ modelKey: 'glm-5' });
     const r1 = parser.feed('Reading: <tool_ca');
     // Should emit "Reading: " but hold "<tool_ca" in case the next chunk completes
     assert.equal(r1.text, 'Reading: ');
@@ -169,7 +169,7 @@ describe('ToolCallStreamParser', () => {
   });
 
   it('picks GLM / Kimi / OpenAI dialects by model or provider', () => {
-    assert.equal(pickToolDialect('glm-5.1'), 'glm47');
+    assert.equal(pickToolDialect('glm-5'), 'glm47');
     assert.equal(pickToolDialect('kimi-k2-thinking'), 'kimi_k2');
     assert.equal(pickToolDialect('gpt-4o'), 'openai_json_xml');
     assert.equal(pickToolDialect(null, 'zhipu'), 'glm47');
@@ -205,7 +205,7 @@ describe('ToolCallStreamParser', () => {
     assert.equal(pickToolDialect('glm-5.2-fast'), 'gpt_native');
     assert.equal(pickToolDialect('glm-5.2-thinking'), 'gpt_native');
     assert.equal(pickToolDialect('glm-5'), 'glm47');
-    assert.equal(pickToolDialect('glm-5.1'), 'glm47');
+    assert.equal(pickToolDialect('glm-4.7'), 'glm47');
     // 5.2+ future SKUs (dashed or dotted) keep gpt_native
     assert.equal(pickToolDialect('glm-5.3', 'zhipu'), 'gpt_native');
     assert.equal(pickToolDialect('glm-5-9', 'zhipu'), 'gpt_native');
@@ -220,7 +220,7 @@ describe('ToolCallStreamParser', () => {
       assert.equal(pickToolDialect('gpt-4o', 'openai'), 'kimi_k2');
       // An unrecognized value is ignored and normal routing applies.
       process.env.WINDSURFAPI_FORCE_TOOL_DIALECT = 'bogus';
-      assert.equal(pickToolDialect('glm-5.1'), 'glm47');
+      assert.equal(pickToolDialect('glm-5'), 'glm47');
     } finally {
       if (prev === undefined) delete process.env.WINDSURFAPI_FORCE_TOOL_DIALECT;
       else process.env.WINDSURFAPI_FORCE_TOOL_DIALECT = prev;
@@ -406,7 +406,7 @@ describe('buildToolPreamble (injection-guard safety)', () => {
   });
 
   it('uses GLM47 arg_key/arg_value protocol in proto preamble', () => {
-    const glm = buildToolPreambleForProto(manyTools, 'auto', '', 'glm-5.1');
+    const glm = buildToolPreambleForProto(manyTools, 'auto', '', 'glm-5');
     assert.ok(glm.includes('<arg_key>'));
     assert.ok(glm.includes('<arg_value>'));
     assert.ok(!glm.includes('"name":"'));
@@ -837,7 +837,7 @@ describe('normalizeMessagesForCascade (preamble placement regression)', () => {
         { role: 'user', content: 'next' },
       ],
       tools,
-      { modelKey: 'glm-5.1', provider: 'zhipu' },
+      { modelKey: 'glm-5', provider: 'zhipu' },
     );
     const asst = out.find(m => m.role === 'assistant');
     assert.ok(asst.content.includes('<arg_key>file_path</arg_key>'),

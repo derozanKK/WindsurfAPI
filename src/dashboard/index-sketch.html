@@ -1611,6 +1611,7 @@ window._firebaseOAuth = async function(provider) {
               <tbody></tbody>
             </table>
           </div>
+          <div id="account-stats-note" class="text-mute" style="margin-top:8px;font-size:12px"></div>
         </div>
       </div>
     </div>
@@ -2209,7 +2210,10 @@ const App = {
     try {
       const r = await fetch('/dashboard/api' + path, opts);
       const data = await r.json().catch(() => ({}));
-      if (r.status === 401) {
+      // Forwarded upstream 401/429 is not dashboard auth failure (see index.html).
+      const upstreamFailure = (r.status === 401 || r.status === 429)
+        && (data?.httpStatus === r.status || data?.upstream === true);
+      if (r.status === 401 && !upstreamFailure) {
         this.password = null;
         try { localStorage.removeItem('dp'); } catch {}
         Object.values(this.pollers).forEach(clearInterval);
@@ -2218,7 +2222,7 @@ const App = {
         const authErr = (data && data.error && (data.error.message || data.error)) || 'Unauthorized';
         return { success: false, error: authErr };
       }
-      if (r.status === 429) {
+      if (r.status === 429 && !upstreamFailure) {
         const lockErr = (data && data.error && (data.error.message || data.error)) || 'Too many failed attempts';
         return { success: false, error: lockErr };
       }
@@ -2818,7 +2822,7 @@ const App = {
         <td><span class="badge ${a.status}">${a.status}</span>${rateLimitBadge}</td>
         <td style="color:${a.errorCount > 0 ? 'var(--error)' : 'inherit'};font-family:'JetBrains Mono',monospace">${a.errorCount}</td>
         <td class="text-sm nowrap">${a.lastUsed ? new Date(a.lastUsed).toLocaleString() : '—'}</td>
-        <td class="nowrap"><code title="reveal & copy" style="cursor:pointer" onclick="App.revealAndCopyKey('${this.escAttr(a.id)}')">${this.esc(a.apiKey_masked || a.keyPrefix || '')}</code></td>
+        <td class="nowrap"><code title="reveal & copy" style="cursor:pointer" onclick="App.revealAndCopyKey('${this.escAttr(a.id)}')">${this.esc(a.apiKey_masked || a.id || '')}</code></td>
         <td class="nowrap"><div class="btn-group">
           <button class="btn btn-ghost btn-xs" onclick="App.probeAccount('${this.escAttr(a.id)}')">probe</button>
           <button class="btn btn-ghost btn-xs" onclick="App.refreshCredits('${this.escAttr(a.id)}')"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
@@ -2932,7 +2936,7 @@ const App = {
             </div>
             <div class="detail-kv">
               <span class="k">id</span><span class="v"><code>${this.esc(a.id)}</code></span>
-              <span class="k">key</span><span class="v"><code>${this.esc(a.apiKey_masked || a.keyPrefix || '')}</code></span>
+              <span class="k">key</span><span class="v"><code>${this.esc(a.apiKey_masked || a.id || '')}</code></span>
               ${cr.lastError ? `<span class="k">last err</span><span class="v" style="color:var(--error);font-size:11px">${this.esc(cr.lastError).slice(0,80)}</span>` : ''}
             </div>
           </div>
@@ -3311,7 +3315,6 @@ const App = {
 
     const accountEntries = Object.entries(r.accountCounts || {}).map(([id, s]) => ({
       id,
-      label: s.label || null,
       requests: s.requests || 0,
       success: s.success || 0,
       errors: s.errors || 0,
@@ -3319,10 +3322,22 @@ const App = {
     })).sort((a, b) => b.requests - a.requests);
     const tbody2 = document.querySelector('#account-stats-table tbody');
     tbody2.innerHTML = accountEntries.map(a => `<tr>
-      <td><code>${this.esc(a.id.slice(0,8))}</code>${a.label ? ` <span class="text-mute">${this.esc(a.label)}</span>` : ''}</td>
+      <td><code>${this.esc(a.id.slice(0,8))}</code></td>
       <td>${a.requests}</td><td>${a.success}</td><td>${a.errors}</td>
       <td>${a.successRate}%</td>
     </tr>`).join('') || `<tr class="empty-row"><td colspan="5">no account data yet</td></tr>`;
+
+    // Per-account rows only cover requests that carried an account id;
+    // global/unauthenticated paths still count in the total. State the
+    // remainder so the table does not silently sum short of the total card.
+    const attribution = r.accountAttribution || {};
+    const unattributed = Number(attribution.unattributed) || 0;
+    const noteEl = document.getElementById('account-stats-note');
+    if (noteEl) {
+      noteEl.textContent = unattributed > 0
+        ? `${unattributed} of ${total} requests have no account attribution (global/unauthenticated paths); they are counted in the total and excluded from the rows above.`
+        : '';
+    }
 
     // 30s auto-refresh — production UI keeps this running so the panel
     // stays live without manual reload.

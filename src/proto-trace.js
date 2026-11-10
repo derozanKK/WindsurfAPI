@@ -744,6 +744,8 @@ function summarizeTrajectoryStep(stepBuf, index) {
     }));
   const type = numberField(fields, 1);
   const status = numberField(fields, 4);
+  // type 14 is CortexStepType.USER_INPUT; field 19 may carry the observed
+  // read-wrapper shape that the inbound parser promotes to a view_file call.
   const wrapper19 = type === 14 ? getField(fields, 19, 2) : null;
   const requestedInteraction = getField(fields, 56, 2);
   const requestedInteractionSummary = requestedInteraction ? summarizeRequestedInteraction(requestedInteraction.value) : null;

@@ -322,9 +322,12 @@ describe('#250 Cascade path: leading think-tagged content is rerouted to reasoni
 
     assert.match(wireContent(raw), /partial reasoning/,
       'the classifier tail must be released on the failure path too');
-    assert.ok(/"finish_reason":"stop"/.test(raw),
-      'the partial-then-error tail must still close the stream cleanly — a '
-      + 'ReferenceError here would swallow the terminal frame');
+    // A06/KH-002: a failure after content is an explicit error frame, not a
+    // fabricated stop. A ReferenceError here would swallow the terminal frame.
+    assert.ok(/"error"\s*:/.test(raw),
+      'the partial-then-error tail must still emit its terminal error frame');
+    assert.equal(/"finish_reason":"stop"/.test(raw), false,
+      'a dead turn must not be dressed up as a successful stop');
   });
 
   // ── emulateTools + failure: the accThinking hole ──────────────────────────
@@ -358,7 +361,7 @@ describe('#250 Cascade path: leading think-tagged content is rerouted to reasoni
     assert.match(wireContent(raw), /answer here/, 'the post-marker answer must still arrive');
   });
 
-  it('emulateTools + failure on an ALL-thinking turn still closes with a stop', async () => {
+  it('emulateTools + failure on an ALL-thinking turn still delivers its bytes and errors', async () => {
     // The worse half: when the whole turn was a rerouted think block, nothing was
     // ever emitted, so emittedClientPayload stayed false and the client got an
     // empty assistant turn plus a raw {"error":...} frame with NO finish_reason.
@@ -370,11 +373,13 @@ describe('#250 Cascade path: leading think-tagged content is rerouted to reasoni
     const all = wireContent(raw) + wireReasoning(raw);
     assert.match(all, /pure reasoning, no answer/,
       'an all-thinking turn must still deliver its bytes on the failure path');
-    assert.ok(/"finish_reason":"stop"/.test(raw),
+    // A06/KH-002: releasing accThinking still sets emittedClientPayload, but
+    // the terminal is now the honest error frame, never a synthetic stop.
+    assert.ok(/"error"\s*:/.test(raw),
       'releasing accThinking must set emittedClientPayload so the partial-delivered '
-      + 'branch closes cleanly instead of emitting a raw error object');
-    assert.ok(!/"error"\s*:/.test(raw),
-      'a turn that produced content must not be closed with a raw error frame');
+      + 'branch emits the structured error frame');
+    assert.equal(/"finish_reason":"stop"/.test(raw), false,
+      'an interrupted turn must not be closed as a successful stop');
   });
 });
 

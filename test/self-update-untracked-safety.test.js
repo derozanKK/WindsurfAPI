@@ -51,7 +51,7 @@ it('rollback refuses an untracked path that reset --hard would overwrite, then f
     git(root, ['config', 'commit.gpgsign', 'false']);
 
     const victim = join(root, 'victim.txt');
-    writeFileSync(join(root, '.gitignore'), 'data/self-update-before.json\ndata/self-update-before.pending.json\n');
+    writeFileSync(join(root, '.gitignore'), 'data/self-update-before.json\ndata/self-update-before.pending.json\ndata/self-update-journal.json\n');
     writeFileSync(victim, 'tracked rollback content\n');
     git(root, ['add', '.gitignore', 'victim.txt']);
     git(root, ['commit', '-m', 'before rollback']);
@@ -91,7 +91,12 @@ it('rollback refuses an untracked path that reset --hard would overwrite, then f
     const forcedRes = fakeRes();
     await handleDashboardApi('POST', '/self-update/rollback', { forceReset: true }, { headers: {}, socket: { remoteAddress: '127.0.0.1' } }, forcedRes);
     const forced = forcedRes.json();
-    assert.equal(forced.ok, true, JSON.stringify(forced));
+    // D6: the force reset and stash are applied, but the scheduler declined,
+    // so this is a pending rollback with its retry point intact — not success.
+    assert.equal(forced.ok, false, JSON.stringify(forced));
+    assert.equal(forced.error, 'ERR_RESTART_NOT_SCHEDULED');
+    assert.equal(forced.rollbackPointRetained, true);
+    assert.equal(forced.rolledBackTo, before.slice(0, 7));
     assert.equal(git(root, ['rev-parse', 'HEAD']), before);
     assert.equal(readFileSync(victim, 'utf8'), 'tracked rollback content\n');
     assert.equal(git(root, ['show', 'stash@{0}^3:victim.txt']), 'owner untracked content');
@@ -178,7 +183,11 @@ it('rollback refuses an ignored target collision even with force, without blocki
     const allowedRes = fakeRes();
     await handleDashboardApi('POST', '/self-update/rollback', {}, { headers: {}, socket: { remoteAddress: '127.0.0.1' } }, allowedRes);
     const allowed = allowedRes.json();
-    assert.equal(allowed.ok, true, JSON.stringify(allowed));
+    // D6: the reset is applied but the scheduler declined, so this is not a
+    // successful rollback — it is a pending one with its retry point intact.
+    assert.equal(allowed.ok, false, JSON.stringify(allowed));
+    assert.equal(allowed.error, 'ERR_RESTART_NOT_SCHEDULED');
+    assert.equal(allowed.rolledBackTo, before.slice(0, 7));
     assert.equal(git(root, ['rev-parse', 'HEAD']), before);
     assert.equal(readFileSync(harmless, 'utf8'), 'unrelated ignored runtime data\n');
   } finally {

@@ -157,9 +157,22 @@ describe('source parity — every internal translator discounts the synthetic cl
     });
   }
 
-  it('chat.js only marks the frame on internal routes', () => {
-    // The marker must never reach a direct /v1/chat/completions client: its wire
-    // shape has to stay byte-identical.
+  it('chat.js never fabricates a successful stop for a partial failure', () => {
+    const src = readFileSync(new URL('chat.js', H), 'utf8');
+    const helperStart = src.indexOf('export function finishPartialStreamAfterError');
+    const helperEnd = src.indexOf('export function finishTruncatedStream', helperStart);
+    assert.ok(helperStart >= 0 && helperEnd > helperStart, 'the partial-failure helper must exist');
+    const helper = src.slice(helperStart, helperEnd);
+    assert.doesNotMatch(helper, /finish_reason:\s*'stop'/,
+      'a failure after content must not be closed as a successful stop');
+    assert.doesNotMatch(helper, /\[DONE\]/,
+      'a failed stream must not write the clean-finish sentinel');
+  });
+
+  it('chat.js only marks the truncation terminal on internal routes', () => {
+    // A length terminal for an upstream poll truncation is still fabricated; the
+    // marker must be gated so a direct /v1/chat/completions client sees the
+    // standard `length` shape without the private translator flag.
     const src = readFileSync(new URL('chat.js', H), 'utf8');
     assert.match(src, /internalRoute \? \{ __synthetic_finish: true \} : \{\}/,
       'the marker must be gated on the internal-route flag');

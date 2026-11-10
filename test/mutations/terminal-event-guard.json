@@ -32,7 +32,7 @@
     {
       "name": "SURVIVOR (documented): Gemini writeFrame drops its writableEnded check. Harmless because it is the SECOND of two gates on the same write path and the first now holds: processChunk returns on `finished`, so nothing reaches writeFrame after a terminal event, and writableEnded only differs from `finished` when the socket closed under us — which end() already makes a no-op. Measured: with this mutation applied the suite stays 26/0, i.e. no post-terminal write becomes reachable. It is NOT dead code — it is what stops a write to an aborted socket on the CLIENT-disconnect path, which no fixture here drives. If the processChunk guard is ever removed, this mutation must be re-run: it would then become the only gate.",
       "file": "src/handlers/gemini.js",
-      "anchor": "  writeFrame(obj) {\n    if (this.res.writableEnded) return;",
+      "anchor": "  writeFrame(obj) {\n    if (this.res.writableEnded) return true;",
       "replacement": "  writeFrame(obj) {",
       "expectCaught": false
     },

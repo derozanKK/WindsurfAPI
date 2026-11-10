@@ -1,0 +1,28 @@
+{
+  "tests": [
+    "test/account-entitlement.test.js",
+    "test/userstatus-teams-tier-log.test.js",
+    "test/dashboard-account-requests.test.js"
+  ],
+  "expectBaselinePass": 40,
+  "mutations": [
+    {
+      "name": "historical success unbounded: the snapshot freshness boundary is removed, so a Pro/trial success outlives a downgrade",
+      "file": "src/auth.js",
+      "anchor": "    if ((cap.lastCheck || 0) >= snapshotAt) return true;",
+      "replacement": "    if (true) return true;"
+    },
+    {
+      "name": "refreshed denial preserves the old success: the P2-4 root cause is re-introduced",
+      "file": "src/auth.js",
+      "anchor": "        account.capabilities[key] = { ok: false, lastCheck: Date.now(), reason: 'not_entitled' };",
+      "replacement": "        if (account.capabilities[key]?.reason !== 'success') account.capabilities[key] = { ok: false, lastCheck: Date.now(), reason: 'not_entitled' };"
+    },
+    {
+      "name": "failures share the eviction order again: a failure burst erases the billed window and zeroes its summary",
+      "file": "src/auth.js",
+      "anchor": "    const failedAt = ring.findIndex(r => r.billed === false);\n    if (failedAt !== -1) {\n      ring.splice(failedAt, 1);\n    } else if (isBilled) {\n      ring.splice(0, 1);\n    } else {\n      ring.pop(); // the just-pushed failure: no billed row may be displaced\n    }",
+      "replacement": "    ring.splice(0, 1);"
+    }
+  ]
+}

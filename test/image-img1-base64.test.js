@@ -20,7 +20,7 @@ function shrinkText(text) {
 // Unused network/PDF functions are never called by this image-only harness.
 function compile(text, overrides = {}) {
   const body = text.replace(/^import[^\n]*\n/gm, '')
-    .replace(/^export (?=(?:async )?function )/gm, '');
+    .replace(/^export (?=(?:async )?(?:function|const|let|var|class) )/gm, '');
   const build = new Function('decodePng', 'jpegDecode', 'jpegEncode', 'Buffer', 'bufferConstants', 'process',
     `${body}\nreturn { shrinkPixels, maybeShrinkImage, readImageDimensions, scaleRGBA };`);
   return build(overrides.decodePng ?? decodePng, overrides.jpegDecode ?? jpegDecode,

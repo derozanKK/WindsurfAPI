@@ -29,6 +29,13 @@
 // the base's src/ tree is clean. The resolved identity is printed as one `WIRE_PROVENANCE`
 // line — a comparison whose base cannot be named in the output is not evidence.
 //
+// An intentional wire change is not allowed to weaken the comparison. It must name itself in
+// test/wire-expected-diffs.json: one entry per differing comparison, carrying the issue, the
+// declared message order before/after, the byte length, and a verifier (test/wire-expected-diffs.js)
+// that requires every byte outside the repeated message field to be identical and every message
+// payload to survive modulo its per-message uuid. A diff with no entry fails; an entry that
+// matches no diff fails as stale; an entry that matches more than one fails as ambiguous.
+//
 // WHAT THIS DOES NOT PROVE (2026-09-17 review, protocol lens — do not read this
 // gate as "the wire is correct"):
 //   • it compares the protobuf request body only; not HTTP/Connect framing, not the
@@ -50,10 +57,14 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { test } from 'node:test';
 import { selectBase } from '../scripts/wire-base.mjs';
+import { classifyWireDiff, coordinateKey, loadExpectedDiffs, unusedExpectedDiffs } from './wire-expected-diffs.js';
 import { absentBase, formatProvenance, reportProvenanceFailure, resolveWireProvenance } from './wire-provenance.js';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..');
 const EXPECTED_COMPARISONS = 270;
+// Intentional, issue-scoped differences (currently the #273 call-before-result repair).
+// Anything not named here still fails; every entry must match exactly one comparison.
+const EXPECTED_DIFFS = loadExpectedDiffs();
 
 function findBaseTree() {
   const candidates = [
@@ -163,14 +174,24 @@ test('the default path emits the same complete request bytes as the last release
   const current = await load(ROOT);
   const previous = await load(BASE);
   let compared = 0;
+  let expectedCount = 0;
+  const used = [];
   for (const [index, history] of HISTORIES.entries()) {
     for (const route of ROUTES) {
       for (const native of [false, true]) {
         for (const env of ENVS) {
           const before = build(previous, prepare(previous, history, route), env, native);
           const after = build(current, prepare(current, history, route), env, native);
-          assert.deepEqual(after, before,
-            `fixture=${index} route=${route} native=${native} env=${JSON.stringify(env)}: request bytes changed`);
+          const context = { fixture: index, route, native, env };
+          const label = `${coordinateKey(context)} env=${JSON.stringify(env)}`;
+          const verdict = classifyWireDiff(EXPECTED_DIFFS, context, before, after);
+          if (verdict.kind === 'unexpected' || verdict.kind === 'invalid') {
+            assert.fail(`${label}: ${verdict.problem}`);
+          }
+          if (verdict.kind === 'expected') {
+            expectedCount++;
+            used.push(verdict.entry.id);
+          }
           compared++;
         }
       }
@@ -181,6 +202,13 @@ test('the default path emits the same complete request bytes as the last release
   process.stdout.write('WIRE_PROVENANCE_COMPARED ' + JSON.stringify({
     compared, expected: EXPECTED_COMPARISONS, base_head: PROVENANCE.baseHead ?? null,
   }) + '\n');
+  process.stdout.write('WIRE_EXPECTED_DIFFS ' + JSON.stringify({
+    byte_identical: compared - expectedCount, expected: expectedCount, entries: EXPECTED_DIFFS.length, compared,
+  }) + '\n');
+  // Exact usage in both directions: no stale/extra entry, and no entry waiving more than
+  // the one comparison it documents.
+  assert.deepEqual(unusedExpectedDiffs(EXPECTED_DIFFS, used), [],
+    'test/wire-expected-diffs.json must be used exactly; remove entries the compared release has absorbed');
   // A shrunken matrix must not read as a pass.
   assert.equal(compared, EXPECTED_COMPARISONS, 'the comparison matrix changed size; update the expectation deliberately');
 });

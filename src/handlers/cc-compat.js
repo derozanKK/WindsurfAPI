@@ -50,7 +50,18 @@ export const CC_CONTENT_MARKERS = /Anthropic's official CLI for Claude|Claude Co
 
 // Process-wide counters surfaced in the dashboard diagnostics card. Reset only
 // in tests. Cheap monotonic ints — no per-request allocation.
-const _stats = { schemaNormalized: 0, identityNeutralized: 0 };
+//
+// toolDeferLoadingHonored / toolDeferLoadingIgnored are the CL3 counters for
+// Claude Code 2.1.306 `defer_loading` tools (messages.js). The ignored counter
+// is logged per request under the literal key `tool_defer_loading_ignored`:
+// the upstream has no tool-loading protocol, so a schema-bearing deferred tool
+// is forwarded anyway and that deviation must stay countable.
+const _stats = {
+  schemaNormalized: 0,
+  identityNeutralized: 0,
+  toolDeferLoadingHonored: 0,
+  toolDeferLoadingIgnored: 0,
+};
 
 /**
  * Identify a Claude Code client from request headers. The Claude Code CLI sets a
@@ -151,5 +162,16 @@ function systemText(body) {
 
 export function recordSchemaNormalized() { _stats.schemaNormalized++; }
 export function recordIdentityNeutralized() { _stats.identityNeutralized++; }
+// CL3: one call per request that carried deferred tools, with both buckets so
+// the caller does not have to know which branch ran.
+export function recordToolDeferLoading({ honored = 0, ignored = 0 } = {}) {
+  _stats.toolDeferLoadingHonored += honored;
+  _stats.toolDeferLoadingIgnored += ignored;
+}
 export function getCcCompatStats() { return { ..._stats }; }
-export function resetCcCompatStats() { _stats.schemaNormalized = 0; _stats.identityNeutralized = 0; }
+export function resetCcCompatStats() {
+  _stats.schemaNormalized = 0;
+  _stats.identityNeutralized = 0;
+  _stats.toolDeferLoadingHonored = 0;
+  _stats.toolDeferLoadingIgnored = 0;
+}

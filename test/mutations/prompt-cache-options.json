@@ -2,19 +2,31 @@
   "tests": [
     "test/prompt-cache-options.test.js"
   ],
-  "expectBaselinePass": 12,
+  "expectBaselinePass": 16,
   "mutations": [
     {
       "name": "the switch accepts any truthy-ish value instead of exactly '1' — the Number()/falsy rewrite that silently flipped sibling knobs in #241/#242, here putting an unconfirmed field on the wire for an operator who set the variable to '0' or 'false'",
       "file": "src/devin-connect.js",
-      "anchor": "export function isPromptCacheEnabled(env = process.env) {\n  return String(env.DEVIN_CONNECT_PROMPT_CACHE ?? '').trim() === '1';",
-      "replacement": "export function isPromptCacheEnabled(env = process.env) {\n  return !!String(env.DEVIN_CONNECT_PROMPT_CACHE ?? '').trim();"
+      "anchor": "export function isPromptCacheEnabled(env = process.env, model = '') {\n  const raw = String(env.DEVIN_CONNECT_PROMPT_CACHE ?? '').trim();\n  if (raw) return raw === '1';",
+      "replacement": "export function isPromptCacheEnabled(env = process.env, model = '') {\n  const raw = String(env.DEVIN_CONNECT_PROMPT_CACHE ?? '').trim();\n  if (raw) return !!raw;"
     },
     {
-      "name": "#13 is emitted even when the switch is OFF — an unconfirmed proto coordinate lands on the wire of every operator who never opted in, which is the one failure this default-off design exists to prevent",
+      "name": "#13 is emitted even when the switch is OFF — an unconfirmed proto coordinate lands on the wire of every operator who never opted in on a non-gpt-6 family, which is the failure the default-off design exists to prevent",
       "file": "src/devin-connect.js",
-      "anchor": "export function buildSystemPromptCacheOptions(systemPrompt, env = process.env) {\n  if (!isPromptCacheEnabled(env)) return null;",
-      "replacement": "export function buildSystemPromptCacheOptions(systemPrompt, env = process.env) {\n  if (false) return null;"
+      "anchor": "export function buildSystemPromptCacheOptions(systemPrompt, env = process.env, model = '') {\n  if (!isPromptCacheEnabled(env, model)) return null;",
+      "replacement": "export function buildSystemPromptCacheOptions(systemPrompt, env = process.env, model = '') {\n  if (false) return null;"
+    },
+    {
+      "name": "the gpt-6 family default is dropped — the live 0-cache-read finding is left with no lever, and the measured write-every-round pattern can never be tested against the hint",
+      "file": "src/devin-connect.js",
+      "anchor": "  return GPT6_CACHE_DEFAULT.test(String(model || ''));",
+      "replacement": "  return false;"
+    },
+    {
+      "name": "the family regex matches every model — the hint lands on Claude/Gemini/SWE wires that were deliberately left byte-identical, changing three families to test one",
+      "file": "src/devin-connect.js",
+      "anchor": "const GPT6_CACHE_DEFAULT = /^(?:gpt-6|gpt6)(?:[.-]1)?-(?:luna|sol|astra)(?:-|$)/i;",
+      "replacement": "const GPT6_CACHE_DEFAULT = /.*/;"
     },
     {
       "name": "the too-short-prompt floor is dropped — a cache WRITE is requested for a trivial prompt, and a write costs roughly an order of magnitude more than a read, so the 'optimisation' bills more than it saves",

@@ -65,9 +65,6 @@ import {
 } from './proto.js';
 import { getSystemPrompts } from './runtime-config.js';
 import { isUserJwtEnabled } from './windsurf-api.js';
-function readUrlLegacySummaryFallbackEnabled() {
-  return process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_READ_URL_LEGACY_SUMMARY === '1';
-}
 
 // ─── Enums ─────────────────────────────────────────────────
 
@@ -176,6 +173,7 @@ export function buildRawGetChatMessageRequest(apiKey, messages, modelEnum, model
   // data" upstream. Cascade models are unaffected — they use a different
   // endpoint (SendUserCascadeMessage) with full tool support.
   let systemPrompt = '';
+  let chatMessageCount = 0;
   for (const msg of messages) {
     if (msg.role === 'system') {
       systemPrompt += (systemPrompt ? '\n' : '') +
@@ -219,6 +217,15 @@ export function buildRawGetChatMessageRequest(apiKey, messages, modelEnum, model
     }
 
     parts.push(writeMessageField(2, buildChatMessage(text, source, conversationId)));
+    chatMessageCount++;
+  }
+
+  // RawGetChatMessageRequest requires at least one chat_messages (#2) entry —
+  // the legacy backend rejects an empty list. An all-system (or empty) input
+  // folds everything into system_prompt_override, so keep one empty user turn
+  // in that case.
+  if (chatMessageCount === 0) {
+    parts.push(writeMessageField(2, buildChatMessage('', SOURCE.USER, conversationId)));
   }
 
   // Field 3: system_prompt_override
@@ -271,13 +278,15 @@ export function parseRawResponse(buf) {
  * Field 1: metadata
  * Field 2: ExtensionPanelTab enum (4 = CORTEX)
  */
-// Field numbers verified by extracting the FileDescriptorProto from
-// language_server_linux_x64. Historical layouts are NOT the same — field 2 of
-// InitializeCascadePanelState is reserved; workspace_trusted moved to field 3.
+// Field 2 of InitializeCascadePanelState is reserved. The workspace trust flag
+// moved to field 4 on newer language servers (field 3 on older ones); both
+// numbers are dual-written so either generation reads the value — parsers
+// ignore unknown and reserved field numbers.
 export function buildInitializePanelStateRequest(apiKey, sessionId, trusted = true) {
   return Buffer.concat([
     writeMessageField(1, buildMetadata(apiKey, undefined, sessionId)),
-    writeBoolField(3, trusted), // workspace_trusted
+    writeVarintField(3, trusted ? 1 : 0), // workspace_trusted (older servers)
+    writeVarintField(4, trusted ? 1 : 0), // is_workspace_trusted (newer servers)
   ]);
 }
 
@@ -336,7 +345,7 @@ export function buildStartCascadeRequest(apiKey, sessionId) {
  *          tool X with result Y" into the trajectory before the planner
  *          sees the next user turn. See src/cascade-native-bridge.js.
  */
-export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images, additionalSteps, nativeMode, nativeAllowlist, nativeEnvironment } = {}, userJwt = null) {
+export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images, additionalSteps, nativeMode, nativeAllowlist, nativeEnvironment, maxOutputTokens } = {}, userJwt = null) {
   const parts = [];
 
   // Field 1: cascade_id
@@ -367,6 +376,8 @@ export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnu
     nativeMode: !!nativeMode,
     nativeAllowlist: nativeAllowlist || null,
     nativeEnvironment: nativeEnvironment || '',
+    // V-14: the caller's output cap (field 6). Undefined keeps 32768.
+    maxOutputTokens,
   });
   parts.push(writeMessageField(5, cascadeConfig));
 
@@ -401,7 +412,25 @@ function conflictsWithKimiPreamble(toolPreamble, reinforcement) {
     && /<\s*tool_call\s*>/i.test(reinforcement || '');
 }
 
-function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault, nativeMode, nativeAllowlist, nativeEnvironment } = {}) {
+/**
+ * The largest max_output_tokens the real IDE is observed to send. Asking for more
+ * than the IDE does is unverified, so a larger caller request is clamped rather
+ * than risked.
+ */
+export const CASCADE_MAX_OUTPUT_TOKENS_CEILING = 32768;
+
+/**
+ * V-14: resolve a caller's output cap into the value field 6 carries.
+ * Anything not a positive finite number keeps the historical 32768 default, so a
+ * request that never set `max_tokens` is byte-identical to before.
+ */
+export function normalizeCascadeMaxOutputTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return CASCADE_MAX_OUTPUT_TOKENS_CEILING;
+  return Math.max(1, Math.min(Math.floor(n), CASCADE_MAX_OUTPUT_TOKENS_CEILING));
+}
+
+function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault, nativeMode, nativeAllowlist, nativeEnvironment, maxOutputTokens } = {}) {
   // CascadeConversationalPlannerConfig.planner_mode (field 4) uses
   // codeium_common.ConversationalPlannerMode:
   //   0 UNSPECIFIED  1 DEFAULT  2 READ_ONLY  3 NO_TOOL
@@ -573,6 +602,15 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault, n
     convParts.push(writeMessageField(13, communicationOverride));
   }
 
+  // code_changes_section (field 11) — suppress IDE-specific "apply changes"
+  // boilerplate. The section must ride the conversational planner config:
+  // the same number on the outer planner config is a bool flag
+  // (allow_pending_steps), so a section written there would not decode.
+  if (!toolPreamble) {
+    const emptySection = Buffer.concat([writeVarintField(1, 1), writeStringField(2, '')]);
+    convParts.push(writeMessageField(11, emptySection));
+  }
+
   const conversationalConfig = Buffer.concat(convParts);
   const plannerParts = [
     writeMessageField(2, conversationalConfig),   // conversational = 2
@@ -602,13 +640,12 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault, n
 
   // max_output_tokens (field 6) — real IDE sends 16384/32768.
   // Missing this causes truncated long responses.
-  plannerParts.push(writeVarintField(6, 32768));
-
-  // code_changes_section (field 11) — suppress IDE-specific "apply changes" boilerplate
-  if (!toolPreamble) {
-    const emptySection = Buffer.concat([writeVarintField(1, 1), writeStringField(2, '')]);
-    plannerParts.push(writeMessageField(11, emptySection));
-  }
+  //
+  // V-14: this used to be a hardcoded 32768, so a caller's `max_tokens` never
+  // reached the wire at all. The field IS the wire's only completion control, so
+  // the caller's cap now lands here (clamped to the IDE ceiling, which is the
+  // largest value the upstream is known to accept).
+  plannerParts.push(writeVarintField(6, normalizeCascadeMaxOutputTokens(maxOutputTokens)));
 
   // CascadePlannerConfig.tool_config = field 13 → CascadeToolConfig.
   // Only populated in native bridge mode. The allowlist (field 32) tells
@@ -620,14 +657,18 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault, n
 
   const plannerConfig = Buffer.concat(plannerParts);
 
+  // brain_config (field 7): {enabled=true}. update_strategy (#6) is left
+  // unset (server default) — it carries a nested strategy message, and an
+  // empty placeholder would never encode.
   const brainConfig = Buffer.concat([
-    writeVarintField(1, 1),
-    writeMessageField(6, writeMessageField(6, Buffer.alloc(0))),
+    writeVarintField(1, 1),   // enabled = true
   ]);
 
   // memory_config (field 5): {enabled=false} — prevent LS injecting user's
-  // stored Cascade memories into API responses
-  const memoryConfig = Buffer.concat([writeBoolField(1, false)]);
+  // stored Cascade memories into API responses. enabled is field 2 and is
+  // written explicitly (varint 0): a plain false bool would be omitted and
+  // the whole message dropped, so the flag would never reach the server.
+  const memoryConfig = Buffer.concat([writeVarintField(2, 0)]);
 
   return Buffer.concat([
     writeMessageField(1, plannerConfig),
@@ -932,13 +973,17 @@ export function buildGetGeneratorMetadataRequest(cascadeId, offset = 0) {
  *   uint64 cache_read_tokens = 5;
  * }
  *
- * Returns null if nothing reported; otherwise an aggregated
- * {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, entryCount}
- * summed across every generator invocation (multi-model trajectories sum).
+ * Returns null only when the response carries no records at all; otherwise an
+ * aggregated {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+ * entryCount, hasUsage} summed across every generator invocation (multi-model
+ * trajectories sum). `hasUsage` is false when records came back but none of
+ * them carried a usage block — the counts are then zeros, not evidence that the
+ * turn was free.
  *
  * `entryCount` is the number of generator-metadata records returned by this
  * response. On resumed cascades we use it as the next offset so prior-turn
- * usage is not counted again.
+ * usage is not counted again — which is why it must survive a response whose
+ * records have no usage: the records still consumed window positions.
  */
 export function parseGeneratorMetadata(buf) {
   const fields = parseFields(buf);
@@ -972,16 +1017,20 @@ export function parseGeneratorMetadata(buf) {
       found = true;
     }
   }
-  if (!found) return null;
+  // D5/F6: a record without a usage block still occupies a position in the
+  // metadata window. Returning null here threw that count away, and the caller's
+  // `?.entryCount || 0` then restarted the next window at record 0 — re-summing
+  // every earlier turn's tokens into this turn's usage. The count is reported
+  // either way; `hasUsage` says whether the token figures mean anything.
   return {
     inputTokens,
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
     entryCount: metaEntries.length,
+    hasUsage: found,
   };
 }
-
 // ─── Cascade response parsers ──────────────────────────────
 
 /** Parse StartCascadeResponse → cascade_id (field 1). */
@@ -1046,6 +1095,34 @@ export function parseTrajectorySteps(buf) {
     if (/^file:\/\/\/?(?:[A-Za-z]:[\\/]|\/|~[\\/])/.test(s)) return true;
     if (/^(?:[A-Za-z]:[\\/]|\/|~[\\/]|\.{1,2}[\\/])\S+/.test(s)) return true;
     return /^[A-Za-z0-9._-]+(?:[\\/][A-Za-z0-9._-]+)*\.[A-Za-z0-9]{1,12}$/.test(s);
+  };
+
+  // Classify a #19 child payload as raw text vs a structured message. The
+  // wrapper promotion below uses these so message bytes are never decoded
+  // as file content.
+  const looksLikeMessage = (buf) => {
+    if (!buf?.length) return false;
+    const key = buf[0];
+    const wireType = key & 7;
+    const field = key >> 3;
+    if (!field || ![0, 1, 2, 5].includes(wireType)) return false;
+    try {
+      const parsed = parseFields(buf);
+      return parsed.length > 0 && parsed.every(f => f.field > 0);
+    } catch {
+      return false;
+    }
+  };
+
+  const mostlyText = (buf) => {
+    if (!buf?.length) return false;
+    const s = buf.toString('utf8');
+    let printable = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c === 9 || c === 10 || c === 13 || (c >= 32 && c !== 127)) printable++;
+    }
+    return printable / Math.max(1, s.length) > 0.9;
   };
 
   for (const step of steps) {
@@ -1288,9 +1365,6 @@ export function parseTrajectorySteps(buf) {
           const webDocument = getField(body, 2, 2);
           const hasWebDocument = !!webDocument;
           result = hasWebDocument ? decodeKnowledgeBaseItemText(webDocument.value) : '';
-          if (!result && readUrlLegacySummaryFallbackEnabled()) {
-            result = getField(body, 5, 2)?.value?.toString('utf8') || '';
-          }
           if (!hasWebDocument && !result && readUrlRequestedInteraction) continue;
         } else if (kind === 'search_web') {
           const args = {
@@ -1317,13 +1391,21 @@ export function parseTrajectorySteps(buf) {
       });
     }
 
-    // Newer LS builds sometimes emit a completed read_file/view_file step as
-    // type=14 with the body wrapped on field 19 instead of the historical
-    // oneof field 14. Live traces show wrapper fields [2,3,4], where field 2
-    // carries the file URI/path and field 4 carries the observed content.
-    // Promote that shape to the same cascade-native tool call so native
-    // bridge can return the proposal before the remote workspace executor
-    // reports its follow-up "invalid tool call" error.
+    // Newer LS builds sometimes emit a completed read_file/view_file result on
+    // a type=14 (CortexStepType.USER_INPUT) step with the body wrapped on
+    // field 19 instead of the historical oneof field 14. Live traces show
+    // wrapper fields [2,3,4], where field 2 carries the file URI/path and
+    // field 4 carries the observed content. Promote that shape to the same
+    // cascade-native tool call so native bridge can return the proposal before
+    // the remote workspace executor reports its follow-up "invalid tool call"
+    // error.
+    //
+    // Field 19 is the user_input slot on the declared schema (#1/#2 are
+    // query/user_response strings, #4 an active_user_state message), so the
+    // promotion stays a stop-loss heuristic: require a path-like candidate
+    // and treat #4 as content only when it reads as plain text. Structured
+    // message bytes are never decoded as file content, and a message-shaped
+    // #4 suppresses the promotion instead of emitting a bogus view_file call.
     if (entry.type === 14 && !entry.toolCalls.some(tc => tc.cascade_native && tc.name === 'view_file')) {
       const wrapper = getField(sf, 19, 2);
       if (wrapper) {
@@ -1331,13 +1413,16 @@ export function parseTrajectorySteps(buf) {
           const body = parseFields(wrapper.value);
           const uri = getField(body, 1, 2)?.value?.toString('utf8')
                    || getField(body, 2, 2)?.value?.toString('utf8') || '';
-          if (isLikelyPathOrFileUri(uri)) {
+          const contentField = getField(body, 4, 2);
+          const contentIsText = !contentField
+            || (mostlyText(contentField.value) && !looksLikeMessage(contentField.value));
+          if (isLikelyPathOrFileUri(uri) && contentIsText) {
             const args = { absolute_path_uri: uri, offset: 0, limit: 0, start_line: 0, end_line: 0 };
             entry.toolCalls.push({
               id: `native:view_file:${results.length}`,
               name: 'view_file',
               argumentsJson: JSON.stringify(args),
-              result: getField(body, 4, 2)?.value?.toString('utf8') || '',
+              result: contentField ? contentField.value.toString('utf8') : '',
               cascade_native: true,
             });
           }

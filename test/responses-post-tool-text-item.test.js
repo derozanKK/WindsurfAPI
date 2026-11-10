@@ -22,7 +22,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleResponses } from '../src/handlers/responses.js';
+import { handleResponses, handleGetResponse } from '../src/handlers/responses.js';
 import { handleMessages } from '../src/handlers/messages.js';
 import { resetResponseStore, getResponse } from '../src/response-store.js';
 
@@ -53,6 +53,13 @@ const TEXT_ONLY = [
   chunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
   'data: [DONE]\n\n',
 ];
+
+/** GET /v1/responses/{id} through the real handler. */
+async function getResponseBody(id, callerKey) {
+  const r = handleGetResponse(id, { context: { callerKey } });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  return r.body;
+}
 
 const depsFor = (frames) => ({
   async handleChatCompletions() {
@@ -142,20 +149,33 @@ describe('item 16 — post-tool text gets its own output item', () => {
     assert.equal(itemText(messages[0].item), 'BEFORE AFTER');
   });
 
-  it('stores the whole turn text, not just the last segment', async () => {
-    // The store holds ONE assistant message with a single `content` string, so it
-    // cannot carry text-tool-text order. Dropping "BEFORE " from the next chained
-    // turn's history would be a new defect traded for the one being fixed.
+  it('round-trips the ordered items: text, call, text — not one merged string', async () => {
+    // V-12/KH-009: the store used to keep ONE assistant message whose `content`
+    // was "BEFORE AFTER" with the call appended last, so a chained turn saw an
+    // order the client never received. The turn's ordered items are persisted
+    // now, and GET replays them with the ids the client already has.
     resetResponseStore();
     const KEY = 'api:posttool:user:t';
     const evs = await runResponses(TEXT_TOOL_TEXT);
     const id = evs.find(e => e.data?.response?.id)?.data.response.id;
     assert.ok(id, 'the stream must report a response id');
+
+    // The chained history keeps the order too: text run, then the call.
     const stored = getResponse(id, KEY);
     assert.equal(stored.ok, true, `expected a stored entry, got ${stored.reason}`);
     const assistant = [...stored.messages].reverse().find(m => m?.role === 'assistant');
-    assert.equal(assistant.content, 'BEFORE AFTER');
-    assert.equal(assistant.tool_calls?.length, 1);
+    assert.deepEqual(assistant.__responses_items.map(i => i.type), ['message', 'function_call', 'message']);
+    assert.equal(assistant.__responses_items[0].content[0].text, 'BEFORE ');
+    assert.equal(assistant.__responses_items[2].content[0].text, 'AFTER');
+
+    const got = await getResponseBody(id, KEY);
+    assert.deepEqual(got.output.map(i => i.type), ['message', 'function_call', 'message']);
+    assert.equal(got.output[0].content[0].text, 'BEFORE ');
+    assert.equal(got.output[2].content[0].text, 'AFTER');
+    // Stable identity: the items GET returns are the ones the stream published.
+    const added = itemEvents(evs, 'added').map(a => a.item);
+    assert.deepEqual(got.output.map(i => i.id), added.map(i => i.id));
+    assert.equal(got.output[1].call_id, 'call_1');
   });
 });
 

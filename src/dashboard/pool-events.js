@@ -21,11 +21,13 @@
  */
 
 // Derive the coarse pool-state of one account from its snapshot flags. Order
-// matters: disabled > quota > rate-limit(account) > capacity(model) > active.
+// matters: disabled > banned > reauth > quota > rate-limit(account) > capacity > active.
 // This is the state we diff transitions against.
 export function accountState(a) {
   if (!a) return 'unknown';
-  if (a.status === 'disabled' || a.status === 'banned') return 'disabled';
+  if (a.status === 'disabled') return 'disabled';
+  if (a.status === 'banned') return 'banned';
+  if (a.status === 'reauth') return 'reauth';
   if (a.status === 'error') return 'error';
   if (a.quotaCooled) return 'quota';
   if (a.rateLimited) return 'rate_limited';
@@ -33,12 +35,41 @@ export function accountState(a) {
   return 'active';
 }
 
+/**
+ * Project the raw pool deadlines into the dashboard's cooldown card fields.
+ *
+ * A deadline is active only when `until > now` (strict): a timestamp exactly at
+ * `now` is already over. `cooldownUntil` is null — not 0 — when no account-wide
+ * deadline is in the future, so the UI can distinguish "cooling" from "expired".
+ * Reason precedence: quota > rate_limit > capacity > null.
+ */
+export function cooldownState({ rateLimitedUntil = 0, quotaResetAt = 0, capacityThrottled = false, now = Date.now() } = {}) {
+  const rateUntil = Number.isFinite(rateLimitedUntil) ? rateLimitedUntil : 0;
+  const quotaUntil = Number.isFinite(quotaResetAt) ? quotaResetAt : 0;
+  const rateLimited = rateUntil > now;
+  const quotaCooled = quotaUntil > now;
+  const cooldownUntil = Math.max(rateLimited ? rateUntil : 0, quotaCooled ? quotaUntil : 0) || null;
+  return {
+    rateLimited,
+    quotaCooled,
+    capacityThrottled: !!capacityThrottled,
+    cooldownUntil,
+    cooldownReason: quotaCooled ? 'quota'
+      : rateLimited ? 'rate_limit'
+        : capacityThrottled ? 'capacity'
+          : null,
+    cooldownRemainingMs: cooldownUntil ? cooldownUntil - now : 0,
+  };
+}
+
 // A state transition worth notifying about, with a severity for styling.
 // 'recovered' (→active from a bad state) is informational; the rest warn.
+// `reauth` is error severity, like `banned`: it never self-heals, so a warn
+// toast would promise a recovery that only a new token can deliver.
 export function classifyTransition(from, to) {
   if (from === to) return null;
   if (to === 'active') return { kind: 'recovered', severity: 'success' };
-  const sev = (to === 'disabled' || to === 'quota') ? 'error' : 'warn';
+  const sev = (to === 'disabled' || to === 'quota' || to === 'banned' || to === 'reauth') ? 'error' : 'warn';
   return { kind: to, severity: sev };
 }
 

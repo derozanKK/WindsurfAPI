@@ -1,10 +1,13 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { addAccountByKey, removeAccount } from '../src/auth.js';
-import { cacheClear, cacheKey, cacheSet } from '../src/cache.js';
-import { handleChatCompletions } from '../src/handlers/chat.js';
+import { cacheClear, cacheKey, cacheSet, cacheStats } from '../src/cache.js';
+import { handleChatCompletions, __setConnectDeps, __resetConnectDeps } from '../src/handlers/chat.js';
+import { stopLanguageServerAndWait } from '../src/langserver.js';
 
 const createdAccountIds = [];
+const originalResponseCacheEnabled = process.env.RESPONSE_CACHE_ENABLED;
+const originalDevinConnect = process.env.DEVIN_CONNECT;
 
 function fakeRes() {
   const listeners = new Map();
@@ -40,11 +43,19 @@ function parseChatFrames(raw) {
     });
 }
 
-afterEach(() => {
+afterEach(async () => {
+  // The Cascade test starts a real LS; a surviving child keeps the test runner
+  // alive on hosts that have a language_server binary installed (HMC).
+  await stopLanguageServerAndWait({ perProcessTimeoutMs: 500 }).catch(() => {});
   cacheClear();
+  __resetConnectDeps();
   while (createdAccountIds.length) {
     removeAccount(createdAccountIds.pop());
   }
+  if (originalResponseCacheEnabled === undefined) delete process.env.RESPONSE_CACHE_ENABLED;
+  else process.env.RESPONSE_CACHE_ENABLED = originalResponseCacheEnabled;
+  if (originalDevinConnect === undefined) delete process.env.DEVIN_CONNECT;
+  else process.env.DEVIN_CONNECT = originalDevinConnect;
 });
 
 describe('chat cache-hit stream shape', () => {
@@ -167,5 +178,66 @@ describe('SEC-W2 cross-tenant cache isolation', () => {
     const served = result?.body?.choices?.[0]?.message?.content || '';
     assert.notEqual(served, 'user-A-secret-answer',
       ':client: bucket must not serve a cross-request cached answer by default');
+  });
+});
+
+// PR #142 / RESPONSE_CACHE_ENABLED switch: the key-site half (s1-p1-cache-gate)
+// asserts the chat key sites skip hashing when disabled. This drives the real
+// handler with the switch off and proves the observable contract: duplicate
+// requests both reach upstream and the cache records neither a store nor a hit.
+describe('RESPONSE_CACHE_ENABLED=0', () => {
+  it('sends two identical requests upstream and records no stores or hits', async () => {
+    process.env.RESPONSE_CACHE_ENABLED = '0';
+    process.env.DEVIN_CONNECT = '1';
+
+    const account = addAccountByKey(
+      `devin-session-token$cache-off-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      'cache-off',
+    );
+    createdAccountIds.push(account.id);
+    cacheClear(); // zero the counters after any setup activity
+
+    let upstreamCalls = 0;
+    __setConnectDeps({
+      toChatCompletion: async () => {
+        upstreamCalls++;
+        return {
+          status: 200,
+          body: {
+            id: 'chatcmpl-cache-off',
+            object: 'chat.completion',
+            created: 1,
+            model: 'swe-1-6-slow',
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: `fresh answer ${upstreamCalls}` },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+          },
+        };
+      },
+    });
+
+    const request = {
+      model: 'swe-1-6-slow',
+      messages: [{ role: 'user', content: 'hi' }],
+      __callerKey: 'api:test:user:cache-off',
+    };
+    const first = await handleChatCompletions(request, { callerKey: request.__callerKey });
+    const second = await handleChatCompletions(request, { callerKey: request.__callerKey });
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(upstreamCalls, 2,
+      'both identical requests must reach upstream when the switch is off');
+    assert.notEqual(first.body.choices[0].message.content, second.body.choices[0].message.content,
+      'the second response must be generated, not replayed from a cache slot');
+
+    const stats = cacheStats();
+    assert.equal(stats.enabled, false);
+    assert.equal(stats.stores, 0, 'the disabled cache must never store a response');
+    assert.equal(stats.hits, 0, 'the disabled cache must never serve a hit');
+    assert.equal(stats.size, 0);
   });
 });

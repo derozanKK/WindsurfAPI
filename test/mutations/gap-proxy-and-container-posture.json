@@ -22,14 +22,14 @@
     {
       "name": "G-8: compose silently overrides the container user",
       "file": "docker-compose.yml",
-      "anchor": "    image: ghcr.io/dwgx/windsurf-api:latest",
+      "anchor": "    image: ${WINDSURFAPI_IMAGE:-ghcr.io/dwgx/windsurf-api:latest}",
       "replacement": "    image: ghcr.io/dwgx/windsurf-api:latest\n    user: \"1000:1000\"",
       "expectCaught": true
     },
     {
       "name": "G-8: the host docker socket is mounted by default",
       "file": "docker-compose.yml",
-      "anchor": "    image: ghcr.io/dwgx/windsurf-api:latest",
+      "anchor": "    image: ${WINDSURFAPI_IMAGE:-ghcr.io/dwgx/windsurf-api:latest}",
       "replacement": "    image: ghcr.io/dwgx/windsurf-api:latest\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock",
       "expectCaught": true
     }

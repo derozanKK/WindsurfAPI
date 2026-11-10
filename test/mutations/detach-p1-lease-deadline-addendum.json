@@ -1,0 +1,16 @@
+{
+  "tests": [
+    "test/cascade-turn-snapshot-v2.test.js",
+    "test/detached-registry.test.js",
+    "test/cascade-detach-lazy-resume.test.js"
+  ],
+  "expectBaselinePass": 59,
+  "mutations": [
+    {
+      "name": "M6c lease: resume-deadline path leaks the request lease",
+      "file": "src/handlers/chat.js",
+      "anchor": "            // The claim acquired this request's lease; no producer ran to\n            // release it.\n            endLsUseFn(ls.port);",
+      "replacement": "            // MUTANT: the claim acquired this request's lease and nothing releases it."
+    }
+  ]
+}

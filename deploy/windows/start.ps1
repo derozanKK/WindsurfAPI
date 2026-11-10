@@ -11,7 +11,7 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $Root
 $EnvPath = Join-Path $Root '.env'
 
-# ── 1. 预检 Node ≥ 20 ──────────────────────────────────────
+# ── 1. 预检 Node ≥ 22.13 ───────────────────────────────────
 function Stop-WithError([string]$msg, [string]$hint) {
   Write-Host ''
   Write-Host '============================================================' -ForegroundColor Red
@@ -25,12 +25,12 @@ function Stop-WithError([string]$msg, [string]$hint) {
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
-  Stop-WithError 'Node.js 未安装或不在 PATH。' '请从 https://nodejs.org 安装 Node 20+ 后重试。'
+  Stop-WithError 'Node.js 未安装或不在 PATH。' '请从 https://nodejs.org 安装 Node 22.13+ 后重试。'
 }
 $verRaw = (& node -v) -replace '^v', ''
-$major = [int]($verRaw.Split('.')[0])
-if ($major -lt 20) {
-  Stop-WithError "Node 版本过低(当前 v$verRaw,需 ≥ 20)。" '请升级 Node.js 到 20 或更高。'
+$nodeVer = [version]$verRaw
+if ($nodeVer -lt [version]'22.13.0') {
+  Stop-WithError "Node 版本过低(当前 v$verRaw,需 ≥ 22.13)。" '请升级 Node.js 到 22.13 或更高。'
 }
 
 # ── 2. 强随机密钥(RandomNumberGenerator,非 Get-Random)──────
@@ -98,6 +98,16 @@ if ($generated.Count -gt 0) {
   try {
     $text = ($outLines -join "`r`n") + "`r`n"
     [System.IO.File]::WriteAllText($EnvPath, $text, (New-Object System.Text.UTF8Encoding($false)))
+    # Windows 上 .env 默认继承目录 ACL(Users / Authenticated Users 可读),而它
+    # 存着 API_KEY 与 DASHBOARD_PASSWORD。best-effort 收紧为仅当前用户:失败只
+    # 警告 —— 密钥已经写成功,不能因此让启动失败。
+    $aclUser = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
+    try {
+      & icacls $EnvPath /inheritance:r /grant:r "${aclUser}:(F)" *> $null
+      if ($LASTEXITCODE -ne 0) { Write-Warning "icacls 未能收紧 .env 权限(退出码 $LASTEXITCODE);其他本机用户可能仍可读取。" }
+    } catch {
+      Write-Warning "icacls 未能收紧 .env 权限:$($_.Exception.Message)"
+    }
     Write-Host ".env 已更新(填入 $($generated.Count) 个缺失键)。" -ForegroundColor Green
   } catch {
     Stop-WithError "写入 .env 失败:$($_.Exception.Message)" `

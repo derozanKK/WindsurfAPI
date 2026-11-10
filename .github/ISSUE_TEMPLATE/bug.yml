@@ -111,6 +111,18 @@ body:
         工具/上下文问题优先贴 `Probe[...]`、`ToolRoute[...]`、`BridgeResult[...]` 和附近 stream/error 行。
         Backend logs from dashboard log panel or `pm2 logs windsurf-api`. Redact tokens/API keys.
         For tool/context issues, include `Probe[...]`, `ToolRoute[...]`, `BridgeResult[...]`, and nearby stream/error lines.
+
+        **链路类问题请附 support bundle**：用 `WINDSURFAPI_TRACE=1` 复现一次，然后运行
+        `node scripts/support-bundle.mjs`，把生成的 `support-bundle-<utc>.zip` 拖进来。
+        trace 含 prompt 片段但不含 key；打包前会脱敏文本凭证/邮箱/预签名 URL 和上游请求
+        ClientMetadata 里的 token，无法脱敏的二进制 leg 只记 size+sha256 不打包，再跑仓库的
+        secret scan，命中即拒绝打包。
+        For request-chain issues, reproduce once with `WINDSURFAPI_TRACE=1`, run
+        `node scripts/support-bundle.mjs`, and attach `support-bundle-<utc>.zip`.
+        Trace legs contain prompt fragments but no keys; the bundler redacts text credentials,
+        emails, presigned-URL query credentials and the upstream request's ClientMetadata token,
+        omits binary legs it cannot redact (size+sha256 in the manifest), and refuses to package
+        on any secret-scan hit.
       render: shell
 
   - type: input
@@ -124,10 +136,10 @@ body:
     attributes:
       label: 环境 / Environment
       description: |
-        Node 版本、操作系统、CPU 架构、部署方式、LS binary 来源（WindsurfAPI release / dwgx/windsurf-ls-release public mirror / Windsurf 桌面端 / Exafunction release / 自定义 WINDSURFAPI_LS_RELEASE / 其他）
+        Node 版本、操作系统、CPU 架构、部署方式、LS binary 来源（install-ls.sh 默认固定 3.10.67 / 3.5.17 rollback mirror / 桌面端本地文件 / 自定义 WINDSURFAPI_LS_VERSION 或 WINDSURFAPI_LS_MANIFEST_URL / 其他）
         Node version, OS, CPU arch, deployment mode, and LS binary source.
       placeholder: |
-        Node: v20.x
+        Node: v24.x (supported floor 22.13)
         OS: Ubuntu 22.04
         Arch: x64
-        LS: WINDSURFAPI_LS_RELEASE unset, fallback release ...
+        LS: install-ls.sh default (pinned 3.10.67), WINDSURFAPI_LS_VERSION unset

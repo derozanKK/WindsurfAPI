@@ -46,6 +46,9 @@ function isNoiseLine(arg1) {
 }
 const RE_TOKEN_PREFIX = /^(devin-session-token\$|auth1_|sk-)/i;
 const RE_JWT = /^eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$/;
+// Any absolute URL scheme, not just http(s): the desktop app's sign-in
+// callback is `windsurf://codeium.windsurf?access_token=…` (F4).
+const ABSOLUTE_URL_RE = /^[a-z][a-z0-9+.\-]*:\/\//i;
 function looksLikeToken(arg1) {
   if (!arg1) {
     return false;
@@ -113,7 +116,7 @@ function parseSingleLine(arg1) {
       return trypairResult;
     }
   }
-  if (!/^https?:\/\//i.test(arg1)) {
+  if (!ABSOLUTE_URL_RE.test(arg1)) {
     const searchResult = arg1.search(/[:：=＝]/);
     if (searchResult !== -1) {
       const trypairResult = tryPair(arg1.substring(0, searchResult), arg1.substring(searchResult + 1));
@@ -245,7 +248,7 @@ function parseAccountText(content) {
         continue;
       }
     }
-    if (/^https?:\/\//i.test(trimResult2)) {
+    if (ABSOLUTE_URL_RE.test(trimResult2)) {
       try {
         const inner = unwrapPastedSecret(trimResult2);
         arr5.push({
@@ -296,7 +299,7 @@ function parseAccountText(content) {
     if (matchResult) {
       const trimResult3 = trimResult2.substring(matchResult[0].length).trim();
       if (trimResult3) {
-        if (/^https?:\/\//i.test(trimResult3)) {
+        if (ABSOLUTE_URL_RE.test(trimResult3)) {
           try {
             arr5.push({
               type: "token",
@@ -430,10 +433,14 @@ function parseAccountText(content) {
 // Pull a token out of a show-auth-token / OAuth redirect URL. Bare strings
 // pass through. A URL with no token query/hash throws ERR_NO_TOKEN_IN_INPUT
 // so POST /accounts does not send the whole URL to RegisterUser (#257).
+//
+// Any absolute scheme counts, not just http(s): the desktop app's callback is
+// `windsurf://codeium.windsurf?access_token=…` and it used to be handed to
+// RegisterUser verbatim as an 88-char "token" (F4).
 function unwrapPastedSecret(input) {
   const raw = String(input || '').trim();
   if (!raw) return '';
-  if (!/^https?:\/\//i.test(raw)) return raw;
+  if (!ABSOLUTE_URL_RE.test(raw)) return raw;
   try {
     const u = new URL(raw);
     const pick = (params) => (params.get('access_token') || params.get('token') || params.get('auth_token') || '').trim();

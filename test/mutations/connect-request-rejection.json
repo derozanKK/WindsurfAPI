@@ -1,0 +1,86 @@
+{
+  "tests": [
+    "test/connect-request-rejection.test.js",
+    "test/connect-error-blame.test.js"
+  ],
+  "expectBaselinePass": 36,
+  "mutations": [
+    {
+      "name": "RR-M1: the 'internal error occurred' TEXT arm reclaims an explicit invalid_argument (the reported 503)",
+      "file": "src/devin-connect.js",
+      "anchor": "if (/internal error occurred/i.test(lc) && !isRequestRejectionCode(code)) {",
+      "replacement": "if (/internal error occurred/i.test(lc)) {",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M2: the 4xx-class arm keeps the old UPSTREAM_INTERNAL verdict",
+      "file": "src/devin-connect.js",
+      "anchor": "      code: 'REQUEST_REJECTED',",
+      "replacement": "      code: 'UPSTREAM_INTERNAL',",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M3: drop the capability hint from the client message",
+      "file": "src/devin-connect.js",
+      "anchor": "      message: `${detail} [upstream rejected the request as invalid (${code}): the selected model `\n        + 'may not support this input — e.g. an image on a model whose /v1/models row omits '\n        + 'supports_images — or the message/tool shape is unsupported. Check supports_images in '\n        + 'GET /v1/models and retry with a capable model or request shape]',",
+      "replacement": "      message: detail,",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M4: claim only invalid_argument and let failed_precondition pass through (#273.1 body)",
+      "file": "src/devin-connect.js",
+      "anchor": "const REQUEST_REJECTION_CODES = new Set(['invalid_argument', 'failed_precondition']);",
+      "replacement": "const REQUEST_REJECTION_CODES = new Set(['invalid_argument']);",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M5: re-admit a permanent rejection to the in-process retry loop",
+      "file": "src/devin-connect.js",
+      "anchor": "if (err.code === 'UPSTREAM_INTERNAL' || err.code === 'REQUEST_REJECTED') return false;",
+      "replacement": "if (err.code === 'UPSTREAM_INTERNAL') return false;",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M6: map the rejection back to the reported 503 UPSTREAM_INTERNAL surface",
+      "file": "src/handlers/chat.js",
+      "anchor": "case 'REQUEST_REJECTED': return { status: 400, type: 'invalid_request_error' };",
+      "replacement": "case 'REQUEST_REJECTED': return { status: 503, type: 'upstream_transient_error' };",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M7: charge the account's error budget for a request rejection",
+      "file": "src/handlers/chat.js",
+      "anchor": "else if (err.code === 'REQUEST_REJECTED') { bumpConnect('request_rejected'); }",
+      "replacement": "else if (err.code === 'REQUEST_REJECTED') { reportError(apiKey, { selector }); bumpConnect('request_rejected'); }",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M8: stream the rejection as a retryable upstream_error",
+      "file": "src/handlers/chat.js",
+      "anchor": "                  : (r.err.code === 'REQUEST_REJECTED' ? 'invalid_request_error' : 'upstream_error'));",
+      "replacement": "                  : 'upstream_error');",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M9: lose the rejection counter (silent in the connect metrics)",
+      "file": "src/devin-connect-metrics.js",
+      "anchor": "  request_rejected: 0,\n",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M10: the 401/403 shell outranks the explicit validator code again (P2-5)",
+      "file": "src/devin-connect.js",
+      "anchor": "  if (isRequestRejectionCode(code)) {",
+      "replacement": "  if (isRequestRejectionCode(code) && status !== 401 && status !== 403) {",
+      "expectCaught": true
+    },
+    {
+      "name": "RR-M11: a bare 401/403 stops being UNAUTHORIZED (P2-5 control)",
+      "file": "src/devin-connect.js",
+      "anchor": "  if (status === 401 || status === 403 || /permission_denied|unauthenticated|invalid.*token/i.test(lc)",
+      "replacement": "  if (/permission_denied|unauthenticated|invalid.*token/i.test(lc)",
+      "expectCaught": true
+    }
+  ]
+}

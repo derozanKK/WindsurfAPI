@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:24-bookworm-slim
 
 ARG BUILD_VERSION=""
 ARG BUILD_COMMIT=""
@@ -21,7 +21,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash curl ca-certificates procps \
+    && apt-get install -y --no-install-recommends bash curl ca-certificates procps gzip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json ./
@@ -30,7 +30,7 @@ COPY scripts/native-bridge-smoke.mjs ./scripts/native-bridge-smoke.mjs
 COPY scripts/special-agent-smoke.mjs ./scripts/special-agent-smoke.mjs
 COPY scripts/lsp-capacity-matrix.mjs ./scripts/lsp-capacity-matrix.mjs
 COPY scripts/web-search-direct-probe.mjs ./scripts/web-search-direct-probe.mjs
-COPY install-ls.sh setup.sh .env.example ./
+COPY install-ls.sh setup.sh .env.example ls-pins.json ./
 
 RUN sed -i 's/\r$//' install-ls.sh setup.sh \
     && chmod +x install-ls.sh setup.sh \

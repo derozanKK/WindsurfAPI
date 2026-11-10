@@ -20,13 +20,13 @@
     {
       "name": "non-stream site stops using the shared helper — the two parse sites can diverge again",
       "file": "src/handlers/gemini.js",
-      "anchor": "      const args = parseToolArgs(tc.function?.arguments, tc.function?.name);",
+      "anchor": "      const args = parseToolArgs(tc.function?.arguments, name);",
       "replacement": "      let args = {}; try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}"
     },
     {
       "name": "stream site stops using the shared helper — flushToolCalls regresses independently",
       "file": "src/handlers/gemini.js",
-      "anchor": "      const args = parseToolArgs(buf.argsBuffered, buf.name);",
+      "anchor": "      const args = parseToolArgs(buf.argsBuffered, name);",
       "replacement": "      let args = {}; try { args = JSON.parse(buf.argsBuffered || '{}'); } catch {}"
     },
     {

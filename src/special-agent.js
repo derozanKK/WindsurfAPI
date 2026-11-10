@@ -35,6 +35,7 @@ import { runDevinAcpProcess, probeDevinCliAvailable, acpVisionEnabled } from './
 import { extractInlineImages as extractImagesFromContent } from './devin-connect.js';
 import { systemFingerprint } from './system-fingerprint.js';
 import { getBackendSwitch, strictUsageTotal } from './runtime-config.js';
+import { toClientToolCallId } from './tool-ids.js';
 
 const SPECIAL_BACKEND = 'special_agent';
 const DEFAULT_SPECIAL_MODELS = new Set([
@@ -271,11 +272,11 @@ function pickUsage(rawUsage, messages, completionText) {
 // cline-01: never report finish_reason:'tool_calls' unless tool_calls were
 // actually emitted. Cline's @ai-sdk client treats a 'tool_calls' finish with no
 // tool_calls array as a broken response and retries to death (cline#9622). The
-// ACP/print runners in this file are TEXT-ONLY (chatCompletionBody /
-// streamFromText never populate message.tool_calls), so a tool-ish upstream
-// stop_reason here must degrade to 'stop', not lie about a tool call that was
-// never sent. hasToolCalls defaults false so every existing text-only call site
-// is corrected; a future tool-capable ACP path passes true to keep 'tool_calls'.
+// print runner is TEXT-ONLY, so a tool-ish stop_reason from it must degrade to
+// 'stop', not lie about a tool call that was never sent. The ACP runner now
+// forwards captured tool_call/tool_call_update notifications and refuses a
+// tool-ish stop with no mappable call (backend_tool_call_unmapped), so its
+// call sites pass hasToolCalls=true exactly when tool_calls are present.
 // The content_filter test is deliberately NARROW. A bare `includes('content')`
 // classified any reason with the substring "content" as a refusal, and the words
 // upstreams actually use for a NORMAL completion contain it: `content_complete`,
@@ -525,9 +526,31 @@ export async function runDevinPrint(prompt, { modelKey = '', apiKey = '', signal
   }
 }
 
-function chatCompletionBody({ id, created, model, messages, text, reasoning = '', usage = null, stopReason = null }) {
+// Project the ACP runner's protocol-neutral tool calls into OpenAI's
+// assistant.tool_calls shape. The runner already refused a tool-ish stop that
+// has no mappable call, so every entry here has an id and a name. `input` is
+// the agent's rawInput; {} means the agent announced no arguments (never a
+// synthesized result — the tool's output stays out of the egress).
+function openAiToolCalls(toolCalls) {
+  if (!Array.isArray(toolCalls) || !toolCalls.length) return null;
+  return toolCalls.map((tc, index) => ({
+    // ACP's toolCallId is the CLI's own dialect (the raw id still keys the
+    // tool_call/tool_call_update notifications inside the pump). The client
+    // only ever sees the OpenAI `call_<opaque>` shape.
+    id: toClientToolCallId(tc.id, `call_${index}_${Date.now().toString(36)}`),
+    type: 'function',
+    function: {
+      name: tc.name,
+      arguments: JSON.stringify(tc.input ?? {}),
+    },
+  }));
+}
+
+function chatCompletionBody({ id, created, model, messages, text, reasoning = '', usage = null, stopReason = null, toolCalls = null }) {
+  const calls = openAiToolCalls(toolCalls);
   const message = { role: 'assistant', content: text || null };
   if (reasoning) message.reasoning_content = reasoning;
+  if (calls) message.tool_calls = calls;
   return {
     id,
     object: 'chat.completion',
@@ -538,7 +561,7 @@ function chatCompletionBody({ id, created, model, messages, text, reasoning = ''
     choices: [{
       index: 0,
       message,
-      finish_reason: mapFinishReason(stopReason),
+      finish_reason: mapFinishReason(stopReason, !!calls),
     }],
     usage: pickUsage(usage, messages, text),
   };
@@ -682,9 +705,21 @@ function streamLiveAcp({ id, created, model, messages, prompt, modelKey, acct, r
           send({ id, object: 'chat.completion.chunk', created, model,
             choices: [{ index: 0, delta: { content: safe }, finish_reason: null }] });
         }
+        // Forward the turn's tool calls before the terminal chunk. They are
+        // emitted as one complete delta per call (id/name/arguments together):
+        // ACP's tool_call_update can replace rawInput, so buffering to the end
+        // is the only lossless framing. No tool result is emitted — the client
+        // never produced one.
+        const calls = openAiToolCalls(result?.toolCalls);
+        if (calls) {
+          send({ id, object: 'chat.completion.chunk', created, model,
+            choices: [{ index: 0, delta: {
+              tool_calls: calls.map((tc, index) => ({ index, ...tc })),
+            }, finish_reason: null }] });
+        }
         // H7: map the ACP stop_reason instead of hardcoding 'stop'.
         send({ id, object: 'chat.completion.chunk', created, model,
-          choices: [{ index: 0, delta: {}, finish_reason: mapFinishReason(result?.stopReason) }] });
+          choices: [{ index: 0, delta: {}, finish_reason: mapFinishReason(result?.stopReason, !!calls) }] });
         // H3: bill real ACP usage when the runner reported it; estimate otherwise.
         // O1: only forward the usage frame when the caller opted in.
         if (includeUsage) {
@@ -754,6 +789,13 @@ function reportRunFailure(apiKey, err, deps = {}) {
   }
   // A client abort (499 request_aborted) is also not an upstream/account fault.
   if (status === 499 || type === 'request_aborted') {
+    return;
+  }
+  // An ACP turn whose tool_use stop has no forwardable tool call is a
+  // protocol/CLI-shape fault (the agent contradicted its own notification
+  // stream), not an account fault. Feeding the error streak would disable a
+  // healthy credential over a CLI-version mismatch.
+  if (type === 'backend_tool_call_unmapped') {
     return;
   }
   // Account-level ban/suspension shapes — promote to banned after 2 hits.
@@ -916,8 +958,9 @@ export async function handleSpecialAgentChatCompletion(body, route, deps = {}) {
     // (null on print runners → pickUsage/mapFinishReason fall back gracefully).
     const usage = result?.usage || null;
     const stopReason = result?.stopReason || null;
+    const toolCalls = result?.toolCalls || null;
     if (body?.stream) return streamFromText({ id, created, model, messages, text, reasoning, usage, stopReason, includeUsage });
-    return { status: 200, body: chatCompletionBody({ id, created, model, messages, text, reasoning, usage, stopReason }) };
+    return { status: 200, body: chatCompletionBody({ id, created, model, messages, text, reasoning, usage, stopReason, toolCalls }) };
   } catch (err) {
     const status = err?.status || 502;
     const type = err?.type || 'backend_error';

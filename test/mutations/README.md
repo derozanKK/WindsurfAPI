@@ -34,7 +34,10 @@ keeping (see AUDIT-LEDGER round 8 on the `WAITABLE` allowlist).
   person who wrote it down;
 - **the baseline is not green, or does not match `expectBaselinePass`** — a `SURVIVED`
   verdict is meaningless if the suite was not running. Round 3 collected four false
-  `SURVIVED` results from a suite that never executed;
+  `SURVIVED` results from a suite that never executed. A baseline that node CANCELLED is
+  reported as **truncated**, not as a failing suite: on node 22 a legitimate run reported
+  `pass=99 fail=0 cancelled=95` when the event loop drained before the rest of the suite
+  ran, and calling that red sent the reader after assertions that never executed;
 - **an anchor does not match exactly once** — a non-matching `replace()` is a silent no-op
   that reports `SURVIVED` while nothing was ever mutated.
 

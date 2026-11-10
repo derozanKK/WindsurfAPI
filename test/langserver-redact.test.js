@@ -79,6 +79,39 @@ describe('buildLanguageServerEnv', () => {
     assert.equal(env.SSL_CERT_FILE, '/etc/ssl/certs/ca-bundle.crt');
     assert.equal(env.NODE_EXTRA_CA_CERTS, '/etc/ssl/extra.pem');
   });
+
+  it('forwards APPDATA on Windows so the LS can resolve its config directory', () => {
+    const env = buildLanguageServerEnv(
+      { HOME: 'C:\\Users\\dev', APPDATA: 'C:\\Users\\dev\\AppData\\Roaming' },
+      { platform: 'win32' }
+    );
+    assert.equal(env.APPDATA, 'C:\\Users\\dev\\AppData\\Roaming');
+  });
+
+  it('keeps APPDATA out of the child env on non-Windows platforms', () => {
+    const env = buildLanguageServerEnv(
+      { HOME: '/home/dev', APPDATA: 'C:\\Users\\dev\\AppData\\Roaming' },
+      { platform: 'linux' }
+    );
+    assert.ok(!('APPDATA' in env));
+  });
+
+  it('does not widen the Windows allowlist beyond APPDATA', () => {
+    const env = buildLanguageServerEnv(
+      {
+        APPDATA: 'C:\\Users\\dev\\AppData\\Roaming',
+        LOCALAPPDATA: 'C:\\Users\\dev\\AppData\\Local',
+        USERPROFILE: 'C:\\Users\\dev',
+        SystemRoot: 'C:\\Windows',
+        AWS_SECRET_ACCESS_KEY: 'leak-me',
+      },
+      { platform: 'win32' }
+    );
+    assert.equal(env.APPDATA, 'C:\\Users\\dev\\AppData\\Roaming');
+    for (const key of ['LOCALAPPDATA', 'USERPROFILE', 'SystemRoot', 'AWS_SECRET_ACCESS_KEY']) {
+      assert.ok(!(key in env), `${key} was forwarded to the LS child env`);
+    }
+  });
 });
 
 describe('probeLanguageServerPort', () => {

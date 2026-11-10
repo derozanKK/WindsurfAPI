@@ -14,6 +14,15 @@ describe('Cascade text conversion safety', () => {
     assert.ok(!text.includes(imageData));
   });
 
+  it('rewrites a short Claude Code identity at the start of a sentence (#41)', () => {
+    const input = "You are Claude Code, Anthropic's official CLI tool for Claude.\nWorking directory: /repo\nAnother sentence. You are an agent. mid-sentence you are stays.";
+    const out = compactSystemPromptForCascade(input);
+    assert.match(out, /^The assistant is Claude Code, Anthropic's official CLI tool for Claude\./);
+    assert.match(out, /Another sentence\. The assistant is an agent\./, 'sentence-initial identity after a period is rewritten');
+    assert.match(out, /mid-sentence you are stays\./, 'lowercase mid-sentence text is not rewritten');
+    assert.doesNotMatch(out, /(^|[\n.!?]\s*)You are /, 'no sentence-initial second-person identity survives');
+  });
+
   it('compacts Claude Code system prompts before they ride in Cascade user text', () => {
     const systemPrompt = [
       'x-anthropic-billing-header: cc_version=2.1.119; cc_entrypoint=cli;',

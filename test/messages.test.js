@@ -81,9 +81,9 @@ describe('Anthropic messages request translation', () => {
     assert.equal(result.body.content[0].type, 'thinking');
     assert.equal(result.body.content[0].thinking, 'plan');
     // When the upstream supplies no real reasoning_signature, the `signature` key
-    // is omitted entirely. Strict clients (e.g. Grok Build's messages backend)
-    // reject an empty-string placeholder as invalid.
-    assert.equal(result.body.content[0].signature, undefined);
+    // is still present as "". Strict clients (e.g. Grok Build's messages backend)
+    // fail with "missing field `signature`" when the key is omitted.
+    assert.equal(result.body.content[0].signature, '');
     assert.equal(result.body.content[1].type, 'text');
     assert.equal(result.body.content[1].text, 'done');
   });
@@ -441,9 +441,12 @@ describe('Anthropic messages request translation', () => {
     assert.equal(capturedBody.tools, undefined);
   });
 
-  it('drops a forced server-side tool_choice when the matching tool was stripped', async () => {
+  it('rejects a forced server-side tool_choice instead of silently dropping the choice', async () => {
+    // A07/KH-003: dropping the choice left the model free to answer as if the
+    // caller had not forced `advisor` at all. The proxy cannot execute that
+    // tool, so the only honest outcome is a 400 before any upstream call.
     let capturedBody = null;
-    await handleMessages({
+    const result = await handleMessages({
       model: 'claude-sonnet-4.6',
       tools: [
         { type: 'advisor_20260301', name: 'advisor', model: 'claude-opus-4-6' },
@@ -463,9 +466,11 @@ describe('Anthropic messages request translation', () => {
         };
       },
     });
-    assert.equal(capturedBody.tools.length, 1);
-    assert.equal(capturedBody.tools[0].function.name, 'Read');
-    assert.equal(capturedBody.tool_choice, undefined);
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.type, 'invalid_request_error');
+    assert.equal(result.body.error.param, 'tool_choice');
+    assert.equal(result.body.error.code, 'unsupported_server_side_tool');
+    assert.equal(capturedBody, null, 'the rejected request must not reach the upstream');
   });
 
   it('streams tail tool_use without a preceding thinking block when reasoning hid the tool call', async () => {
@@ -890,8 +895,8 @@ describe('Anthropic messages request translation', () => {
   // Anthropic thinking-block sequence: content_block_start(thinking) →
   // thinking_delta* → [signature_delta] → content_block_stop. The proxy only
   // emits a signature_delta when the upstream supplied a real reasoning_signature;
-  // otherwise the signature key is omitted so strict clients (e.g. Grok Build's
-  // messages backend) don't fail on an empty-string placeholder.
+  // the content_block_start always carries `signature: ""` so strict clients
+  // (e.g. Grok Build's messages backend) that require the key still parse it.
   it('does not emit a signature_delta for a streamed thinking block without a real signature', async () => {
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
@@ -922,6 +927,7 @@ describe('Anthropic messages request translation', () => {
     const thinkingStart = events.find(e => e.event === 'content_block_start' && e.data.content_block?.type === 'thinking');
     assert.ok(thinkingStart, 'a thinking content_block_start was emitted');
     const thinkingIdx = thinkingStart.data.index;
+    assert.equal(thinkingStart.data.content_block.signature, '', 'thinking start carries signature key');
 
     const sigDeltas = events.filter(e => e.event === 'content_block_delta' && e.data.delta?.type === 'signature_delta');
     assert.equal(sigDeltas.length, 0, 'no signature_delta emitted without a real signature');
@@ -1111,7 +1117,14 @@ describe('Anthropic messages request translation', () => {
       'user content must not carry the JSON-only instruction into the next turn');
   });
 
-  it('projects final JSON onto requested keys using tool results when the model drifts', () => {
+  it('does not invent values when the model drifts off the requested key set', () => {
+    // V-10/KH-013: this used to return
+    //   {"readVersion":"2.0.11","bashVersion":"2.0.11","versionsMatch":true}
+    // — readVersion/bashVersion lifted out of the tool results by key-name
+    // matching and versionsMatch computed by the proxy. None of it was in the
+    // model's answer, so a caller reading `versionsMatch:true` could not tell a
+    // fabricated fact from a measured one. The projection now only carries
+    // values the model itself emitted; a gap stays a gap.
     const messages = [
       { role: 'user', content: 'After both tool results, answer only compact JSON with exact keys readVersion, bashVersion, versionsMatch and no other keys.' },
       { role: 'assistant', content: null, tool_calls: [
@@ -1119,15 +1132,15 @@ describe('Anthropic messages request translation', () => {
       ] },
       { role: 'tool', tool_call_id: 'call_read', content: '{"name":"windsurf-api","version":"2.0.11"}' },
       { role: 'assistant', content: null, tool_calls: [
-        { id: 'call_bash', type: 'function', function: { name: 'Bash', arguments: '{"command":"node -p \\"require(\\\'./package.json\\\').version\\""}' } },
+        { id: 'call_bash', type: 'function', function: { name: 'Bash', arguments: '{"command":"node -p version"}' } },
       ] },
       { role: 'tool', tool_call_id: 'call_bash', content: '2.0.11' },
     ];
 
-    assert.equal(
-      stabilizeJsonPayload('{"name":"windsurf-api","version":"2.0.11"}', messages),
-      '{"readVersion":"2.0.11","bashVersion":"2.0.11","versionsMatch":true}',
-    );
+    const projected = stabilizeJsonPayload('{"name":"windsurf-api","version":"2.0.11"}', messages);
+    assert.equal(projected, '{"name":"windsurf-api","version":"2.0.11"}',
+      'with nothing projectable the model payload is the honest answer');
+    assert.doesNotMatch(projected, /versionsMatch|readVersion|bashVersion/);
   });
 
   // Batch 2 — multimodal / document input (GATE A2, A3, B2)

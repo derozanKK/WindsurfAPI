@@ -1,6 +1,8 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleResponses, responsesToChat, chatToResponse } from '../src/handlers/responses.js';
+import { handleResponses, responsesToChat, chatToResponse, handleGetResponse } from '../src/handlers/responses.js';
+import { handleChatCompletions, __setConnectDeps, __resetConnectDeps } from '../src/handlers/chat.js';
+import { resetResponseStore } from '../src/response-store.js';
 
 function chatChunk(chunk) {
   return `data: ${JSON.stringify(chunk)}\n\n`;
@@ -455,13 +457,12 @@ describe('chatToResponse', () => {
     assert.deepEqual(response.incomplete_details, { reason: 'max_output_tokens' });
   });
 
-  it('preserves flattened metadata for custom, web_search, and namespace tools', async () => {
+  it('preserves flattened metadata for custom and namespace tools', async () => {
     const result = await handleResponses({
       model: 'claude-sonnet-4.6',
       input: 'Use native tools',
       tools: [
         { type: 'custom', name: 'runner', description: 'Run shell' },
-        { type: 'web_search', description: 'Search the web' },
         {
           type: 'namespace',
           name: 'mcp__desktop_commander',
@@ -473,8 +474,7 @@ describe('chatToResponse', () => {
     }, {
       async handleChatCompletions(body) {
         assert.equal(body.tools[0].function.name, 'runner');
-        assert.equal(body.tools[1].function.name, 'web_search');
-        assert.equal(body.tools[2].function.name, 'mcp__desktop_commander__read_file');
+        assert.equal(body.tools[1].function.name, 'mcp__desktop_commander__read_file');
         return {
           status: 200,
           body: {
@@ -487,7 +487,6 @@ describe('chatToResponse', () => {
                 content: null,
                 tool_calls: [
                   { id: 'call_custom', type: 'function', function: { name: 'runner', arguments: '{"input":"echo hi"}' } },
-                  { id: 'call_search', type: 'function', function: { name: 'web_search', arguments: '{"query":"codex"}' } },
                   { id: 'call_ns', type: 'function', function: { name: 'mcp__desktop_commander__read_file', arguments: '{"path":"README.md"}' } },
                 ],
               },
@@ -502,11 +501,560 @@ describe('chatToResponse', () => {
     assert.equal(response.output[0].type, 'custom_tool_call');
     assert.equal(response.output[0].name, 'runner');
     assert.equal(response.output[0].input, 'echo hi');
-    assert.equal(response.output[1].type, 'web_search_call');
-    assert.equal(response.output[1].action.query, 'codex');
-    assert.equal(response.output[2].type, 'function_call');
-    assert.equal(response.output[2].name, 'read_file');
-    assert.equal(response.output[2].namespace, 'mcp__desktop_commander');
+    assert.equal(response.output[1].type, 'function_call');
+    assert.equal(response.output[1].name, 'read_file');
+    assert.equal(response.output[1].namespace, 'mcp__desktop_commander');
+  });
+
+  it('rejects hosted web_search (both stream modes) instead of reporting an unexecuted search as completed', async () => {
+    // The reviewer's counterexample: no executor runs, yet the response used to
+    // carry web_search_call.status=completed (and a completed terminal). There is
+    // no dispatch loop on this route, so the request must fail up front with an
+    // actionable error — never reach the model at all.
+    for (const type of ['web_search', 'web_search_preview']) {
+      for (const stream of [false, true]) {
+        let modelCalled = false;
+        const result = await handleResponses({
+          model: 'claude-sonnet-4.6',
+          input: 'search',
+          stream,
+          tools: [{ type, description: 'Search the web' }],
+        }, {
+          async handleChatCompletions() {
+            modelCalled = true;
+            throw new Error('must not call the model for an unsupported hosted tool');
+          },
+        });
+        assert.equal(result.status, 400, `${type} stream=${stream}`);
+        assert.equal(result.stream, undefined, 'a rejected request never opens an SSE stream');
+        assert.equal(result.body.error.type, 'invalid_request_error');
+        assert.equal(result.body.error.param, 'tools');
+        assert.equal(result.body.error.code, 'unsupported_hosted_tool');
+        assert.match(result.body.error.message, /does not execute server-side searches/);
+        assert.equal(modelCalled, false, 'no credits are spent on a turn the proxy cannot serve truthfully');
+      }
+    }
+  });
+
+  it('rejects a hosted-search tool_choice even when no tool declaration is present', async () => {
+    const result = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'search',
+      tool_choice: { type: 'web_search' },
+    }, {
+      async handleChatCompletions() {
+        throw new Error('must not call the model');
+      },
+    });
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.param, 'tool_choice');
+    assert.equal(result.body.error.code, 'unsupported_hosted_tool');
+  });
+
+  it('rejects hosted search hidden in additional_tools or a namespace', async () => {
+    const cases = [
+      {
+        body: {
+          input: [
+            { type: 'additional_tools', tools: [{ type: 'web_search_preview' }] },
+            { type: 'message', role: 'user', content: 'search' },
+          ],
+        },
+        param: 'input',
+      },
+      {
+        body: {
+          input: 'search',
+          tools: [{ type: 'namespace', name: 'web', tools: [{ type: 'web_search' }] }],
+        },
+        param: 'tools',
+      },
+    ];
+    for (const { body, param } of cases) {
+      let modelCalled = false;
+      const result = await handleResponses({ model: 'claude-sonnet-4.6', ...body }, {
+        async handleChatCompletions() {
+          modelCalled = true;
+          throw new Error('must not call the model');
+        },
+      });
+      assert.equal(result.status, 400);
+      assert.equal(result.body.error.code, 'unsupported_hosted_tool');
+      assert.equal(result.body.error.param, param);
+      assert.equal(modelCalled, false);
+    }
+  });
+
+  it('rejects_versioned_hosted_search_before_model_dispatch', async () => {
+    // OpenAI ships dated snapshots of the same hosted tool next to the
+    // unversioned aliases. They ask THIS SERVER to execute the search just the
+    // same, so every position that can carry a tool declaration must refuse
+    // them before the model runs — an exact-match set used to let them through
+    // and flattenResponseTool then dropped them silently.
+    const versionedTypes = ['web_search_preview_2025_03_11', 'web_search_2025_08_26'];
+    for (const type of versionedTypes) {
+      const cases = [
+        {
+          position: 'top-level tools',
+          body: { tools: [{ type, description: 'Search the web' }] },
+          param: 'tools',
+        },
+        {
+          position: 'additional_tools',
+          body: {
+            input: [
+              { type: 'additional_tools', tools: [{ type }] },
+              { type: 'message', role: 'user', content: 'search' },
+            ],
+          },
+          param: 'input',
+        },
+        {
+          position: 'namespace child',
+          body: { tools: [{ type: 'namespace', name: 'web', tools: [{ type }] }] },
+          param: 'tools',
+        },
+        {
+          position: 'tool_choice',
+          body: { tool_choice: { type } },
+          param: 'tool_choice',
+        },
+      ];
+      for (const stream of [false, true]) {
+        for (const { position, body, param } of cases) {
+          let modelCalled = false;
+          const result = await handleResponses({ model: 'claude-sonnet-4.6', input: 'search', stream, ...body }, {
+            async handleChatCompletions() {
+              modelCalled = true;
+              throw new Error('must not call the model for a versioned hosted tool');
+            },
+          });
+          assert.equal(result.status, 400, `${type} in ${position} stream=${stream}`);
+          assert.equal(result.stream, undefined, 'a rejected request never opens an SSE stream');
+          assert.equal(result.body.error.type, 'invalid_request_error');
+          assert.equal(result.body.error.code, 'unsupported_hosted_tool');
+          assert.equal(result.body.error.param, param, `${type} in ${position}`);
+          assert.match(result.body.error.message, /does not execute server-side searches/);
+          assert.equal(modelCalled, false, 'no model turn runs for a hosted search this proxy cannot execute');
+        }
+      }
+    }
+  });
+
+  it('keeps a client-declared function tool named web_search as a normal function_call', async () => {
+    // The reviewer's control: an ordinary client function keeps the original
+    // semantics. Only the HOSTED tool type is rejected.
+    const result = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'search',
+      tools: [{
+        type: 'function',
+        name: 'web_search',
+        description: 'Client-run search',
+        parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+      }],
+    }, {
+      async handleChatCompletions(body) {
+        assert.equal(body.tools[0].function.name, 'web_search');
+        return {
+          status: 200,
+          body: {
+            created: 123,
+            model: body.model,
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  { id: 'call_search', type: 'function', function: { name: 'web_search', arguments: '{"query":"codex"}' } },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            }],
+          },
+        };
+      },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.output[0].type, 'function_call');
+    assert.equal(result.body.output[0].name, 'web_search');
+    assert.equal(result.body.output[0].call_id, 'call_search');
+    assert.equal(result.body.output[0].arguments, '{"query":"codex"}');
+    assert.ok(result.body.output.every(item => item.type !== 'web_search_call'));
+  });
+
+  it('rejects every server-executed tool type instead of dropping it silently', async () => {
+    // ReviewConnectRouter P2-1: a client that declared a server-executed tool got
+    // a perfectly normal answer with the tool gone. `file_search` /
+    // `computer_use_preview` / `mcp` were dropped without a trace and every other
+    // hosted type fell through the catch-all (`log.warn` + `return []`). This is
+    // the same silent non-execution the hosted-search gate removes, minus the
+    // fake receipt: the request must fail before dispatch, in every position a
+    // tool declaration can hide in.
+    const serverSideTypes = [
+      'file_search',
+      'computer_use_preview',
+      'mcp',
+      'code_interpreter',
+      'image_generation',
+      'local_shell',
+      'shell',
+      'apply_patch',
+    ];
+    const cases = [
+      {
+        position: 'top-level tools',
+        param: 'tools',
+        bodyFor: type => ({ tools: [{ type }] }),
+      },
+      {
+        position: 'additional_tools',
+        param: 'input',
+        bodyFor: type => ({
+          input: [
+            { type: 'additional_tools', tools: [{ type }] },
+            { type: 'message', role: 'user', content: 'run it' },
+          ],
+        }),
+      },
+      {
+        position: 'namespace child',
+        param: 'tools',
+        bodyFor: type => ({ tools: [{ type: 'namespace', name: 'hosted', tools: [{ type }] }] }),
+      },
+      {
+        position: 'tool_choice',
+        param: 'tool_choice',
+        bodyFor: type => ({ tool_choice: { type } }),
+      },
+    ];
+    for (const type of serverSideTypes) {
+      for (const stream of [false, true]) {
+        for (const { position, param, bodyFor } of cases) {
+          let modelCalled = false;
+          const result = await handleResponses({
+            model: 'claude-sonnet-4.6',
+            input: 'run it',
+            stream,
+            ...bodyFor(type),
+          }, {
+            async handleChatCompletions() {
+              modelCalled = true;
+              throw new Error('must not call the model for a server-executed tool');
+            },
+          });
+          assert.equal(result.status, 400, `${type} in ${position} stream=${stream}`);
+          assert.equal(result.stream, undefined, 'a rejected request never opens an SSE stream');
+          assert.equal(result.body.error.type, 'invalid_request_error');
+          assert.equal(result.body.error.code, 'unsupported_server_side_tool', `${type} in ${position}`);
+          assert.equal(result.body.error.param, param, `${type} in ${position}`);
+          assert.match(result.body.error.message, /executor/i);
+          assert.ok(
+            result.body.error.message.includes(type),
+            `the message names the rejected type ${type}`,
+          );
+          for (const listed of serverSideTypes) {
+            assert.ok(
+              result.body.error.message.includes(listed),
+              `the message lists every rejected type, missing ${listed}`,
+            );
+          }
+          assert.equal(modelCalled, false, 'no credits are spent on a turn whose tool this proxy cannot execute');
+        }
+      }
+    }
+  });
+
+  it('keeps a client-declared function tool named apply_patch as an ordinary function tool', async () => {
+    // The control for the ambiguous spelling: `{type:'apply_patch'}` is the
+    // server-executed hosted tool, but `{type:'function', name:'apply_patch'}` is
+    // how codex clients declare their own patch tool. Only `tool.type` decides.
+    const result = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'patch it',
+      tools: [{
+        type: 'function',
+        name: 'apply_patch',
+        description: 'Client-run patch',
+        parameters: { type: 'object', properties: { patch: { type: 'string' } }, required: ['patch'] },
+      }],
+      tool_choice: { type: 'function', name: 'apply_patch' },
+    }, {
+      async handleChatCompletions(body) {
+        assert.equal(body.tools[0].function.name, 'apply_patch');
+        assert.equal(body.tool_choice.type, 'function');
+        assert.equal(body.tool_choice.function.name, 'apply_patch');
+        return {
+          status: 200,
+          body: {
+            created: 123,
+            model: body.model,
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                  { id: 'call_patch', type: 'function', function: { name: 'apply_patch', arguments: '{"patch":"*** Begin Patch"}' } },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            }],
+          },
+        };
+      },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.body.output[0].type, 'function_call');
+    assert.equal(result.body.output[0].name, 'apply_patch');
+    assert.equal(result.body.output[0].call_id, 'call_patch');
+  });
+
+  it('leaves a request without tools untouched by the server-side gate', async () => {
+    let forwarded = null;
+    const result = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'Hello',
+    }, {
+      async handleChatCompletions(body) {
+        forwarded = body;
+        return {
+          status: 200,
+          body: {
+            created: 123,
+            model: body.model,
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          },
+        };
+      },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(forwarded.tools, undefined);
+    assert.equal(forwarded.tool_choice, undefined);
+  });
+
+  it('still drops a genuinely unknown tool type with a warning', async () => {
+    // The catch-all stays lenient for types this bridge has never heard of —
+    // but it must still emit the warning, not swallow the tool in silence.
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(' ')); };
+    let forwarded = null;
+    let result;
+    try {
+      result = await handleResponses({
+        model: 'claude-sonnet-4.6',
+        input: 'Hello',
+        tools: [
+          { type: 'quantum_flux' },
+          { type: 'function', name: 'do_thing', parameters: { type: 'object' } },
+        ],
+      }, {
+        async handleChatCompletions(body) {
+          forwarded = body;
+          return {
+            status: 200,
+            body: {
+              created: 123,
+              model: body.model,
+              choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            },
+          };
+        },
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.equal(result.status, 200);
+    assert.equal(forwarded.tools.length, 1);
+    assert.equal(forwarded.tools[0].function.name, 'do_thing');
+    assert.ok(
+      warnings.some(line => line.includes('quantum_flux') && line.includes('unknown tool type')),
+      `expected a warning naming the dropped type, got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  it('rejects dated snapshots of server-executed tools instead of dropping them', async () => {
+    // OpenAI ships dated snapshots next to the unversioned aliases
+    // (`code_interpreter_2025_03_11`, `web_search_2025_08_26`). A snapshot of a
+    // server-executed tool asks THIS SERVER to execute it just the same, but the
+    // exact-match set sent it to the catch-all, which warned and dropped it — a
+    // 200 with the tool gone. Stripping the trailing `_YYYY_MM_DD` and re-testing
+    // the set covers every current and future snapshot of a member without
+    // touching unrelated types.
+    const serverSideTypes = [
+      'file_search',
+      'computer_use_preview',
+      'mcp',
+      'code_interpreter',
+      'image_generation',
+      'local_shell',
+      'shell',
+      'apply_patch',
+    ];
+    const cases = [
+      {
+        position: 'top-level tools',
+        param: 'tools',
+        bodyFor: type => ({ tools: [{ type }] }),
+      },
+      {
+        position: 'additional_tools',
+        param: 'input',
+        bodyFor: type => ({
+          input: [
+            { type: 'additional_tools', tools: [{ type }] },
+            { type: 'message', role: 'user', content: 'run it' },
+          ],
+        }),
+      },
+      {
+        position: 'namespace child',
+        param: 'tools',
+        bodyFor: type => ({ tools: [{ type: 'namespace', name: 'hosted', tools: [{ type }] }] }),
+      },
+      {
+        position: 'tool_choice',
+        param: 'tool_choice',
+        bodyFor: type => ({ tool_choice: { type } }),
+      },
+    ];
+    for (const type of serverSideTypes) {
+      const versioned = `${type}_2025_03_11`;
+      for (const stream of [false, true]) {
+        for (const { position, param, bodyFor } of cases) {
+          let modelCalled = false;
+          const result = await handleResponses({
+            model: 'claude-sonnet-4.6',
+            input: 'run it',
+            stream,
+            ...bodyFor(versioned),
+          }, {
+            async handleChatCompletions() {
+              modelCalled = true;
+              throw new Error('must not call the model for a dated server-executed tool');
+            },
+          });
+          assert.equal(result.status, 400, `${versioned} in ${position} stream=${stream}`);
+          assert.equal(result.body.error.code, 'unsupported_server_side_tool', `${versioned} in ${position}`);
+          assert.equal(result.body.error.param, param, `${versioned} in ${position}`);
+          assert.ok(
+            result.body.error.message.includes(versioned),
+            `the message names the rejected snapshot ${versioned}`,
+          );
+          assert.equal(modelCalled, false, 'no model turn runs for a snapshot this proxy cannot execute');
+        }
+      }
+    }
+
+    // A versioned HOSTED search keeps its own gate and error code.
+    let hostedModelCalled = false;
+    const hosted = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'search',
+      tools: [{ type: 'web_search_2025_03_11' }],
+    }, {
+      async handleChatCompletions() {
+        hostedModelCalled = true;
+        throw new Error('must not call the model for a hosted search');
+      },
+    });
+    assert.equal(hosted.status, 400);
+    assert.equal(hosted.body.error.code, 'unsupported_hosted_tool');
+    assert.equal(hosted.body.error.param, 'tools');
+    assert.equal(hostedModelCalled, false);
+
+    // A dated type that is not a member stays unknown: warn + drop, not 400.
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(' ')); };
+    let forwarded = null;
+    let junk;
+    try {
+      junk = await handleResponses({
+        model: 'claude-sonnet-4.6',
+        input: 'Hello',
+        tools: [{ type: 'foobar_2025_03_11' }],
+      }, {
+        async handleChatCompletions(body) {
+          forwarded = body;
+          return {
+            status: 200,
+            body: {
+              created: 123,
+              model: body.model,
+              choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            },
+          };
+        },
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.equal(junk.status, 200);
+    assert.equal(forwarded.tools, undefined);
+    assert.ok(
+      warnings.some(line => line.includes('foobar_2025_03_11') && line.includes('unknown tool type')),
+      `expected a warning naming the dropped type, got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  it('rejects a server-executed tool hidden behind a second namespace child key', async () => {
+    // The walker used to recurse into the FIRST array-valued child key only,
+    // while flattenResponseTool picks the first truthy one. A namespace carrying
+    // both `tools: []` and `children: [{type:'mcp'}]` therefore walked the empty
+    // array, missed the server-executed child, and the request returned 200 with
+    // that tool gone and not even a warning. Walk every child key the schema
+    // allows so a hidden server-side tool cannot slip past the gate.
+    const namespaces = [
+      { name: 'a', tools: [], children: [{ type: 'mcp' }] },
+      {
+        name: 'b',
+        tools: [{ type: 'function', name: 'ok', parameters: { type: 'object' } }],
+        children: [{ type: 'file_search' }],
+      },
+      { name: 'c', functions: [], items: [{ type: 'code_interpreter' }] },
+    ];
+    for (const namespace of namespaces) {
+      let modelCalled = false;
+      const result = await handleResponses({
+        model: 'claude-sonnet-4.6',
+        input: 'run it',
+        tools: [{ type: 'namespace', ...namespace }],
+      }, {
+        async handleChatCompletions() {
+          modelCalled = true;
+          throw new Error('must not call the model for a hidden server-executed tool');
+        },
+      });
+      assert.equal(result.status, 400, `namespace ${namespace.name}`);
+      assert.equal(result.body.error.code, 'unsupported_server_side_tool', `namespace ${namespace.name}`);
+      assert.equal(result.body.error.param, 'tools', `namespace ${namespace.name}`);
+      assert.equal(modelCalled, false, `namespace ${namespace.name}: no model turn runs`);
+    }
+
+    // The same shape inside `additional_tools` is scanned by the same walker.
+    let additionalModelCalled = false;
+    const additional = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: [
+        {
+          type: 'additional_tools',
+          tools: [{ type: 'namespace', name: 'd', tools: [], children: [{ type: 'mcp' }] }],
+        },
+        { type: 'message', role: 'user', content: 'run it' },
+      ],
+    }, {
+      async handleChatCompletions() {
+        additionalModelCalled = true;
+        throw new Error('must not call the model for a hidden server-executed tool');
+      },
+    });
+    assert.equal(additional.status, 400);
+    assert.equal(additional.body.error.code, 'unsupported_server_side_tool');
+    assert.equal(additional.body.error.param, 'input');
+    assert.equal(additionalModelCalled, false);
   });
 
   it('round-trips Responses Lite additional_tools metadata', async () => {
@@ -597,95 +1145,83 @@ describe('chatToResponse', () => {
 });
 
 describe('handleResponses streaming', () => {
-  it('drops unbridged server-side tools (file_search, computer_use_preview, mcp) instead of failing', async () => {
-    // Throwing on the first non-function entry killed the whole request
-    // even when the model still had real function tools to use. Drop
-    // the unbridged server-side types, forward the function tools, and
-    // let sandleft's flatten layer translate web_search / custom /
-    // namespace separately (covered by other tests).
-    let forwarded = null;
-    const result = await handleResponses({
-      model: 'claude-sonnet-4.6',
-      input: 'Hello',
-      stream: false,
-      tools: [
-        { type: 'file_search' },
-        { type: 'computer_use_preview' },
-        { type: 'mcp', server_label: 'foo' },
-        { type: 'function', name: 'do_thing', parameters: { type: 'object' } },
-      ],
-    }, {
-      async handleChatCompletions(chatBody) {
-        forwarded = chatBody;
-        return {
-          status: 200,
-          body: {
-            id: 'c1', object: 'chat.completion', created: 1, model: chatBody.model,
-            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          },
-        };
-      },
-    });
-    assert.equal(result.status, 200);
-    assert.ok(Array.isArray(forwarded.tools));
-    assert.equal(forwarded.tools.length, 1);
-    assert.equal(forwarded.tools[0].function.name, 'do_thing');
+  it('rejects unbridged server-side tools (file_search, computer_use_preview, mcp) instead of failing the model turn silently', async () => {
+    // Dropping these used to keep the request alive at the cost of the tool:
+    // the client declared a server-executed tool, got a normal answer, and had
+    // no way to learn the tool never existed. Refuse before dispatch instead —
+    // the client still has real function tools and can retry without them.
+    for (const type of ['file_search', 'computer_use_preview', 'mcp']) {
+      let modelCalled = false;
+      const result = await handleResponses({
+        model: 'claude-sonnet-4.6',
+        input: 'Hello',
+        stream: false,
+        tools: [
+          { type, ...(type === 'mcp' ? { server_label: 'foo' } : {}) },
+          { type: 'function', name: 'do_thing', parameters: { type: 'object' } },
+        ],
+      }, {
+        async handleChatCompletions() {
+          modelCalled = true;
+          throw new Error('must not call the model for an unbridged server-side tool');
+        },
+      });
+      assert.equal(result.status, 400, type);
+      assert.equal(result.body.error.code, 'unsupported_server_side_tool', type);
+      assert.equal(result.body.error.param, 'tools', type);
+      assert.equal(modelCalled, false, `${type}: no model turn runs`);
+    }
   });
 
-  it('drops forced tool_choice when a Responses server-side tool was not forwarded', async () => {
-    let forwarded = null;
+  it('rejects a forced tool_choice naming a server-side tool instead of dropping the choice', async () => {
+    // Dropping the forced choice left the model free to answer normally, so the
+    // caller could not tell its forced tool had been discarded. `tool_choice`
+    // naming a type this proxy cannot execute is now the same 400 as declaring
+    // it — here with no declaration at all, mirroring the hosted-search gate.
+    let modelCalled = false;
     const result = await handleResponses({
       model: 'claude-sonnet-4.6',
       input: 'Hello',
       stream: false,
       tools: [
-        { type: 'file_search' },
         { type: 'function', name: 'do_thing', parameters: { type: 'object' } },
       ],
       tool_choice: { type: 'file_search' },
     }, {
-      async handleChatCompletions(chatBody) {
-        forwarded = chatBody;
-        return {
-          status: 200,
-          body: {
-            id: 'c1', object: 'chat.completion', created: 1, model: chatBody.model,
-            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          },
-        };
+      async handleChatCompletions() {
+        modelCalled = true;
+        throw new Error('must not call the model');
       },
     });
-    assert.equal(result.status, 200);
-    assert.equal(forwarded.tools.length, 1);
-    assert.equal(forwarded.tools[0].function.name, 'do_thing');
-    assert.equal(forwarded.tool_choice, undefined);
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.type, 'invalid_request_error');
+    assert.equal(result.body.error.code, 'unsupported_server_side_tool');
+    assert.equal(result.body.error.param, 'tool_choice');
+    assert.equal(modelCalled, false);
   });
 
-  it('translates web_search_preview to a function tool the same way as web_search', async () => {
-    let forwarded = null;
-    await handleResponses({
+  it('rejects a forced function tool_choice absent from tools instead of pruning it', async () => {
+    // A07/KH-003: a forced function that is not declared used to be dropped,
+    // leaving the model free to answer as if nothing was forced. It must be a
+    // 400 before any model turn.
+    let modelCalled = false;
+    const result = await handleResponses({
       model: 'claude-sonnet-4.6',
-      input: 'search',
+      input: 'Hello',
       stream: false,
-      tools: [{ type: 'web_search_preview' }],
+      tools: [{ type: 'function', name: 'Read', parameters: { type: 'object' } }],
+      tool_choice: { type: 'function', name: 'Bash' },
     }, {
-      async handleChatCompletions(chatBody) {
-        forwarded = chatBody;
-        return {
-          status: 200,
-          body: {
-            id: 'c', object: 'chat.completion', created: 1, model: chatBody.model,
-            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          },
-        };
+      async handleChatCompletions() {
+        modelCalled = true;
+        throw new Error('must not call the model');
       },
     });
-    assert.equal(forwarded.tools.length, 1);
-    assert.equal(forwarded.tools[0].function.name, 'web_search');
-    assert.equal(forwarded.tools[0].__response_tool.type, 'web_search');
+    assert.equal(result.status, 400);
+    assert.equal(result.body.error.type, 'invalid_request_error');
+    assert.equal(result.body.error.param, 'tool_choice');
+    assert.equal(result.body.error.code, 'tool_choice_tool_not_declared');
+    assert.equal(modelCalled, false);
   });
 
   it('emits the Responses text event sequence and response.completed', async () => {
@@ -784,7 +1320,6 @@ describe('handleResponses streaming', () => {
       stream: true,
       tools: [
         { type: 'custom', name: 'runner', description: 'Run shell' },
-        { type: 'web_search', description: 'Search the web' },
         {
           type: 'namespace',
           name: 'mcp__desktop_commander',
@@ -800,8 +1335,7 @@ describe('handleResponses streaming', () => {
           stream: true,
           async handler(res) {
             res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_custom', type: 'function', function: { name: 'runner', arguments: '{"input":"echo hi"}' } }] }, finish_reason: null }] }));
-            res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: 'call_search', type: 'function', function: { name: 'web_search', arguments: '{"query":"codex"}' } }] }, finish_reason: null }] }));
-            res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 2, id: 'call_ns', type: 'function', function: { name: 'mcp__desktop_commander__read_file', arguments: '{"path":"README.md"}' } }] }, finish_reason: null }] }));
+            res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: 'call_ns', type: 'function', function: { name: 'mcp__desktop_commander__read_file', arguments: '{"path":"README.md"}' } }] }, finish_reason: null }] }));
             res.end('data: [DONE]\n\n');
           },
         };
@@ -815,11 +1349,58 @@ describe('handleResponses streaming', () => {
     assert.equal(doneItems[0].type, 'custom_tool_call');
     assert.equal(doneItems[0].name, 'runner');
     assert.equal(doneItems[0].input, 'echo hi');
-    assert.equal(doneItems[1].type, 'web_search_call');
-    assert.equal(doneItems[1].action.query, 'codex');
-    assert.equal(doneItems[2].type, 'function_call');
-    assert.equal(doneItems[2].name, 'read_file');
-    assert.equal(doneItems[2].namespace, 'mcp__desktop_commander');
+    assert.equal(doneItems[1].type, 'function_call');
+    assert.equal(doneItems[1].name, 'read_file');
+    assert.equal(doneItems[1].namespace, 'mcp__desktop_commander');
+  });
+
+  it('streams a client-declared function named web_search as a normal function_call', async () => {
+    // Control for the rejection above: the HOSTED tool type is refused, but an
+    // ordinary client function called web_search keeps the normal wire shape.
+    const result = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'search',
+      stream: true,
+      tools: [{
+        type: 'function',
+        name: 'web_search',
+        description: 'Client-run search',
+        parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+      }],
+    }, {
+      async handleChatCompletions(body) {
+        return {
+          status: 200,
+          stream: true,
+          async handler(res) {
+            res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_search', type: 'function', function: { name: 'web_search', arguments: '{"query":"codex"}' } }] }, finish_reason: null }] }));
+            res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }));
+            res.end('data: [DONE]\n\n');
+          },
+        };
+      },
+    });
+    const res = fakeRes();
+    await result.handler(res);
+    const events = parseEvents(res.body);
+    assertSequenceNumbers(events);
+    const added = events.find(e => e.event === 'response.output_item.added').data.item;
+    assert.equal(added.type, 'function_call');
+    assert.equal(added.call_id, 'call_search');
+    const done = events.find(e => e.event === 'response.output_item.done').data.item;
+    assert.equal(done.type, 'function_call');
+    assert.equal(done.name, 'web_search');
+    assert.equal(done.arguments, '{"query":"codex"}');
+    const deltas = events
+      .filter(e => e.event === 'response.function_call_arguments.delta')
+      .map(e => e.data.delta)
+      .join('');
+    assert.equal(deltas, '{"query":"codex"}', 'arguments stream through the normal function-call channel');
+    const allItems = events.flatMap(e => (e.data?.item
+      ? [e.data.item]
+      : (Array.isArray(e.data?.response?.output) ? e.data.response.output : [])));
+    assert.ok(allItems.every(item => item.type !== 'web_search_call'), 'no hosted search is reported as executed');
+    assert.equal(events.at(-1).data.response.status, 'completed');
   });
 
   it('recovers Responses-native metadata when the streaming tool name arrives later', async () => {
@@ -1012,5 +1593,288 @@ describe('H-1 (audit 2026-07-13): input_image string image_url normalizes to obj
     });
     assert.equal(messages[0].content, JSON.stringify(['file1.txt', 'file2.txt']));
     assert.equal(messages[1].content, JSON.stringify([{ name: 'alice' }, { name: 'bob' }]));
+  });
+});
+
+describe('parallel_tool_calls on /v1/responses (F1, DataAuditTools)', () => {
+  // The Responses surface accepted `parallel_tool_calls` and never read it. Forwarding
+  // the field is still the whole fix — the chat handler owns the decision: it honours
+  // the hint when DEVIN_CONNECT_TOOL_CHOICE=1 and otherwise serves the request while
+  // counting the drop. It never refuses it (Codex 0.164 sends the field on every
+  // request; a 400 there made the CLI unusable — evidence/CodexParallelFix.md).
+  it('forwards the field instead of dropping it', () => {
+    assert.equal(responsesToChat({ input: 'hi', parallel_tool_calls: false }).parallel_tool_calls, false);
+    assert.equal(responsesToChat({ input: 'hi', parallel_tool_calls: true }).parallel_tool_calls, true);
+    assert.equal('parallel_tool_calls' in responsesToChat({ input: 'hi' }), false,
+      'absent stays absent — the chat default is unchanged');
+  });
+
+  it('hands parallel_tool_calls:false to the chat handler', async () => {
+    let captured = null;
+    const result = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'hi',
+      parallel_tool_calls: false,
+    }, {
+      async handleChatCompletions(body) {
+        captured = body;
+        return {
+          status: 200,
+          body: {
+            created: 123,
+            model: body.model,
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          },
+        };
+      },
+    });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.equal(captured.parallel_tool_calls, false, 'the chat handler must be able to see the hint');
+  });
+
+  it('serves a Codex-shaped request with parallel_tool_calls:false when the passthrough is off', async () => {
+    const prevConnect = process.env.DEVIN_CONNECT;
+    const prevChoice = process.env.DEVIN_CONNECT_TOOL_CHOICE;
+    process.env.DEVIN_CONNECT = '1';
+    delete process.env.DEVIN_CONNECT_TOOL_CHOICE;
+    const seen = [];
+    __setConnectDeps({
+      toChatCompletion: async (params) => {
+        seen.push(params);
+        return {
+          status: 200,
+          body: {
+            id: 'chatcmpl-test',
+            model: 'claude-5-fable-medium',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
+          },
+        };
+      },
+    });
+    try {
+      const result = await handleResponses({
+        model: 'claude-5-fable-medium',
+        input: 'hi',
+        tools: [{
+          type: 'function',
+          name: 'functions__exec',
+          description: 'run a command',
+          parameters: { type: 'object', properties: { command: { type: 'string' } } },
+        }],
+        parallel_tool_calls: false,
+      }, { handleChatCompletions });
+      assert.equal(result.status, 200, JSON.stringify(result.body));
+      assert.equal(seen.length, 1, 'the request must reach the model');
+      assert.equal(seen[0].parallelToolCalls, false);
+    } finally {
+      __resetConnectDeps();
+      if (prevConnect === undefined) delete process.env.DEVIN_CONNECT;
+      else process.env.DEVIN_CONNECT = prevConnect;
+      if (prevChoice === undefined) delete process.env.DEVIN_CONNECT_TOOL_CHOICE;
+      else process.env.DEVIN_CONNECT_TOOL_CHOICE = prevChoice;
+    }
+  });
+});
+
+describe('parallel_tool_calls honoured path through /v1/responses (F1)', () => {
+  const okChat = () => ({
+    status: 200,
+    body: {
+      id: 'chatcmpl-test',
+      model: 'claude-5-fable-medium',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
+    },
+  });
+
+  it('passes parallel_tool_calls:true through to the connect layer unchanged', async () => {
+    const prevConnect = process.env.DEVIN_CONNECT;
+    const prevChoice = process.env.DEVIN_CONNECT_TOOL_CHOICE;
+    process.env.DEVIN_CONNECT = '1';
+    delete process.env.DEVIN_CONNECT_TOOL_CHOICE;
+    const seen = [];
+    __setConnectDeps({ toChatCompletion: async (params) => { seen.push(params); return okChat(); } });
+    try {
+      const result = await handleResponses({
+        model: 'claude-5-fable-medium',
+        input: 'hi',
+        parallel_tool_calls: true,
+      }, { handleChatCompletions });
+      assert.equal(result.status, 200, JSON.stringify(result.body));
+      assert.equal(seen.length, 1, 'exactly one connect turn');
+      assert.equal(seen[0].parallelToolCalls, true, 'the caller value survives the Responses translation');
+    } finally {
+      __resetConnectDeps();
+      if (prevConnect === undefined) delete process.env.DEVIN_CONNECT;
+      else process.env.DEVIN_CONNECT = prevConnect;
+      if (prevChoice === undefined) delete process.env.DEVIN_CONNECT_TOOL_CHOICE;
+      else process.env.DEVIN_CONNECT_TOOL_CHOICE = prevChoice;
+    }
+  });
+
+  it('honours parallel_tool_calls:false when DEVIN_CONNECT_TOOL_CHOICE=1', async () => {
+    const prevConnect = process.env.DEVIN_CONNECT;
+    const prevChoice = process.env.DEVIN_CONNECT_TOOL_CHOICE;
+    process.env.DEVIN_CONNECT = '1';
+    process.env.DEVIN_CONNECT_TOOL_CHOICE = '1';
+    const seen = [];
+    __setConnectDeps({ toChatCompletion: async (params) => { seen.push(params); return okChat(); } });
+    try {
+      const result = await handleResponses({
+        model: 'claude-5-fable-medium',
+        input: 'hi',
+        parallel_tool_calls: false,
+      }, { handleChatCompletions });
+      assert.equal(result.status, 200, JSON.stringify(result.body));
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].parallelToolCalls, false,
+        'the hint must reach buildGetChatMessageRequest, not stop at the Responses allow-list');
+    } finally {
+      __resetConnectDeps();
+      if (prevConnect === undefined) delete process.env.DEVIN_CONNECT;
+      else process.env.DEVIN_CONNECT = prevConnect;
+      if (prevChoice === undefined) delete process.env.DEVIN_CONNECT_TOOL_CHOICE;
+      else process.env.DEVIN_CONNECT_TOOL_CHOICE = prevChoice;
+    }
+  });
+});
+
+// `metadata` (DataAuditTools F4) — the field exists to be ECHOED.
+//
+// A client tags a request (trace id, tenant) and reads the tag back off the
+// response object for its own bookkeeping. Nothing on this route read the field,
+// so it vanished behind a 200 with no signal, and a retrieved response could not
+// report it either because the store had no slot for it. The contract is OpenAI's:
+// a flat map of at most 16 string pairs, keys <= 64 chars, values <= 512 chars.
+describe('responses metadata echo and persistence', () => {
+  const CALLER = 'api:metadatametadatametadatametada:user:tagger';
+
+  beforeEach(() => resetResponseStore());
+
+  const reply = (content = 'ok') => ({
+    status: 200,
+    body: { id: 'chat_1', choices: [{ message: { role: 'assistant', content } }] },
+  });
+
+  it('echoes request metadata on the response object', async () => {
+    const result = await handleResponses(
+      { model: 'm', input: 'hi', metadata: { trace_id: 'abc', tenant: 'acme' } },
+      { handleChatCompletions: async () => reply(), context: { callerKey: CALLER } },
+    );
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.deepEqual(result.body.metadata, { trace_id: 'abc', tenant: 'acme' });
+  });
+
+  it('omits the field entirely when the request omits it — absence stays absent', async () => {
+    const result = await handleResponses(
+      { model: 'm', input: 'hi' },
+      { handleChatCompletions: async () => reply(), context: { callerKey: CALLER } },
+    );
+    assert.equal(result.status, 200);
+    assert.equal(Object.hasOwn(result.body, 'metadata'), false);
+  });
+
+  it('does not leak the tag into the upstream chat body as an unknown field', async () => {
+    const seen = [];
+    const result = await handleResponses(
+      { model: 'm', input: 'hi', metadata: { tag: 'x' } },
+      {
+        handleChatCompletions: async (body) => { seen.push(body); return reply(); },
+        context: { callerKey: CALLER },
+      },
+    );
+    assert.equal(result.status, 200);
+    assert.equal(Object.hasOwn(seen[0], 'metadata'), false,
+      'the chat surface drops metadata; forwarding it would be a second silent drop');
+    assert.equal(Object.hasOwn(seen[0], '__responseMetadata'), false,
+      'the internal carrier must be stripped before the upstream call');
+  });
+
+  it('echoes metadata on the streaming response object', async () => {
+    const result = await handleResponses({
+      model: 'claude-sonnet-4.6',
+      input: 'hi',
+      stream: true,
+      metadata: { trace_id: 'abc' },
+    }, {
+      async handleChatCompletions(body) {
+        return {
+          status: 200,
+          stream: true,
+          async handler(res) {
+            res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: { content: 'hi' } }] }));
+            res.write(chatChunk({ id: 'chat_1', created: 123, model: body.model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+            res.end('data: [DONE]\n\n');
+          },
+        };
+      },
+    });
+    const res = fakeRes();
+    await result.handler(res);
+    const events = parseEvents(res.body);
+    const created = events.find(e => e.event === 'response.created');
+    const completed = events.find(e => e.event === 'response.completed');
+    assert.ok(created && completed, `terminal events missing: ${events.map(e => e.event).join(',')}`);
+    assert.deepEqual(created.data.response.metadata, { trace_id: 'abc' });
+    assert.deepEqual(completed.data.response.metadata, { trace_id: 'abc' });
+  });
+
+  it('preserves metadata through previous_response_id and GET /v1/responses/{id}', async () => {
+    const deps = { handleChatCompletions: async () => reply(), context: { callerKey: CALLER } };
+    const first = await handleResponses(
+      { model: 'm', input: 'turn 1', metadata: { trace_id: 'abc', tenant: 'acme' } }, deps);
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+
+    const second = await handleResponses(
+      { model: 'm', previous_response_id: first.body.id, input: 'turn 2' }, deps);
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+    assert.equal(Object.hasOwn(second.body, 'metadata'), false,
+      'metadata belongs to the response that carried it; it is not inherited');
+
+    const retrieved = handleGetResponse(first.body.id, { context: { callerKey: CALLER } });
+    assert.equal(retrieved.status, 200, JSON.stringify(retrieved.body));
+    assert.deepEqual(retrieved.body.metadata, { trace_id: 'abc', tenant: 'acme' },
+      'the chained lookup must not drop the stored tag');
+  });
+
+  it('treats an empty map and an explicit null as absent, so POST and GET agree', async () => {
+    const deps = { handleChatCompletions: async () => reply(), context: { callerKey: CALLER } };
+    for (const metadata of [{}, null]) {
+      const result = await handleResponses({ model: 'm', input: 'hi', metadata }, deps);
+      assert.equal(result.status, 200, JSON.stringify(metadata));
+      assert.equal(Object.hasOwn(result.body, 'metadata'), false, JSON.stringify(metadata));
+      const retrieved = handleGetResponse(result.body.id, { context: { callerKey: CALLER } });
+      assert.equal(retrieved.status, 200);
+      assert.equal(Object.hasOwn(retrieved.body, 'metadata'), false, JSON.stringify(metadata));
+    }
+  });
+
+  it('rejects metadata that violates the OpenAI contract with a 400 naming the field', async () => {
+    const cases = [
+      ['not an object', 'abc'],
+      ['an array', ['a']],
+      ['a non-string value', { a: 1 }],
+      ['a key longer than 64 characters', { ['k'.repeat(65)]: 'v' }],
+      ['a value longer than 512 characters', { a: 'v'.repeat(513) }],
+      ['more than 16 pairs', Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k${i}`, 'v']))],
+    ];
+    for (const [label, metadata] of cases) {
+      const result = await handleResponses({ model: 'm', input: 'hi', metadata }, {
+        handleChatCompletions: async () => { throw new Error('must not reach the model'); },
+        context: { callerKey: CALLER },
+      });
+      assert.equal(result.status, 400, label);
+      assert.equal(result.body.error?.param, 'metadata', label);
+    }
+  });
+
+  it('accepts the contract maximum and echoes it unchanged', async () => {
+    const metadata = Object.fromEntries(
+      Array.from({ length: 16 }, (_, i) => [`k${i}`, 'v'.repeat(512)]));
+    const result = await handleResponses({ model: 'm', input: 'hi', metadata }, {
+      handleChatCompletions: async () => reply(), context: { callerKey: CALLER },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(Object.keys(result.body.metadata).length, 16);
+    assert.equal(result.body.metadata.k15.length, 512);
   });
 });

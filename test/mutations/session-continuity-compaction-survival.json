@@ -3,7 +3,7 @@
     "test/session-continuity.test.js",
     "test/chat-reuse-log.test.js"
   ],
-  "expectBaselinePass": 50,
+  "expectBaselinePass": 51,
   "mutations": [
     {
       "name": "root fallback fires even when pair evidence exists — a live session gets re-associated through the root",

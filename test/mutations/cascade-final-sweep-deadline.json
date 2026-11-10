@@ -1,0 +1,61 @@
+{
+  "_scope_note": "F2/F3 (evidence/audit2/Cascade.md:254-296): the final-sweep text must count as turn output, and the route budget must cover warmup/StartCascade/Send/retry/polling/detach instead of starting at the poll loop. Both defects were reproduced at 2598299e (streamed 'answer' -> 502 EMPTY_RESPONSE; 100 ms budget -> 310 ms behind a 250 ms Send) and re-pinned here against the fixed producer. Each mutation re-introduces one half of the fix; the two expectCaught:false entries are MEASURED survivors with the reason they cannot be seen from outside.",
+  "_baseline_provenance": "MEASURED 2026-10-26 on the deadline-flake fix commit, Windows, Node v24.19.0, worktree D:/Project/WindsurfAPI. The sweep is run with scripts/mutate-verify-dirty.mjs in WSL (Ubuntu 24.04, /usr/bin/git, /opt/node24/bin/node v24.21.0) because mutation-harness-utils.mjs requires git at a POSIX absolute path. Baseline 19/19 green and identical in every mutated run. Results: 6 CAUGHT arms and 2 declared SURVIVORS (see their names). Full log: evidence/final/DeadlineFlake.md.",
+  "tests": [
+    "test/cascade-final-sweep-terminal.test.js",
+    "test/cascade-turn-deadline.test.js"
+  ],
+  "expectBaselinePass": 19,
+  "mutations": [
+    {
+      "name": "F2: the idle_empty classifier arm ignores delivered output again — a turn whose text arrived in the final sweep is reported as an empty upstream failure (502 EMPTY_RESPONSE) after the bytes were streamed",
+      "file": "src/client.js",
+      "anchor": "    if (hasOutput) {",
+      "replacement": "    if (false) {"
+    },
+    {
+      "name": "SURVIVOR (equivalent while both sweep arms mark sawText): the terminal reason drops the `|| totalYielded > 0` half. No producer path can reach the clause any more, so only a future sweep arm that advances totalYielded without sawText would exercise it; the clause is kept as the audit-specified second layer behind the per-arm marking, and mutation 1 proves the classifier still refuses to turn delivered bytes into an empty failure",
+      "file": "src/client.js",
+      "anchor": "            endReason = (sawText || totalYielded > 0) ? 'idle_done' : 'idle_empty';",
+      "replacement": "            endReason = sawText ? 'idle_done' : 'idle_empty';",
+      "expectCaught": false
+    },
+    {
+      "name": "F2: the final sweep stops marking the turn as having text — a detached turn's snapshot freezes sawText=false, so the resume path resurrects the empty-turn verdict after delivering the answer",
+      "file": "src/cascade-turn.js",
+      "anchor": "      this.totalYielded += textDelta.length;\n      // F2: the sweep can be the FIRST place this step's text is visible, so\n      // it must account for the emission exactly like consumeStep does.\n      // Leaving sawText false made the turn end `idle_empty` after the bytes\n      // had already been streamed.\n      this.sawText = true;",
+      "replacement": "      this.totalYielded += textDelta.length;"
+    },
+    {
+      "name": "SURVIVOR (masked by the deadline-bounded reads): the poll window is granted the full route budget again. Every read in the loop is itself bounded by the remaining turn time, so a spent deadline ends the loop as max_wait whether or not the window agrees; the window line is kept because it stops the loop from issuing 1 ms-timeout RPCs after the deadline, and the difference is not deterministically observable from outside (it would depend on a 1 ms read timeout not firing). The detach-deadline assertion does catch the related regression through the admission pin",
+      "file": "src/client.js",
+      "anchor": "      const maxWait = Math.max(0, turnStart + turnBudgetMs - startTime);",
+      "replacement": "      const maxWait = turnBudgetMs;",
+      "expectCaught": false
+    },
+    {
+      "name": "F3: a phase failure after the deadline is no longer converted to the route-budget stop — a Send/StartCascade that ran out of turn time surfaces as a transport error, which rotates accounts and retries a request that has no time left",
+      "file": "src/client.js",
+      "anchor": "      if (remainingBudgetMs() > DEADLINE_TOLERANCE_MS) return;",
+      "replacement": "      if (true) return;"
+    },
+    {
+      "name": "F3: the last-tick deadline tolerance collapses to zero — a phase timer that fires on the deadline's final wall-clock millisecond rethrows `gRPC unary timeout`, the exact B06 CI flake (attempt 2: 120.24 ms StartCascade test)",
+      "file": "src/client.js",
+      "anchor": "    const DEADLINE_TOLERANCE_MS = 5;",
+      "replacement": "    const DEADLINE_TOLERANCE_MS = 0;"
+    },
+    {
+      "name": "F3: the Send RPC loses its remaining-time bound — a Send issued inside the budget can run to gRPC's 30 s default, so the turn returns after the deadline instead of stopping at it",
+      "file": "src/client.js",
+      "anchor": "        await grpcUnary(\n          this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, grpcFrame(sendProto),\n          budgetTimeout(30_000)\n        );",
+      "replacement": "        await grpcUnary(\n          this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, grpcFrame(sendProto),\n          30_000\n        );"
+    },
+    {
+      "name": "F3: the shared workspace warmup is awaited without the deadline race — a warmup started by another request can hold a short route for the full multi-RPC handshake",
+      "file": "src/client.js",
+      "anchor": "    if (!resumeTurn) await awaitWithinBudget(this.warmupCascade(), 'Cascade workspace warmup');",
+      "replacement": "    if (!resumeTurn) await this.warmupCascade();"
+    }
+  ]
+}

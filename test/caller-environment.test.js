@@ -1,6 +1,7 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractCallerEnvironment, shouldLiftCallerEnv } from '../src/handlers/chat.js';
+import { addAccountByKey, getAccountInternal, getApiKey, removeAccount } from '../src/auth.js';
+import { extractCallerEnvironment, handleChatCompletions, shouldLiftCallerEnv } from '../src/handlers/chat.js';
 import { buildToolPreambleForProto } from '../src/handlers/tool-emulation.js';
 
 // Why these tests exist:
@@ -431,5 +432,105 @@ describe('shouldLiftCallerEnv (#209 fable env-lift gate)', () => {
 
   it('glm-5.2 is NOT weak-model-gated (goes through gpt_native, unaffected by #209)', () => {
     assert.equal(shouldLiftCallerEnv('glm-5.2', { emulateTools: true, env: {} }), true);
+  });
+});
+
+// #209 wiring: the predicate tests above are only half the fix. These drive the
+// real handler and capture the proto preamble handed to cascadeChat, so a future
+// refactor that drops shouldLiftCallerEnv() from the call site (chat.js) fails
+// here even while the predicate tests still pass.
+describe('caller env wiring into the proto tool preamble (#209)', () => {
+  const createdAccountIds = [];
+  const savedEnv = {};
+
+  beforeEach(() => {
+    for (const name of [
+      'DEVIN_CONNECT',
+      'DEVIN_ONLY',
+      'WINDSURFAPI_NATIVE_TOOL_BRIDGE',
+      'WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF',
+      'WINDSURFAPI_ENV_LIFT',
+    ]) {
+      savedEnv[name] = process.env[name];
+      delete process.env[name];
+    }
+    // Pin the escape hatch ON: an operator shell with WINDSURFAPI_ENV_LIFT=0
+    // must not turn the haiku control assertion into a false failure.
+    process.env.WINDSURFAPI_ENV_LIFT = '1';
+
+    const account = addAccountByKey(`test-key-env-lift-${Date.now()}-${Math.random().toString(16).slice(2)}`, 'env-lift');
+    createdAccountIds.push(account.id);
+    const internal = getAccountInternal(account.id);
+    internal.tier = 'pro';
+    internal.status = 'active';
+  });
+
+  afterEach(() => {
+    while (createdAccountIds.length) removeAccount(createdAccountIds.pop());
+    for (const [name, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  function payload(model) {
+    return {
+      model,
+      messages: [
+        { role: 'system', content: 'You are Claude Code.\n\n<env>\nWorking directory: /Users/dev/proj\nPlatform: darwin\n</env>' },
+        { role: 'user', content: 'run pwd' },
+      ],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'Bash',
+          description: 'Run a shell command.',
+          parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+        },
+      }],
+    };
+  }
+
+  // Cascade path (not DEVIN_CONNECT): the preamble under test is the
+  // proto-level tool_calling_section, which is exactly the slot the fable
+  // empty-completion bug (#209) was traced to.
+  function cascadeContext(capturedPreambles) {
+    class FakeClient {
+      async cascadeChat(_messages, _modelEnum, _modelUid, opts = {}) {
+        capturedPreambles.push(opts.toolPreamble || '');
+        return Object.assign([{ text: 'OK' }], { toolCalls: [], usage: { inputTokens: 5, outputTokens: 2 } });
+      }
+    }
+    return {
+      waitForAccount(tried) { return getApiKey(tried); },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'test', generation: 1 }),
+      WindsurfClient: FakeClient,
+    };
+  }
+
+  it('lifts the <env> block into the preamble for a normal model (control)', async () => {
+    const preambles = [];
+    const result = await handleChatCompletions(payload('claude-4.5-haiku'), cascadeContext(preambles));
+
+    assert.equal(result.status, 200);
+    assert.equal(preambles.length, 1, 'the handler must reach cascadeChat exactly once');
+    assert.match(preambles[0], /- Working directory: \/Users\/dev\/proj/,
+      'a normal model must still receive the caller cwd');
+    assert.match(preambles[0], /- Platform: darwin/);
+  });
+
+  it('does NOT lift the <env> block for claude-5-fable-high (the #209 fix)', async () => {
+    const preambles = [];
+    const result = await handleChatCompletions(payload('claude-5-fable-high'), cascadeContext(preambles));
+
+    assert.equal(result.status, 200);
+    assert.equal(preambles.length, 1, 'the handler must reach cascadeChat exactly once');
+    assert.doesNotMatch(preambles[0], /- Working directory:/,
+      'the fable family must not receive the lifted env block that idles it to an empty completion');
+    assert.doesNotMatch(preambles[0], /\/Users\/dev\/proj/,
+      'no fragment of the env block may leak through another preamble path');
+    assert.match(preambles[0], /You have access to the following functions/,
+      'skipping the env lift must not suppress the tool preamble itself');
   });
 });

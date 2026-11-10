@@ -67,7 +67,7 @@ const MULTI_HIT_REWRITE_WARN_COUNT = 1;
  * enables the (a6-cline-obj) OBJECTIVE-boast rule; see comment at the a6-cline-obj rule.
  * Opt-in (speculative): WINDSURFAPI_NEUTRALIZE_CC_AGGRESSIVE=1 or opts.ccActive
  *   (default off) — reserved hook for Claude-Code-specific aggressive rules; see
- *   the (cc) block at the end. Currently EMPTY on purpose (a1-a4 already cover
+ *   the (cc) block at the end. Currently EMPTY on purpose (a1-a4 and a8 already cover
  *   every live-confirmed CC trigger); the hook exists so a new CC trigger can be
  *   flipped on the instant a repetition A/B proves it, without re-plumbing.
  *
@@ -75,7 +75,7 @@ const MULTI_HIT_REWRITE_WARN_COUNT = 1;
  * @param {object} env   environment (injectable for tests)
  * @param {object} opts  { ccActive?: boolean } — Claude Code compat layer active
  *   for this request (via /v1/cc/* or detected + master toggle). Gates ONLY the
- *   opt-in (cc) block; the confirmed rules (a1-a5, a6-grok, a7) stay unconditional
+ *   opt-in (cc) block; the confirmed rules (a1-a5, a6-grok, a7, a8) stay unconditional
  *   (they are the default 529 / content-policy defense line for ALL clients and
  *   must never be gated).
  */
@@ -304,13 +304,32 @@ export function neutralizeClientIdentity(text, env = process.env, opts = {}) {
   // Live-confirmed ⇒ unconditional, on the main WINDSURFAPI_NEUTRALIZE_CLIENT_ID switch.
   rule('a7-freeform', /FREEFORM/g, 'free-form');
   rule('a7-json-wrap', /do not wrap the patch in JSON\./g, 'provide the patch as plain text.');
+  // (a8) Claude Code subagent system-prompt trigger (2026-10-24, Claude Code 2.1.310,
+  // live-bisected via /v1/messages replay, 2/2 per variant). Every subagent (Agent tool,
+  // general-purpose / Explore / ...) carries the Notes bullet "For clear
+  // communication with the user the assistant MUST avoid using emojis." That one
+  // sentence alone, as the whole system prompt, blocks (permission_denied / 400);
+  // the same request with the subagent block dropped passes. The TRIGGER is the
+  // whole combination: "The assistant MUST avoid using emojis." passes, the same
+  // sentence with "should" passes, dropping the "For clear communication with the
+  // user" lead-in passes. The full blocked subagent request with only MUST -> should
+  // passed 3/3, so the rewrite keeps the instruction and changes one word. The main
+  // session prompt does not contain this sentence, which is why only subagents fail.
+  // Unconditional rather than in the (cc) block: ccActive is off by default, so a
+  // gated rule would leave every default deployment's subagents failing, and the
+  // regex is anchored on the whole sentence, so it cannot hit unrelated content.
+  // Live-confirmed => unconditional, on the main WINDSURFAPI_NEUTRALIZE_CLIENT_ID switch.
+  rule('a8-cc-subagent-emoji',
+    /For clear communication with the user,?\s+the assistant MUST avoid using emojis\./g,
+    'For clear communication with the user the assistant should avoid using emojis.',
+  );
   // (cc) SPECULATIVE / DEFAULT-OFF — Claude-Code-specific aggressive rules. Gated
   // by the CC compat layer being active for this request (opts.ccActive, i.e.
   // /v1/cc/* or detected + master toggle) OR the env opt-in. INTENTIONALLY EMPTY
-  // today: a1-a4 already neutralize every live-confirmed Claude Code trigger
+  // today: a1-a4 and a8 already neutralize every live-confirmed Claude Code trigger
   // ("You are Claude Code", the Agent-SDK line, the billing header, the brand
-  // block), and adding UNVERIFIED rewrites would risk mangling prompt semantics
-  // against Devin's NON-DETERMINISTIC content policy (same prompt blocked then
+  // block, the subagent emoji bullet), and adding UNVERIFIED rewrites would risk
+  // mangling prompt semantics against Devin's NON-DETERMINISTIC content policy (same prompt blocked then
   // passed hours later — no reliable A/B, the exact reason a6-cline-obj ships off). This
   // hook exists so the moment the policy re-fires and a repetition A/B isolates a
   // NEW CC-only trigger, the rule drops in here and flips on via ccActive with no

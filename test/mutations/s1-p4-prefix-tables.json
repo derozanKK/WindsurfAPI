@@ -21,8 +21,8 @@
     {
       "name": "P4 mutation 3",
       "file": "src/handlers/tool-emulation.js",
-      "anchor": "          const max = Math.min(s.length - 1, this.buffer.length);\n          for (let len = max; len > 0; len--) {\n            if (this.buffer.endsWith(prefixes[len])) {",
-      "replacement": "          const max = Math.min(s.length - 1, this.buffer.length);\n          for (let len = max; len > 0; len--) {\n            if (this.buffer.endsWith(s.slice(0, len))) {",
+      "anchor": "            const max = Math.min(s.length - 1, this.buffer.length);\n            for (let len = max; len > 0; len--) {\n              if (this.buffer.endsWith(prefixes[len])) {",
+      "replacement": "            const max = Math.min(s.length - 1, this.buffer.length);\n            for (let len = max; len > 0; len--) {\n              if (this.buffer.endsWith(s.slice(0, len))) {",
       "expectCaught": true
     },
     {

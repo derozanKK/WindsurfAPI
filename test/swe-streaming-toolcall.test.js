@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import {
   ToolCallStreamParser,
   parseToolCallsFromText,
@@ -93,4 +95,47 @@ describe('kimi_k2 XML compatibility fallback', () => {
       );
     }
   });
+});
+
+// PR #252: the only real captured wire for the swe/Kimi tool dialect lives in
+// test/_research/swe-1-7-kimi-tool-call-wire.json. Until this block the fixture
+// was orphaned (zero references under test/ or src/), so the parser was pinned
+// only against a hand-written approximation with `functions.Bash:0` and no space
+// in the JSON. Feed the verbatim captured field instead.
+describe('captured swe-1-7 Kimi wire field (PR #252)', () => {
+  const fixture = JSON.parse(readFileSync(
+    new URL('./_research/swe-1-7-kimi-tool-call-wire.json', import.meta.url),
+    'utf8',
+  ));
+  const raw = fixture.raw_response_field;
+
+  it('fixture is the verbatim 156-byte captured field', () => {
+    assert.equal(fixture.source.field_bytes, 156);
+    assert.equal(Buffer.byteLength(raw, 'utf8'), 156, 'the fixture must not drift from the capture');
+    assert.equal(
+      createHash('sha256').update(raw).digest('hex').slice(0, 16),
+      fixture.source.field_sha256_prefix,
+      'the captured field must match the hash recorded with the evidence',
+    );
+    assert.equal(raw,
+      '<|tool_calls_section_begin|><|tool_call_begin|>functions.terminal:0<|tool_call_argument_begin|>'
+      + '{"command": "pwd"}<|tool_call_end|><|tool_calls_section_end|>');
+  });
+
+  for (const [label, chunkSize] of [
+    ['one byte at a time', 1],
+    ['as a single chunk', raw.length],
+  ]) {
+    it(`parses the captured field ${label}`, () => {
+      const result = collectStreaming(raw, 'swe-1-7', chunkSize);
+
+      assert.equal(result.text, '', 'no protocol markup may leak into the text channel');
+      assert.equal(result.toolCalls.length, 1, 'exactly one tool call is present in the field');
+      const [call] = result.toolCalls;
+      assert.equal(call.name, 'terminal');
+      assert.deepEqual(JSON.parse(call.argumentsJson), { command: 'pwd' });
+      assert.equal(raw.includes('{"command": "pwd"}'), true,
+        'the captured wire keeps the JSON space; the parser normalizes it, not the fixture');
+    });
+  }
 });

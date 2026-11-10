@@ -7,7 +7,7 @@
     "test/audit-fixes.test.js",
     "test/docker-self-update.test.js"
   ],
-  "expectBaselinePass": 164,
+  "expectBaselinePass": 187,
   "mutations": [
     {
       "name": "dashboard stable-tag selection accepts leading-zero pseudo versions",
@@ -72,14 +72,14 @@
     {
       "name": "successful dashboard update releases the lock before restart handoff",
       "file": "src/dashboard/api.js",
-      "anchor": "        }, releaseMutation);\n        mutationLockHandedOff = restartScheduled === true;\n      }\n      return json(res, 200, {\n        ok: true,",
-      "replacement": "        }, releaseMutation);\n        mutationLockHandedOff = false;\n      }\n      return json(res, 200, {\n        ok: true,"
+      "anchor": "        }, releaseMutation);\n        mutationLockHandedOff = restartScheduled === true;\n        try {\n          updateSelfUpdateJournal({",
+      "replacement": "        }, releaseMutation);\n        mutationLockHandedOff = false;\n        try {\n          updateSelfUpdateJournal({"
     },
     {
       "name": "successful rollback releases the lock before restart handoff",
       "file": "src/dashboard/api.js",
-      "anchor": "          }), releaseMutation);\n        mutationLockHandedOff = restartScheduled === true;\n        return json(res, 200, { ok: true, rolledBackTo: beforeCommit.slice(0, 7) });",
-      "replacement": "          }), releaseMutation);\n        mutationLockHandedOff = false;\n        return json(res, 200, { ok: true, rolledBackTo: beforeCommit.slice(0, 7) });"
+      "anchor": "        }, releaseMutation);\n        mutationLockHandedOff = restartScheduled === true;\n        if (mutationLockHandedOff) {",
+      "replacement": "        }, releaseMutation);\n        mutationLockHandedOff = false;\n        if (mutationLockHandedOff) {"
     },
     {
       "name": "Docker deployer ownership is released with the HTTP response",
@@ -312,8 +312,8 @@
     {
       "name": "Docker OTA replays only an implicit Compose file",
       "file": "src/dashboard/docker-self-update.js",
-      "anchor": "  const composeConfigArgs = configFiles.map(file => '-f ' + shellQuote(file)).join(' ');",
-      "replacement": "  const composeConfigArgs = '';"
+      "anchor": "    + ' ' + configFiles.map(file => '-f ' + shellQuote(file)).join(' ');",
+      "replacement": "    + ' ';"
     },
     {
       "name": "Docker OTA leaves a stopped deployer after start failure",

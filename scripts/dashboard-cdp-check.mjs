@@ -85,7 +85,7 @@ try {
   pass('overview trend section removed', (await ev(`!document.getElementById('overview-trend-section')`)) === true);
   pass('overview trend canvas removed', (await ev(`!document.getElementById('overview-trend-canvas')`)) === true);
   pass('model pie canvas removed', (await ev(`!document.getElementById('model-pie-canvas')`)) === true);
-  pass('model-stats table present', (await ev(`!!document.getElementById('model-stats-table')`)) === true);
+  pass('model stats aggregate table present', (await ev(`!!document.getElementById('stats-agg-table')`)) === true);
   const rawKeys = await ev(`(document.body.innerText.match(/\\b(section|action|status|confirm|toast|overview|table|aria)\\.[a-zA-Z][a-zA-Z0-9.]+/g)||[]).slice(0,6)`);
   pass('no unresolved i18n keys in body', Array.isArray(rawKeys) && rawKeys.length === 0, JSON.stringify(rawKeys));
   pass('zero console errors / exceptions', errors.length === 0, errors.slice(0, 5).join(' | '));

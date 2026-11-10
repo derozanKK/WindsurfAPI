@@ -4,7 +4,7 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { writeJsonAtomic } from '../fs-atomic.js';
+import { writeJsonAtomic, restrictFileToOwnerSync } from '../fs-atomic.js';
 import { join } from 'path';
 import { config, log } from '../config.js';
 
@@ -27,6 +27,11 @@ try {
 function save() {
   try {
     writeJsonAtomic(PROXY_FILE, _config);
+    // SEC-03 follow-up: proxy.json stores upstream proxy passwords in
+    // cleartext. `mode: 0o600` is POSIX-only; on Windows the renamed file
+    // keeps the inherited directory ACL (Users/Authenticated Users), so run
+    // the same best-effort owner-only icacls pass as accounts.json.
+    restrictFileToOwnerSync(PROXY_FILE, { warn: (m) => log.warn(m) });
   } catch (e) {
     log.error('Failed to save proxy.json:', e.message);
   }

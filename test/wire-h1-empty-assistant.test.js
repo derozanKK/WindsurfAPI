@@ -5,6 +5,8 @@ import { syncBuiltinESMExports } from 'node:module';
 import { buildGetChatMessageRequest } from '../src/devin-connect.js';
 import { parseFields, getField, getAllFields } from '../src/proto.js';
 import { geminiToOpenAI } from '../src/handlers/gemini.js';
+import { log } from '../src/config.js';
+import { getConnectMetrics, resetConnectMetrics } from '../src/devin-connect-metrics.js';
 
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 const image = { type: 'image_url', image_url: { url: `data:image/png;base64,${PNG}` } };
@@ -97,10 +99,74 @@ test('H1-T4: image-only Gemini history is reachable but default wire stays froze
   assert.deepEqual(converted.messages, [
     { role: 'assistant', content: [image] }, user,
   ]);
-  // This is a compatibility boundary, not an assertion that image loss is desirable.
+  // This is a compatibility boundary, not an assertion that image loss is desirable:
+  // the upstream ignores #10 on role=assistant (measured 2026-10-21, issue #272), so
+  // admitting the turn would ship bytes it discards. What must NOT happen is losing
+  // the image SILENTLY — that is H1-T7 below.
   for (const native of [false, true]) {
     assert.deepEqual(build(converted.messages, {}, native), build([user], {}, native));
   }
+});
+
+test('H1-T4b: the image-only assistant drop is named in the log and counted (#272)', () => {
+  // Issue #272 is filed as "silently dropped". The drop itself is measured-correct
+  // (upstream ignores assistant-role images); the silence is the defect. Pin both
+  // halves here so a future edit cannot restore the silence — or admit the turn
+  // without a deliberate decision (that is what mutation M5 guards).
+  const captured = [];
+  const realWarn = log.warn;
+  log.warn = (...args) => captured.push(args.join(' '));
+  resetConnectMetrics();
+  try {
+    build([{ role: 'assistant', content: [image] }, user], {});
+  } finally {
+    log.warn = realWarn;
+  }
+  assert.equal(captured.length, 1, `expected exactly one drop warning, got ${JSON.stringify(captured)}`);
+  assert.match(captured[0], /from an assistant turn \(#272\)/);
+  assert.match(captured[0], /dropped 1 inline image/);
+  assert.equal(getConnectMetrics().assistant_images_dropped, 1);
+
+  // Image emission disabled → the images were never going to be emitted, so there
+  // is nothing to report and the counter must not move.
+  captured.length = 0;
+  log.warn = (...args) => captured.push(args.join(' '));
+  try {
+    build([{ role: 'assistant', content: [image] }, user], { DEVIN_CONNECT_IMAGE_TAG: '0' });
+  } finally {
+    log.warn = realWarn;
+  }
+  assert.deepEqual(captured, []);
+  assert.equal(getConnectMetrics().assistant_images_dropped, 1);
+
+  // A text-carrying assistant turn keeps its image (H1-T5) — it must not be
+  // reported as dropped either.
+  captured.length = 0;
+  log.warn = (...args) => captured.push(args.join(' '));
+  try {
+    build([{ role: 'assistant', content: [{ type: 'text', text: 'caption' }, image] }, user], {});
+  } finally {
+    log.warn = realWarn;
+  }
+  assert.deepEqual(captured, []);
+  assert.equal(getConnectMetrics().assistant_images_dropped, 1);
+
+  // Second drop site: the native tool-call branch encodes text and #6 calls only,
+  // so an image riding an assistant turn that also carries tool_calls is discarded
+  // there instead. Same defect class, same report.
+  captured.length = 0;
+  log.warn = (...args) => captured.push(args.join(' '));
+  try {
+    build([
+      { role: 'assistant', content: [image], tool_calls: [call('a')] },
+      user,
+    ], {}, true);
+  } finally {
+    log.warn = realWarn;
+  }
+  assert.equal(captured.length, 1, `expected one native-branch drop warning, got ${JSON.stringify(captured)}`);
+  assert.match(captured[0], /from an assistant turn \(#272\)/);
+  assert.equal(getConnectMetrics().assistant_images_dropped, 2);
 });
 
 test('H1-T5: a non-text part must not be flattened by coalescing', () => {

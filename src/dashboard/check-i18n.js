@@ -45,7 +45,7 @@ const CHINESE_REGEX = /[\u4e00-\u9fff]/;
 // Patterns that are allowed to contain Chinese (whitelisted)
 const WHITELIST_PATTERNS = [
   /data-i18n(?:-[\w-]+)?=/,  // i18n attributes are ok
-  /id="lang-indicator"/, // compact language toggle label
+  /id="(?:mobile-)?lang-indicator"/, // compact language toggle label
   /indicator\.textContent\s*=/, // compact language toggle label
   /\/\/.*/,      // comments
   /https?:\/\//,  // URLs

@@ -85,14 +85,23 @@ describe('rate table → currently-free selectors (#235)', () => {
     assert.equal(isConnectSelectorCurrentlyFree(PAID_SELECTOR), false);
   });
 
-  it('keeps the static whitelist as a UNION, not a replacement', () => {
-    // swe-1-6-slow appears in no catalog snapshot, so it can never appear in a
-    // selector-keyed rate table. Intersecting would drop the one selector every
-    // account can reach and black out a drought-mode pool.
+  it('keeps the static whitelist as a FALLBACK, not a union over live data', () => {
+    // The old rule was a UNION: a whitelist selector stayed free even when a live
+    // rate table omitted it, on the premise that `swe-1-6-slow` is "the one selector
+    // every account can reach". Two live tokens falsified that premise (2026-10-22):
+    // the selector is absent from the 240-selector catalog and 502s with "daily usage
+    // quota has been exhausted". Live data outranks the stale list; the whitelist is
+    // only the cold-start fallback for when NO live pricing source exists.
     mk({ weeklyPercent: 50, rateTable: { [PROMO_SELECTOR]: 0 } });
 
+    assert.equal(isConnectSelectorCurrentlyFree(FREE_SELECTOR), false,
+      'a live rate table that omits the selector is evidence the static list is stale');
+    assert.equal(isConnectSelectorCurrentlyFree(PROMO_SELECTOR), true);
+
+    // No live source anywhere → the documented fallback applies.
+    removeAccount(created.pop());
     assert.equal(isConnectSelectorCurrentlyFree(FREE_SELECTOR), true,
-      'the static free-reachable selector must survive a table that omits it');
+      'with no live pricing data the static floor is the only free source');
   });
 
   it('ignores an UNPAIRED (array) rate table', () => {

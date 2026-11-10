@@ -27,7 +27,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { renameSync, unlinkSync, openSync, writeSync, fsyncSync, closeSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { dirname } from 'node:path';
 
 const RETRYABLE_RENAME_CODES = new Set(['EPERM', 'EBUSY']);
@@ -121,5 +123,63 @@ export function writeJsonAtomic(targetPath, value, { spaces = 2, mode = 0o600 } 
   } catch (err) {
     try { unlinkSync(tmp); } catch {}
     throw err;
+  }
+}
+
+// ── Windows ACL hardening ──────────────────────────────────
+//
+// `mode: 0o600` is a POSIX contract; on Windows Node maps it (at best) to the
+// read-only bit and the file keeps the ACL it inherits from its directory —
+// `BUILTIN\Users:(RX)` and `NT AUTHORITY\Authenticated Users:(M)` on a default
+// profile. accounts.json holds upstream tokens in cleartext and the packaged
+// first-run .env holds the API key + dashboard password, so "owner-only" has to
+// be enforced explicitly there.
+//
+// Best effort by design: a failed icacls must never fail the write that just
+// succeeded (the bytes are already durable), but it must be LOUD — a silent
+// failure is the same inherited-ACE exposure with a false sense of safety.
+// `/inheritance:r` drops inherited ACEs (which is what Users/Authenticated
+// Users get); `/grant:r <user>:(F)` leaves exactly one explicit owner ACE.
+// Group names are deliberately not referenced — they are localized, while
+// `/inheritance:r` works on every Windows locale.
+const ACL_WARNED = new Set();
+
+function defaultWindowsUser() {
+  const username = process.env.USERNAME || userInfo().username;
+  const domain = process.env.USERDOMAIN;
+  return domain ? `${domain}\\${username}` : username;
+}
+
+export function restrictFileToOwnerSync(targetPath, {
+  platform = process.platform,
+  run = execFileSync,
+  warn = (message) => console.warn(message),
+  resolveUser = defaultWindowsUser,
+} = {}) {
+  if (platform !== 'win32') return { applied: false, reason: 'not-windows' };
+  let user;
+  try {
+    user = resolveUser();
+  } catch (err) {
+    user = '';
+    warn(`[fs] cannot resolve the current Windows user for ${targetPath}: ${err?.message || err}`);
+  }
+  if (!user) return { applied: false, reason: 'no-user' };
+  try {
+    run('icacls', [targetPath, '/inheritance:r', '/grant:r', `${user}:(F)`], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    return { applied: true, user };
+  } catch (err) {
+    const message = `[fs] could not restrict permissions on ${targetPath} (${err?.code || err?.message}); inherited Users/Authenticated Users access may remain`;
+    // Saves repeat on a timer; one warning per path+reason is enough to be
+    // actionable without turning a read-only install into a log flood.
+    const key = `${targetPath}\0${err?.code || err?.message}`;
+    if (!ACL_WARNED.has(key)) {
+      ACL_WARNED.add(key);
+      warn(message);
+    }
+    return { applied: false, reason: 'icacls-failed', error: err?.message };
   }
 }

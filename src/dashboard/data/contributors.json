@@ -226,6 +226,26 @@
       "summary": "系统性扫了一遍仓库提了 CRITICAL/HIGH/MEDIUM 15 条修复建议：XSS 转义、shell 注入防护、10MB body 上限、auth 路由顺序、gRPC 双回调保护、LS pool 并发竞态、HTTP/2 frame 16MB 上限、varint BigInt 支持。PR 因改动面过大未直接合并，但其中多项被后续独立重做。"
     },
     {
+      "login": "suhaihui-git",
+      "githubId": 57882092,
+      "pr": 142,
+      "weight": "A",
+      "weightLabel": "响应缓存总开关（RESPONSE_CACHE_ENABLED / WINDSURFAPI_RESPONSE_CACHE）· 全语料唯一一条 APPROVED",
+      "mergedAt": "2026-05-06",
+      "title": "新增响应缓存关闭开关",
+      "summary": "响应缓存第一次变成可配置：新增 `RESPONSE_CACHE_ENABLED` / `WINDSURFAPI_RESPONSE_CACHE` 开关，可显式关闭本地精确匹配响应缓存；默认仍启用、行为逐字节不变，`.env.example` 只给注释形式的关闭示例。改动不止一个 flag：client.js / chat.js / messages.js 的读写路径与 dashboard 面板（含 `cacheStats()` 的 `enabled` 字段）一起接上，测试覆盖默认启用、显式关闭、流式缓存命中三种形态。全语料**唯一一条 APPROVED** 的 PR —— 「Clean feature, well-tested. Simple env-controlled cache disable. LGTM.」；同日 cherry-pick 进 master（`6d19afc`），维护者明确「Credits 会加上你的贡献」。开关至今仍在 `ENV-SWITCHES.md` 表里（默认开）。"
+    },
+    {
+      "login": "Await-d",
+      "githubId": 58165861,
+      "pr": 144,
+      "weight": "A",
+      "weightLabel": "PostAuth 协议三处对齐 · 修好 v2.0.89 的邮箱/密码登录",
+      "mergedAt": "2026-05-07",
+      "title": "fix(dashboard): send Auth1 token in PostAuth header for v2.0.89 login",
+      "summary": "v2.0.89 的邮箱/密码登录被上游协议变更打断（`ERR_POSTAUTH_FAILED` / `unauthenticated: missing required header: X-Devin-Auth1-Token`），这个 PR 把 PostAuth 三件事一次对齐：Auth1 token 改走 `X-Devin-Auth1-Token` 请求头、请求体切成当前的空 `application/proto` 形态、从原始 PostAuth 响应解析 `devin-session-token$…` 会话凭证，并补回归断言。与 v2.0.90 的 OTT 修复是两条独立故障链（那条修的是更靠后的 OneTimeToken）。维护者当日 cherry-pick（`1383b0c`，落地为 `04c1500`，commit message 署名 `PR #144 by @Await-d`）并承诺「Credits 面板会加上」。"
+    },
+    {
       "login": "you922",
       "pr": 162,
       "weight": "S",
@@ -532,6 +552,26 @@
       "summary": "kimi 之类的客户端会在长对话里压缩历史:0/31 保留的 pair 逐字或规范都存活不下来,客户端改写保留尾 —— 但对话的第一轮输入逐字存活。这个 PR 用 root anchor(首轮输入哈希)索引每个 state,compaction 之后 pair 证据全丢时,通过 root 重新关联。三条防线:root-index the fork(分叉共享开端的 root,避免压缩后被并回原会话的 hijack)、模糊规则(多个活跃候选无 pair 证据 → 不分配给任何,生成新 id)、TTL 驱逐(过期 state 不通过压缩复活)。guard 只在「没有任何入站哈希命中索引」时走 root(seen 为空)—— 前缀 pair 仍命中的分叉对话不得被 root 重关联。新增 spec session-continuity-compaction-survival.json 3 条突变全 CAUGHT。未到 S 是因为「survive client history compaction」只在单对话成立,而 PR 描述说成通用能力;另外与 #242 的 findExistingState 抽取有结构性交互(git 三方合并看不见,合并时实测 15 条测试失败后修复),说明拆函数抽局部这类重构跨 PR 叠加时风险在文本层之下。"
     },
     {
+      "login": "warelik",
+      "githubId": 54947489,
+      "pr": 249,
+      "weight": "A+",
+      "weightLabel": "reasoning/content 边界追踪钓竿（WINDSURFAPI_LEAK_TRACE）· #250 的现成仪器，默认关零开销",
+      "mergedAt": "2026-08-10",
+      "title": "feat(trace): WINDSURFAPI_LEAK_TRACE — structured reasoning/content boundary logs for catching live reasoning leaks (opt-in, default OFF)",
+      "summary": "为 #250（reasoning 偶发漏进 content 通道、只能在真实会话里复现）造的**结构化追踪钓竿**：`WINDSURFAPI_LEAK_TRACE` 默认关、关闭时行为逐字节不变，开启后在 reasoning/content 边界按最小充分集埋三个点 —— 事件层（devin-connect-openai）记原始通道与 think 标记、分类层（messages）记重路由决策、出口层（chat settle）记 settle 后的尺寸比与 `outcome`（ok / client-abort / upstream-error，异常出口不再输出全空行）。评审要求把 #243 用来命名该泄漏的 `<think>` 方言补进标记表、采样复用 `log-safety` 脱敏、文档写明实测量级（一个 2000 token 回答 ≈ 215 KiB），改完合入（`08861f7`），附 6 条突变 spec 全 CAUGHT。只做可观测性不做修复 —— 「抓到现场后另开 PR 提修复」。至今仍是四个「从未开过」的现成仪器之一：关 #250 只差一次开门的真会话。"
+    },
+    {
+      "login": "wjurkowlaniec",
+      "githubId": 1134323,
+      "pr": 252,
+      "weight": "A",
+      "weightLabel": "SWE 家族 → kimi_k2 方言路由 · wire 捕获钉住观察，收窄后合入",
+      "mergedAt": "2026-08-10",
+      "title": "Fix/swe family tool dialect",
+      "summary": "把 SWE 家族从「标记格式与解析器错配」里救出来：SWE-1.5 / 1.6 / 1.7 在生产流量里与 Kimi K2 用同一套 section-token 工具格式，`pickToolDialect` 据此把**被观察到的**变体路由到 `kimi_k2`，`swe-1-6-slow` / `-lightning` / 未知变体保持安全的 XML 默认。第一轮 `startsWith('swe')` 的写法把免费档唯一可达的 `swe-1-6-slow` 一起卷入，被维护者实测拦下（流式路径上标记原样漏给客户端）；收窄后附 sanitized `swe-1-7` wire 捕获（`test/_research/`）钉住承重结论，并把流式/非流式的原生 section-token 解析、工具历史保真（`call_*` ID → `functions.<name>:<index>`、并行调用保持一个 section）与两个突变 spec 基线（94→95 / 72→73）一起补齐。维护者结语：「这个 PR 的价值在观察本身 —— SWE 系列跟 Kimi K2 共用 section-token 格式这件事，不看生产流量是想不到的。收窄之后我直接合。」"
+    },
+    {
       "login": "lovedxc",
       "githubId": 138214841,
       "pr": 270,
@@ -590,6 +630,26 @@
       "mergedAt": "2026-09-16",
       "title": "fix(tools): absorb stray assistant text inside parallel tool-call runs",
       "summary": "Codex 的 responses 路径每轮会在并行 tool_calls 之间重放一条 reasoning+text 的 assistant 条目,归一化后是 [call, call, text] 的同源 3 连,上游状态机拒。作者定位到 interleaveParallelToolMessages 只交错 call/result 对、不看游离文本,改成把文本折进首个 call 的回合。维护方评审两轮:M1 首个 call 的数组 content 被压平成字符串 → image_url 部件在进 extractInlineImages 之前消失(wire 实测 images 1→0,与 #265 刚钉死的 isMergeableText 守卫冲突);M3.1 空 tool_call_id 能与空结果 id 配对(两个空串相等不是归属证据);M3.2 带自有字段的游离条目(reasoning_content/signature 等)折进后字段静默丢失。作者第二轮全改到位:追加 text part 而不是压平、两处恢复 tcid &&、只在 role/content/tool_calls 且 content 全文本 part 时才折叠,否则整条透传追加在交错块末尾(已声明代价:同源 ≥3 连续此类条目仍可能连发,与该形状修复前一致)。维护方合并时复核:作者测试 79/79;独立探针 10/10(图存活、空 id 透传、字段存活、既有不变量);270 条完整请求 Buffer 对 v3.9.34 pristine 逐字节一致(5 条预处理路径 × native × 三组 env);规格 anchor 重指 + 基线重测 72→79 / 103→110 / 81→88;注入一条突变确认 CAUGHT、一条 KNOWN SURVIVOR 确认仍 SURVIVED。默认路径与 wire 无变化,随下一版发布。"
+    },
+    {
+      "login": "3219378872",
+      "githubId": 62558119,
+      "pr": 278,
+      "weight": "A",
+      "weightLabel": "thinking 块恒带 signature · 修好 Grok Build，并推翻无据的旧裁定",
+      "mergedAt": "2026-10-05",
+      "title": "fix(messages): always include `signature` on thinking blocks",
+      "summary": "修好 #277：`/v1/messages` 的 thinking 块现在**始终带 `signature` 字段**（上游有真实签名时为真实值，没有时为空串），流式 `content_block_start` 与非流式一起对齐 —— Grok Build 把 `ContentBlock::Thinking.signature` 反序列化为必填 `String`，缺字段整条响应 / SSE 事件直接失败。这条同时**推翻了一个无据的旧裁定**：当年 #228 以「严格客户端会拒空 signature」为由删掉字段，但没版本、没报错、没复现；作者用 Grok Build 源码 + 最小 serde 程序 + 生产实例 + 端到端多轮工具调用（3 轮 success）逐层举证，维护者复核后判定「有证据的一边赢了没证据的一边」，并把它记入质量条作为「…"
+    },
+    {
+      "login": "PsychMing",
+      "githubId": 107941337,
+      "pr": 282,
+      "weight": "S",
+      "weightLabel": "签名 thinking 往返：`#11` thinking + `#12` signature 在工具循环、rescue 重试与后续用户轮都能被模型读到，默认关闭、失败关闭",
+      "mergedAt": "2026-10-30",
+      "title": "feat(devin-connect): round-trip signed thinking (tool loops, rescue retries, later user turns)",
+      "summary": "让 Claude 的**签名 thinking**真正往返，而不是被历史翻译丢掉。上游响应的 thinking 签名（`#10`，实测 1440 字符 CAIS `C` 信封）先经 `DEVIN_CONNECT_SIGNATURE_TAG` 解码交给客户端；客户端在 `/v1/messages` 历史里带回的带签名 thinking 块，在 `DEVIN_CONNECT_REPLAY_SIGNED_THINKING=1` 时以 `#11` thinking + `#12` signature 原生回放到 assistant 帧 —— 工具调用轮与纯文本轮都包括，工具循环内、rescue 重试之后、以及用户发新消息之后都有效。上游会验签（同一段历史改一个字节即 `invalid_argument` 400，未改动的 200），所以回放的不是「让模型回忆」的提示词，而是真实可验证的推理上下文；实测工具循环召回 2/3 对不带签名的 0/3，真实 Claude Code 2.1.306 的 `Read` 工具循环 + `--resume` 后续轮 wire 为 `#11` 72 B + `#12` 936 B（关闭时 0/0）。维护方评审把四处会让签名静默消失的路径全部钉掉：M1 流式 `signature_delta` 被赋值覆盖（master 既有缺陷，改为累加）、M2 builder 在旧回放探测关闭时丢掉 signed reasoning-only 历史、M3 `/v1/messages` 入口在进 builder 前就丢掉 thinking-only assistant 轮、M4 rescue 过滤把带签名的 reasoning-only 历史当空轮剔除；并补齐守卫：provider 门（只限 Claude，未入目录的名字按 `claude-*`/`anthropic/` 兜底）、E/R/C/Q 信封门（其他形状含 `#` 缓存前缀 400，接受字节永不改写）、强制 prompt 模拟时 400 失败关闭、历史预算计入签名字节、多段签名整体抑制（拼起来是无效签名）。默认关闭，因此默认路径的 wire 仍 270/270 逐字节不变。"
     }
   ]
 }

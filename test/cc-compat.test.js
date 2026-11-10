@@ -179,10 +179,20 @@ describe('cc-compat stats', () => {
   beforeEach(() => resetCcCompatStats());
 
   it('counts schema normalizations and identity neutralizations independently', () => {
-    assert.deepEqual(getCcCompatStats(), { schemaNormalized: 0, identityNeutralized: 0 });
+    assert.deepEqual(getCcCompatStats(), {
+      schemaNormalized: 0,
+      identityNeutralized: 0,
+      toolDeferLoadingHonored: 0,
+      toolDeferLoadingIgnored: 0,
+    });
     recordSchemaNormalized();
     recordSchemaNormalized();
     recordIdentityNeutralized();
-    assert.deepEqual(getCcCompatStats(), { schemaNormalized: 2, identityNeutralized: 1 });
+    assert.deepEqual(getCcCompatStats(), {
+      schemaNormalized: 2,
+      identityNeutralized: 1,
+      toolDeferLoadingHonored: 0,
+      toolDeferLoadingIgnored: 0,
+    });
   });
 });

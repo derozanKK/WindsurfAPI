@@ -8,19 +8,21 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 506 files / ~6,250 tests: measured 10m+ on a hosted runner. The old 10-minute
+    # cap cancelled v3.9.58 mid-suite; 20 leaves headroom without hiding a hang.
+    timeout-minutes: 20
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # The wire comparison base is a tag, so the tags have to be here.
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '24'
           cache: 'npm'
@@ -56,6 +58,15 @@ jobs:
       - name: Secret scan
         run: npm run secret-scan
 
+      - name: Mutation baselines match, measured from executed evidence (full scope)
+        # FULL scope on purpose: a tag checkout has no diff to scope by, and a
+        # change-scoped run would measure nothing (or exit 2 on the missing
+        # origin/master). Every spec is executed against its own pin here, which is
+        # the only mode that catches a pin moved by a change no spec's test list
+        # names. The incremental `npm run gate` stays fast with change-scoped
+        # selection; this is the gate that cannot be scoped.
+        run: node scripts/spec-baseline-check.mjs --all
+
       - name: Run tests
         run: npm run test:release
 
@@ -67,10 +78,17 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Policy T (D9 §5.3): keyless signing exchanges this job's GitHub OIDC
+      # token for a short-lived Fulcio certificate. No key or secret is used.
+      id-token: write
+    # The digest is the only immutable identity of the pushed image; keep it
+    # addressable from the release job and from the workflow run summary.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Build metadata
         run: |
@@ -84,10 +102,10 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Login to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -95,7 +113,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           # github.repository (= dwgx/WindsurfAPI) lowercases to "windsurfapi"
           # without the hyphen the package.json npm name uses. Hardcode the
@@ -110,7 +128,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: linux/amd64
@@ -126,12 +145,60 @@ jobs:
             BUILD_COMMIT_DATE=${{ env.COMMIT_DATE }}
             BUILD_BRANCH=${{ env.BUILD_BRANCH }}
 
+      - name: Install cosign
+        # Policy T (D9 §5.3): same pinned signer as the release-assets job.
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.1.4'
+
+      - name: Sign the pushed image digest (keyless)
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/windsurf-api
+        run: |
+          set -euo pipefail
+          digest='${{ steps.build.outputs.digest }}'
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::build-push did not return a sha256 image digest: $digest"
+            exit 1
+          fi
+          cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Record the signed image digest
+        id: image-digest
+        run: |
+          set -euo pipefail
+          digest='${{ steps.build.outputs.digest }}'
+          if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::refusing to publish an invalid image digest: $digest"
+            exit 1
+          fi
+          printf '%s\n' "$digest" > image-digest.txt
+          test -s image-digest.txt
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Sign image-digest.txt (keyless)
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle image-digest.txt.sigstore.json image-digest.txt
+          test -s image-digest.txt.sigstore.json
+
+      - name: Upload the signed image digest
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: image-digest
+          path: |
+            image-digest.txt
+            image-digest.txt.sigstore.json
+          if-no-files-found: error
+
       - name: Summary
         run: |
           echo "## Docker Image Published" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Tags:**" >> "$GITHUB_STEP_SUMMARY"
           echo '${{ steps.meta.outputs.tags }}' | tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Platform:** \`linux/amd64\`" >> "$GITHUB_STEP_SUMMARY"
 
@@ -145,16 +212,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '22'
 
       - name: Build windsurfapi-macos-arm64
         run: |
-          npm i -g @yao-pkg/pkg@6.21.0 esbuild
+          npm i -g @yao-pkg/pkg@6.21.0 esbuild@0.28.1
           npm run build:bundle
           mkdir -p dist-macos
           pkg src/_bundle.cjs --config package.json --targets node22-macos-arm64 --output dist-macos/windsurfapi-macos-arm64
@@ -163,7 +230,7 @@ jobs:
         run: node scripts/exe-boot-smoke.mjs dist-macos/windsurfapi-macos-arm64
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: windsurfapi-macos-arm64
           path: dist-macos/windsurfapi-macos-arm64
@@ -184,16 +251,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '22'
 
       - name: Build windsurfapi-macos-x64
         run: |
-          npm i -g @yao-pkg/pkg@6.21.0 esbuild
+          npm i -g @yao-pkg/pkg@6.21.0 esbuild@0.28.1
           npm run build:bundle
           mkdir -p dist-macos
           pkg src/_bundle.cjs --config package.json --targets node22-macos-x64 --output dist-macos/windsurfapi-macos-x64
@@ -202,7 +269,7 @@ jobs:
         run: node scripts/exe-boot-smoke.mjs dist-macos/windsurfapi-macos-x64
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: windsurfapi-macos-x64
           path: dist-macos/windsurfapi-macos-x64
@@ -218,10 +285,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           # Match the pkg target (node22-win-x64). pkg-fetch 3.6.4 ships prebuilt
           # base binaries for node22/24/26 but NOT node20 — a node20 target 404s
@@ -243,7 +310,7 @@ jobs:
       # (node20 has none → don't use it). Zero runtime deps, so no `npm ci`.
       - name: Build windsurfapi.exe
         run: |
-          npm i -g @yao-pkg/pkg@6.21.0 esbuild
+          npm i -g @yao-pkg/pkg@6.21.0 esbuild@0.28.1
           npm run build:bundle
           pkg src/_bundle.cjs --config package.json --targets node22-win-x64 --output dist-windows/windsurfapi.exe
 
@@ -299,7 +366,7 @@ jobs:
           Write-Host 'zip OK: exe + tray scripts present'
 
       - name: Upload exe artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: windsurfapi-windows-exe
           path: |
@@ -314,10 +381,14 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      # SEC-04: keyless cosign signing exchanges this job's GitHub OIDC token
+      # for a short-lived Fulcio certificate. No repository secret or private
+      # key is involved; without this permission the signing step fails closed.
+      id-token: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Get version from tag
         id: version
@@ -338,20 +409,28 @@ jobs:
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Download the signed image digest
+        # DockerSign's docker job uploads `image-digest` (digest + cosign
+        # bundle). The release job attaches both files; the docker job owns
+        # producing them.
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: image-digest
+
       - name: Download Windows exe
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: windsurfapi-windows-exe
           path: dist-windows
 
       - name: Download macOS arm64 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: windsurfapi-macos-arm64
           path: dist-macos
 
       - name: Download macOS x64 binary (optional)
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         continue-on-error: true
         with:
           name: windsurfapi-macos-x64
@@ -371,8 +450,99 @@ jobs:
           cd dist-macos && zip -r ../windsurfapi-macos.zip . && cd ..
           echo "macOS zip contents:"; unzip -l windsurfapi-macos.zip
 
+      - name: Generate SHA256SUMS for the published assets
+        # SEC-04: releases used to ship unsigned, unhashed binaries, so a
+        # tampered download was indistinguishable from a real one. Hash exactly
+        # the files listed in the release `files:` block below; a missing file
+        # fails the job rather than publishing a partial manifest.
+        #
+        # The manifest must name the assets as they appear on the release page
+        # (flat), not their build-tree paths: GitHub release assets have no
+        # directories, so `sha256sum -c SHA256SUMS` in a flat download folder
+        # failed for every asset that carried a `dist-*/` prefix (v3.9.53, the
+        # first release with a manifest). The subshells keep the build layout
+        # while flattening names.
+        run: |
+          ( cd dist-windows && sha256sum windsurfapi.exe windsurfapi-windows.zip ) > SHA256SUMS
+          ( cd dist-macos && sha256sum windsurfapi-macos-arm64 ) >> SHA256SUMS
+          sha256sum windsurfapi-macos.zip >> SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate release attestation
+        # D9: bind the tag to the exact commit/tree and to the bytes of every
+        # published asset. The file is signed in the next-but-one step with the
+        # same keyless identity as the assets, then attached to the release.
+        # `git rev-parse HEAD` is the tag's commit (checkout is at the tag).
+        run: |
+          node scripts/generate-release-attestation.mjs \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$(git rev-parse HEAD)" \
+            --tree "$(git rev-parse 'HEAD^{tree}')" \
+            --repository "$GITHUB_REPOSITORY" \
+            --out release-attestation.json
+          cat release-attestation.json
+
+      - name: Install cosign
+        # SEC-04/SEC-11: the signer is pinned by commit SHA (the tag is mutable)
+        # and to an exact cosign release, so the tool that produces the
+        # signatures cannot change under a release without a visible commit.
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.1.4'
+
+      - name: Sign the published assets and SHA256SUMS (keyless)
+        # SEC-04: SHA256SUMS alone is only an integrity check — it ships in the
+        # same release as the binaries, so whoever can rewrite the release can
+        # rewrite both. Sign every published blob with the workflow's GitHub
+        # OIDC identity (no key, no secret) and publish:
+        #   *.sig             detached signature
+        #   *.pem             Fulcio certificate carrying the workflow identity
+        #   *.sigstore.json   Sigstore bundle (cert + Rekor inclusion proof)
+        # The bundle is the durable proof: Fulcio certificates expire in
+        # minutes, and a detached certificate can only be checked against the
+        # current time. Verification instructions live in docs/RELEASE-SIGNING.md.
+        #
+        # Any signing failure fails this job. A release that claims signatures
+        # in its notes but ships none is worse than an explicitly unsigned one.
+        run: |
+          set -euo pipefail
+          for f in \
+            dist-windows/windsurfapi.exe \
+            dist-windows/windsurfapi-windows.zip \
+            dist-macos/windsurfapi-macos-arm64 \
+            windsurfapi-macos.zip \
+            SHA256SUMS; do
+            base="$(basename "$f")"
+            cosign sign-blob \
+              --yes \
+              --bundle "${base}.sigstore.json" \
+              "$f"
+          done
+          # A missing or empty signature would otherwise be attached as a
+          # zero-byte asset and only discovered by the first user to verify.
+          for f in *.sigstore.json; do
+            [ -s "$f" ] || { echo "::error::signature bundle $f is empty"; exit 1; }
+          done
+          ls -l *.sigstore.json
+
+      - name: Sign the release attestation (keyless)
+        # D9: the statement itself is a published blob. Sign it with the same
+        # workflow identity that signs SHA256SUMS, so a consumer can prove the
+        # tag/commit/asset binding came from this workflow at this tag.
+        run: |
+          set -euo pipefail
+          cosign sign-blob \
+            --yes \
+            --bundle release-attestation.json.sigstore.json \
+            release-attestation.json
+          [ -s release-attestation.json.sigstore.json ] || {
+            echo "::error::release attestation signature bundle is empty"
+            exit 1
+          }
+          ls -l release-attestation.json release-attestation.json.sigstore.json
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           name: v${{ steps.version.outputs.VERSION }}
           body_path: ${{ steps.notes.outputs.found == 'true' && steps.notes.outputs.file || '' }}
@@ -380,7 +550,15 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
+            *.sig
+            *.pem
+            *.sigstore.json
             dist-windows/windsurfapi.exe
             dist-windows/windsurfapi-windows.zip
             dist-macos/windsurfapi-macos-arm64
             windsurfapi-macos.zip
+            image-digest.txt
+            image-digest.txt.sigstore.json
+            release-attestation.json
+            release-attestation.json.sigstore.json
+            SHA256SUMS

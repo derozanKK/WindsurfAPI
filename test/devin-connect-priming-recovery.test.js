@@ -7,9 +7,10 @@ import {
 
 // Regression coverage for the deferred role-priming fix: the role-priming chunk
 // must NOT be sent before the upstream demonstrably opens, otherwise the very
-// first send() flips `emitted=true` in handlers/chat.js and disarms every
-// !emitted-gated first-connect recovery branch (transient replay / re-login /
-// failover). See src/devin-connect-openai.js streamChatCompletion §1.
+// first send() flips `emitted=true` in handlers/chat.js and disarms the
+// !emitted-gated account recovery branches (re-login / failover), and it would
+// also make the adapter's own pre-emit transport retry look unsafe.
+// See src/devin-connect-openai.js streamChatCompletion §1.
 
 afterEach(() => {
   __setStreamChatForTest(null);

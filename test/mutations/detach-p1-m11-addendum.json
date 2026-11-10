@@ -1,0 +1,16 @@
+{
+  "tests": [
+    "test/cascade-turn-snapshot-v2.test.js",
+    "test/detached-registry.test.js",
+    "test/cascade-detach-lazy-resume.test.js"
+  ],
+  "expectBaselinePass": 59,
+  "mutations": [
+    {
+      "name": "M11 replay: prefix bypasses onChunk (raw send, no sanitizer)",
+      "file": "src/handlers/chat.js",
+      "anchor": "          for (const chunk of resumeClaim.entry.snapshot.chunks) {\n            await onChunk(chunk);",
+      "replacement": "          for (const chunk of resumeClaim.entry.snapshot.chunks) {\n            if (chunk?.text) await send({ id, object: 'chat.completion.chunk', created, model,\n              choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }] });"
+    }
+  ]
+}

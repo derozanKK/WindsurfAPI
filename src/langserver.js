@@ -1023,10 +1023,24 @@ const LS_ENV_ALLOWLIST = [
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
 ];
 
+// Windows-only. The LS calls Go's os.UserConfigDir(), which reads %AppData%
+// and aborts startup with "failed to determine user config directory:
+// %AppData% is not defined" when the child env has no APPDATA. Everything
+// else stays filtered: this build never links os.UserCacheDir or
+// os.UserHomeDir (their Go error strings are absent from the binary),
+// TEMP/TMP are already in the cross-platform list, and no LS code reads
+// SystemRoot as an env key.
+const LS_ENV_ALLOWLIST_WIN32 = ['APPDATA'];
+
 export function buildLanguageServerEnv(source = process.env, options = {}) {
   const env = {};
   for (const key of LS_ENV_ALLOWLIST) {
     if (source[key] != null && source[key] !== '') env[key] = source[key];
+  }
+  if ((options.platform ?? process.platform) === 'win32') {
+    for (const key of LS_ENV_ALLOWLIST_WIN32) {
+      if (source[key] != null && source[key] !== '') env[key] = source[key];
+    }
   }
   // Fall back to /root only when HOME isn't already set (e.g. a systemd
   // unit without User=). VPS deployments already have HOME in env; forcing

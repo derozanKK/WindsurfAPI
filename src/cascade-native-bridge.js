@@ -54,25 +54,25 @@ import {
 
 // ─── Cascade step type enums ───────────────────────────────────────
 //
-// CortexStepType field numbers from exa.cortex_pb.proto (see
-// scripts/ls-protos/proto/exa_cortex_pb_cortex.proto). The enum is the
-// CortexTrajectoryStep.type (field 1) value. The matching oneof field
-// number for each step is also the same number — Cascade keeps them
-// aligned so the discriminator and the body share an integer.
-
+// CortexStepType enum values from exa.cortex_pb.proto. The `type` field is
+// `CortexTrajectoryStep.type` (field 1), whose enum values are NOT the oneof
+// field numbers: e.g. VIEW_FILE=8 but the `view_file` body rides field 14.
+// Writing the oneof number into `type` labels every step as a different kind
+// (14 is USER_INPUT, 28 is COMMAND_STATUS, 40 is TOOL_CALL_PROPOSAL). The
+// body field still uses the oneof number; keep the two separate.
 export const CASCADE_STEP = {
   // step kind → { typeEnum, oneofField }
-  view_file:       { typeEnum: 14,  oneofField: 14  },
-  list_directory:  { typeEnum: 15,  oneofField: 15  },
-  write_to_file:   { typeEnum: 23,  oneofField: 23  },
-  run_command:     { typeEnum: 28,  oneofField: 28  },
-  propose_code:    { typeEnum: 32,  oneofField: 32  },
-  find:            { typeEnum: 34,  oneofField: 34  },
-  read_url_content:{ typeEnum: 40,  oneofField: 40  },
-  grep_search:     { typeEnum: 13,  oneofField: 13  },
-  grep_search_v2:  { typeEnum: 105, oneofField: 105 },
+  view_file:       { typeEnum: 8,   oneofField: 14  },
+  list_directory:  { typeEnum: 9,   oneofField: 15  },
+  write_to_file:   { typeEnum: 16,  oneofField: 23  },
+  run_command:     { typeEnum: 21,  oneofField: 28  },
+  propose_code:    { typeEnum: 24,  oneofField: 32  },
+  find:            { typeEnum: 25,  oneofField: 34  },
+  read_url_content:{ typeEnum: 31,  oneofField: 40  },
+  grep_search:     { typeEnum: 7,   oneofField: 13  },
+  grep_search_v2:  { typeEnum: 91,  oneofField: 105 },
   // v2.0.70 — search_web (CortexStepSearchWeb proto field 42).
-  search_web:      { typeEnum: 42,  oneofField: 42  },
+  search_web:      { typeEnum: 33,  oneofField: 42  },
 };
 
 // CortexStepStatus — used for the step.status field (CortexTrajectoryStep
@@ -866,12 +866,17 @@ const STEP_BODY_BUILDER = {
  * trajectory that already contains the answer and continues reasoning from
  * there instead of asking again.
  *
- * Returns null if `kind` has no encoder (caller should fall back).
+ * `observed` is REQUIRED (V-13 / KH-034). A step may only be stamped DONE
+ * when the caller reported a result for it; without that gate an unobserved
+ * call was encoded as "ran successfully, empty output", which the planner
+ * then treated as real history.
+ *
+ * Returns null if `kind` has no encoder or no observation was supplied.
  */
-export function buildAdditionalStep(kind, args) {
+export function buildAdditionalStep(kind, args, { observed = false } = {}) {
   const meta = CASCADE_STEP[kind];
   const builder = STEP_BODY_BUILDER[kind];
-  if (!meta || !builder) return null;
+  if (!meta || !builder || observed !== true) return null;
   const body = builder(args || {});
   // CortexTrajectoryStep envelope: type=1, status=4, oneof step body
   return Buffer.concat([
@@ -1282,90 +1287,226 @@ function partialFunctionCallsPrefixLength(text) {
 // planner reason from the post-tool state instead of re-asking.
 
 /**
- * Translate a single OpenAI assistant turn { tool_calls, ...} + the
- * matching tool messages into an array of CortexTrajectoryStep buffers
- * suitable for SendUserCascadeMessageRequest.additional_steps[9].
+ * Translate the caller's assistant/tool turns into CortexTrajectoryStep
+ * buffers plus the message list the emulation path should keep.
  *
- * Inputs:
- *   - assistantMessage: { role:'assistant', tool_calls: [{id, function:{name, arguments}}, ...] }
- *   - toolResults: Map<tool_call_id, content_string>
+ * For each tool_call whose name maps onto a cascade kind we encode the call
+ * args AS IF the planner had emitted them, and overlay the tool result onto
+ * the step (e.g. view_file.content = result_string for Read). Unmapped
+ * calls (and calls whose forward translation is lossy) stay in
+ * `emulationMessages` so the existing <tool_result> emulation still carries
+ * them — the bridge must not swallow history it cannot encode.
  *
- * For each tool_call we look up the cascade kind, encode the call args
- * AS IF the planner had emitted them, and overlay the tool result onto
- * the step (e.g. view_file.content = result_string for Read). Any
- * tool_call whose name isn't in TOOL_MAP is skipped — those go through
- * the existing user-message tool_result emulation fallback.
+ * `reuse: true` means the caller is resuming a cascade that already holds
+ * every observation step from earlier turns. Only the newest pending tool
+ * round can be new, so earlier rounds are not re-injected (V-13 / KH-034).
  *
- * Returns: Buffer[] (each one already has the CortexTrajectoryStep
- * envelope baked in via buildAdditionalStep).
+ * Returns { steps: Buffer[], deltaStart: number, emulationMessages: object[] }.
+ * `deltaStart` indexes the first step of the newest pending tool round, so a
+ * caller holding the full list can slice it for a reused cascade instead of
+ * encoding the history again. With `reuse: true`, `steps` is already that
+ * slice and `deltaStart` is 0.
  */
-export function buildAdditionalStepsFromHistory(messages) {
-  if (!Array.isArray(messages) || !messages.length) return [];
-  const out = [];
-
-  // Index tool result content by tool_call_id for fast lookup.
-  const toolResultById = new Map();
-  for (const m of messages) {
-    if (m?.role !== 'tool' || !m.tool_call_id) continue;
-    const content = typeof m.content === 'string'
-      ? m.content
-      : (Array.isArray(m.content)
-          ? m.content.filter(p => typeof p?.text === 'string').map(p => p.text).join('\n')
-          : JSON.stringify(m.content ?? ''));
-    toolResultById.set(m.tool_call_id, content);
+export function buildNativeToolHistory(messages, { reuse = false } = {}) {
+  if (!Array.isArray(messages) || !messages.length) {
+    return { steps: [], emulationMessages: [] };
   }
 
+  const resultByCallId = new Map();
   for (const m of messages) {
+    if (m?.role !== 'tool' || m.tool_call_id == null) continue;
+    resultByCallId.set(String(m.tool_call_id), m);
+  }
+
+  // A mapped call with a lossless forward translation belongs to the bridge
+  // for this request: it becomes a completed step when observed, and it is
+  // kept out of the text history either way. Everything else is emulation's.
+  const bridgeOwnedIds = new Set();
+  const candidates = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
     if (m?.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
     for (const tc of m.tool_calls) {
-      const name = tc.function?.name;
-      const entry = TOOL_MAP[name];
+      const entry = TOOL_MAP[tc?.function?.name];
       if (!entry) continue;
       const args = safeJsonParse(tc.function?.arguments);
       let cascadeArgs;
       try { cascadeArgs = entry.forward(args); } catch { continue; }
-      const observation = toolResultById.get(tc.id);
       // v2.0.70 — apply_patch returns a sentinel from forward()
       // because we can't lossless-encode multi-file patches into a
       // single cascade step. Skip and let partition fallback to
       // emulation toolPreamble.
       if (cascadeArgs?.__apply_patch_unmappable) continue;
-      if (typeof observation === 'string') {
-        // Overlay the result onto the cascade step's "this is what came
-        // back" field. Per-kind because the result field varies:
-        //   view_file       → content (4)
-        //   run_command     → full_output / stdout (proxied via combined_output)
-        //   grep_search_v2  → raw_output (15)
-        //   find            → raw_output (11)
-        //   list_directory  → children (2, repeated)
-        //   write_to_file   → file_created (4) ← bool, ignore content
-        //   search_web      → summary (5)
-        //   read_url_content → web_document.text (2.2)
-        //   propose_code    → no native result field (proxy passes back
-        //                    through emulation toolPreamble result text)
-        if (entry.kind === 'view_file') cascadeArgs.content = observation;
-        else if (entry.kind === 'run_command') {
-          cascadeArgs.full_output = observation;
-          cascadeArgs.stdout = observation;
-          cascadeArgs.exit_code = 0;
-        } else if (entry.kind === 'grep_search_v2' || entry.kind === 'grep_search') {
-          cascadeArgs.raw_output = observation;
-        } else if (entry.kind === 'find') {
-          cascadeArgs.raw_output = observation;
-        } else if (entry.kind === 'list_directory') {
-          cascadeArgs.children = observation
-            .split(/\r?\n/)
-            .map(s => s.trim())
-            .filter(Boolean);
-        } else if (entry.kind === 'search_web') {
-          cascadeArgs.summary = observation;
-        } else if (entry.kind === 'read_url_content') {
-          cascadeArgs.content = observation;
-        }
-      }
-      const buf = buildAdditionalStep(entry.kind, cascadeArgs);
-      if (buf) out.push(buf);
+      if (tc.id != null) bridgeOwnedIds.add(String(tc.id));
+      const resultMessage = tc.id != null ? resultByCallId.get(String(tc.id)) : null;
+      candidates.push({
+        messageIndex: i,
+        entry,
+        cascadeArgs,
+        resultMessage,
+        observation: resultMessage ? toolResultContent(resultMessage) : undefined,
+      });
     }
+  }
+
+  const fromIndex = reuse ? trailingPendingRoundStart(messages) : 0;
+  // Index of the first step that belongs to the newest pending tool round.
+  // Callers that already hold the full list can slice it instead of encoding
+  // the history a second time when a cascade is reused.
+  let deltaStart = reuse ? 0 : -1;
+  const steps = [];
+  if (!reuse || fromIndex >= 0) {
+    const pendingStart = reuse ? fromIndex : trailingPendingRoundStart(messages);
+    for (const { messageIndex, entry, cascadeArgs, observation, resultMessage } of candidates) {
+      if (!reuse && deltaStart < 0 && pendingStart >= 0 && messageIndex >= pendingStart) {
+        deltaStart = steps.length;
+      }
+      if (messageIndex < fromIndex) continue;
+      // Require an observation before completion: an unanswered proposal is
+      // not a DONE step (V-13).
+      if (typeof observation !== 'string') continue;
+      // Overlay the result onto the cascade step's "this is what came
+      // back" field. Per-kind because the result field varies:
+      //   view_file       → content (4)
+      //   run_command     → combined_output (21) — the authoritative result field
+      //   grep_search_v2  → raw_output (15)
+      //   find            → raw_output (11)
+      //   list_directory  → children (2, repeated)
+      //   write_to_file   → file_created (4) ← bool, ignore content
+      //   search_web      → summary (5)
+      //   read_url_content → web_document.text (2.2)
+      //   propose_code    → no native result field (proxy passes back
+      //                    through emulation toolPreamble result text)
+      if (entry.kind === 'view_file') cascadeArgs.content = observation;
+      else if (entry.kind === 'run_command') {
+        // One authoritative output field: the planner reads combined_output;
+        // writing stdout as well duplicated every observation.
+        cascadeArgs.full_output = observation;
+        // Never fabricate success: a failed command keeps its exit status
+        // (and a signalled failure without a numeric code is non-zero).
+        const status = parseObservationExitStatus(observation, resultMessage);
+        if (status) cascadeArgs.exit_code = status.exitCode;
+      } else if (entry.kind === 'grep_search_v2' || entry.kind === 'grep_search') {
+        cascadeArgs.raw_output = observation;
+      } else if (entry.kind === 'find') {
+        cascadeArgs.raw_output = observation;
+      } else if (entry.kind === 'list_directory') {
+        cascadeArgs.children = observation
+          .split(/\r?\n/)
+          .map(s => s.trim())
+          .filter(Boolean);
+      } else if (entry.kind === 'search_web') {
+        cascadeArgs.summary = observation;
+      } else if (entry.kind === 'read_url_content') {
+        cascadeArgs.content = observation;
+      }
+      const buf = buildAdditionalStep(entry.kind, cascadeArgs, { observed: true });
+      if (buf) steps.push(buf);
+    }
+  }
+  if (deltaStart < 0) deltaStart = steps.length;
+
+  return { steps, deltaStart, emulationMessages: buildEmulationHistory(messages, bridgeOwnedIds) };
+}
+
+/**
+ * Same step list as buildNativeToolHistory().steps, kept as the narrow API
+ * for callers that only need the protos.
+ */
+export function buildAdditionalStepsFromHistory(messages, options = {}) {
+  return buildNativeToolHistory(messages, options).steps;
+}
+
+function toolResultContent(m) {
+  if (typeof m?.content === 'string') return m.content;
+  if (Array.isArray(m?.content)) {
+    return m.content.filter(p => typeof p?.text === 'string').map(p => p.text).join('\n');
+  }
+  return JSON.stringify(m?.content ?? '');
+}
+
+// proto3 reads an absent exit_code as 0 (success). A result the caller
+// flagged as failed therefore has to carry a non-zero code even when the
+// text has no numeric status.
+const EXIT_CODE_UNKNOWN_FAILURE = 1;
+
+/**
+ * Read the exit status the caller reported for a shell result. The tool
+ * result is opaque client-owned text, so recognize the shapes the common
+ * dialects emit instead of assuming success: plain-text markers, codex-style
+ * JSON metadata, and Anthropic's is_error flag / `[tool error]` prefix.
+ *
+ * Returns { exitCode } or null when the observation carries no status.
+ */
+function parseObservationExitStatus(observation, message) {
+  const text = typeof observation === 'string' ? observation : '';
+  const signalledFailure = message?.is_error === true || /^\s*\[tool error\]/i.test(text);
+  const accept = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 0x7fffffff;
+  const json = safeJsonParse(text);
+  for (const value of [
+    json.exit_code, json.exitCode,
+    json.metadata?.exit_code, json.metadata?.exitCode,
+  ]) {
+    if (accept(value)) return { exitCode: value };
+  }
+  const patterns = [
+    /\bexit\s+(?:code|status)\s*[:=]?\s*(\d{1,10})\b/i,
+    /\bexited\s+with\s+(?:code|status)\s*[:=]?\s*(\d{1,10})\b/i,
+    /\[(?:process\s+)?exit(?:ed)?\s+(?:code|status)?\s*[:=]?\s*(\d{1,10})\]/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const value = Number(match[1]);
+    if (accept(value)) return { exitCode: value };
+  }
+  return signalledFailure ? { exitCode: EXIT_CODE_UNKNOWN_FAILURE } : null;
+}
+
+/**
+ * Index of the last assistant tool_calls message when every message after it
+ * is a tool result — the only round a reused cascade can be missing. Returns
+ * -1 when the newest turn is not a pending tool round (or there is none).
+ */
+function trailingPendingRoundStart(messages) {
+  let start = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0 || start === messages.length - 1) return -1;
+  for (let i = start + 1; i < messages.length; i++) {
+    if (messages[i]?.role !== 'tool') return -1;
+  }
+  return start;
+}
+
+/**
+ * Drop the pairs the bridge encoded (or owns but could not observe) from the
+ * message list the emulation path will fold into text. Unmapped calls,
+ * lossy translations and orphan tool results stay, so the planner keeps that
+ * history instead of losing it between the two paths.
+ */
+function buildEmulationHistory(messages, bridgeOwnedIds) {
+  const out = [];
+  for (const m of messages) {
+    if (m?.role === 'tool') {
+      if (m.tool_call_id != null && bridgeOwnedIds.has(String(m.tool_call_id))) continue;
+      out.push(m);
+      continue;
+    }
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const retained = m.tool_calls.filter(tc => !(tc?.id != null && bridgeOwnedIds.has(String(tc.id))));
+      if (retained.length === m.tool_calls.length) { out.push(m); continue; }
+      if (retained.length) { out.push({ ...m, tool_calls: retained }); continue; }
+      const { tool_calls: _consumed, ...rest } = m;
+      if (rest.content != null && rest.content !== '') out.push(rest);
+      continue;
+    }
+    out.push(m);
   }
   return out;
 }

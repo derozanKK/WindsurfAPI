@@ -17,7 +17,11 @@
 //    and reported `{method:'auth1', hasPassword:false}`, which surfaced
 //    as `ERR_NO_PASSWORD_SET` for accounts that DO have passwords.
 //    Fix: when both `userExists` and `hasPassword` are missing, return
-//    null so the call site falls back to /_devin-auth/connections.
+//    null so the caller does not guess.
+//    Update (2026-10-22): the probe ORDER was inverted — `/_devin-auth/
+//    connections` is now primary (its `auth_method.has_password` is what
+//    windsurf.com itself branches on) and CheckUserLoginMethod is enrichment
+//    only. An empty `{}` is still "unknown", never "password-capable".
 
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -91,20 +95,30 @@ describe('CheckUserLoginMethod empty-body fallback (#follow-up)', () => {
       'when neither field is present, must return null so caller falls back to /_devin-auth/connections');
   });
 
-  test('falsy-but-present hasPassword:false still throws a clear OAuth-account error (we did not over-relax)', () => {
-    // Make sure the fix didn't accidentally silence the legitimate
-    // "no password, sign in via Google" case. windsurfLogin still
-    // throws when conn.method==='auth1' && !conn.hasPassword.
-    const m = LOGIN_JS.match(/if \(conn\.method === 'auth1'\)[\s\S]+?if \(!conn\.hasPassword\)[\s\S]+?\}/);
-    assert.ok(m, 'auth1 + !hasPassword branch removed or refactored');
-    // The message must still make clear this is a no-password / OAuth account
-    // (it now points users to OAuth / token instead of the old wording).
-    assert.match(m[0], /no password|OAuth|Google\/GitHub/i,
-      'must still surface a clear "this account has no password, use OAuth/token" friendly error');
+  test('falsy-but-present has_password:false is a terminal, non-lockout "no password" answer', () => {
+    // The fix must not accidentally silence the legitimate "no password, sign
+    // in with an emailed code / OAuth" case. windsurfLogin still stops on a
+    // positive hasPassword:false — before any password attempt.
+    const m = LOGIN_JS.match(/if \(probe\.hasPassword === false\)[\s\S]+?\n  \}/);
+    assert.ok(m, 'hasPassword:false terminal branch removed or refactored');
+    // The error must still make clear this is a no-password / OAuth account
+    // (it now points users at the email code / OAuth / token instead of the
+    // old wording).
+    assert.match(m[0], /noPasswordError\(probe\)/,
+      'must keep the dedicated no-password error helper');
+    assert.match(LOGIN_JS, /code\s*=\s*'ERR_NO_PASSWORD_OAUTH_ACCOUNT'/,
+      'the helper must keep the dedicated no-password error code');
+    assert.match(m[0], /no password|OAuth|email/i,
+      'must still surface a clear "this account has no password" friendly error');
+    assert.match(LOGIN_JS, /method\s*=\s*probe\.emailCode \? 'email_code' : 'oauth'/,
+      'must tell the caller which method actually works');
     // v3: a no-password result is a WRONG-METHOD signal, not a brute-force
     // guess — it must NOT feed the email lockout (that locked users for using
     // the wrong login tab). Assert the branch does not record a failure.
     assert.doesNotMatch(m[0], /recordEmailFailure/,
       'no_password must not count toward the email lockout');
+    // And it must never reach the password endpoints.
+    assert.doesNotMatch(m[0], /windsurfLoginViaAuth1\(|windsurfLoginViaFirebase\(/,
+      'no_password must not attempt a password login');
   });
 });

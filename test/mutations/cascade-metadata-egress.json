@@ -175,8 +175,8 @@
     {
       "name": "the stream failure tail forgets to release the metadata candidate",
       "file": "src/handlers/chat.js",
-      "anchor": "          const egressTail = pathStreamText.flush({\n            hasToolCalls: collectedToolCalls.length > 0,\n            incomplete: true,\n          });\n          if (egressTail) emitContent(egressTail);",
-      "replacement": "          const egressTail = '';\n          if (egressTail) emitContent(egressTail);"
+      "anchor": "          if (egressTail) { await settleWriter(); if (!writerGone()) await emitContent(egressTail); }",
+      "replacement": "          if (egressTail) { await settleWriter(); if (false) await emitContent(egressTail); }"
     },
     {
       "name": "a negative JSON clause immediately overrides a later independent positive contract",
@@ -505,14 +505,14 @@
     {
       "name": "stream WebFetch fallback rewrites identity-bearing document prose",
       "file": "src/handlers/chat.js",
-      "anchor": "              if (fallbackText) emitExternalContent(fallbackText);",
-      "replacement": "              if (fallbackText) emitContent(neutralizeCascadeIdentity(sanitizeText(fallbackText), model));"
+      "anchor": "              if (fallbackText) await emitExternalContent(fallbackText);",
+      "replacement": "              if (fallbackText) await emitContent(neutralizeCascadeIdentity(sanitizeText(fallbackText), model));"
     },
     {
       "name": "stream WebFetch fallback re-enters reasoning dedup through ordinary content emission",
       "file": "src/handlers/chat.js",
-      "anchor": "              if (fallbackText) emitExternalContent(fallbackText);",
-      "replacement": "              if (fallbackText) emitContent(sanitizeText(fallbackText));"
+      "anchor": "              if (fallbackText) await emitExternalContent(fallbackText);",
+      "replacement": "              if (fallbackText) await emitContent(sanitizeText(fallbackText));"
     },
     {
       "name": "stream WebFetch fallback skips the only allowed path sanitizer",

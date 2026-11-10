@@ -61,36 +61,61 @@ describe('update.sh language-server source selection', () => {
     );
   });
 
-  test('install-ls.sh defaults to the maintained public Windsurf LS mirror', () => {
+  test('install-ls.sh resolves the pinned upstream manifest and fails closed', () => {
     assert.match(
       INSTALL_LS,
-      /dwgx\/windsurf-ls-release/,
-      'install-ls.sh should default to the maintained public Windsurf LS release mirror'
+      /https:\/\/windsurf-stable\.codeium\.com\/api\/versions/,
+      'install-ls.sh must default to the upstream versions manifest'
+    );
+    assert.match(
+      INSTALL_LS,
+      /WINDSURFAPI_LS_MANIFEST_URL/,
+      'operators must be able to override the manifest URL'
+    );
+    assert.match(
+      INSTALL_LS,
+      /WINDSURFAPI_LS_VERSION/,
+      'operators must be able to pin an exact version'
+    );
+    assert.match(
+      INSTALL_LS,
+      /ls-pins\.json/,
+      'the reviewed pins file is the trust anchor'
+    );
+    assert.match(
+      INSTALL_LS,
+      /Archive checksum mismatch/,
+      'archive hash mismatches must be fatal'
+    );
+    assert.match(
+      INSTALL_LS,
+      /Binary checksum mismatch/,
+      'inner binary hash mismatches must be fatal'
     );
     assert.doesNotMatch(
       INSTALL_LS,
-      /CaiJingLong\/windsurf-linux-server-release/,
-      'install-ls.sh must not default to the stale third-party mirror'
+      /EXAFUNCTION|Exafunction/,
+      'the silent Exafunction fallback must be gone'
+    );
+    assert.doesNotMatch(
+      INSTALL_LS,
+      /releases\/latest\/download/,
+      'the installer must not follow a mutable latest tag'
     );
     assert.match(
       INSTALL_LS,
-      /WINDSURFAPI_LS_RELEASE/,
-      'install-ls.sh should allow operators to override the LS release mirror/source'
+      /windsurf-ls-release\/releases\/download/,
+      'the pinned 3.5.17 rollback mirror remains available'
     );
     assert.match(
       INSTALL_LS,
-      /Trying maintained Windsurf LS mirror: \$ws_url/,
-      'install-ls.sh should print the fallback URL so large macOS downloads do not look hung'
+      /--allow-mirror/,
+      'mirror pins require an explicit opt-in'
     );
     assert.match(
       INSTALL_LS,
-      /verify_release_asset_checksum "\$WINDSURF_LS_RELEASE" "\$ASSET" "\$TMP_TARGET"/,
-      'downloads from the maintained mirror should be checked against SHA256SUMS when available'
-    );
-    assert.match(
-      INSTALL_LS,
-      /SHA256SUMS not available; skipping mirror checksum verification/,
-      'custom or older mirrors without SHA256SUMS should remain usable'
+      /Refusing to fall back to the stale mirror/,
+      'an unreachable manifest must not silently install the old mirror'
     );
   });
 });

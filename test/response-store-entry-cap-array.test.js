@@ -167,10 +167,18 @@ describe('per-entry ceiling: array content is capped like string content', () =>
       const block = { type: 'input_text', id: 'blk_1', name: 'attachment', text: 'small payload' };
       block[key] = key === 'tool_call_id' ? block[key] : huge;
       const msg = { role: 'tool', tool_call_id: key === 'tool_call_id' ? huge : 'call_1', content: [block] };
-      store.putResponse(`biggest_${key}`, [{ role: 'system', content: 'INSTRUCTIONS' }, msg], A);
-
-      const got = store.getResponse(`biggest_${key}`, A).messages;
-      const last = got[got.length - 1];
+      const stored = store.putResponse(`biggest_${key}`, [{ role: 'system', content: 'INSTRUCTIONS' }, msg], A);
+      const got = store.getResponse(`biggest_${key}`, A);
+      if (!stored) {
+        // A20: the whole write is rejected when an unshrinkable field alone
+        // exceeds the ceiling. That is the correct outcome — the alternative is
+        // storing an over-cap entry or silently changing the field's meaning.
+        assert.equal(got.ok, false,
+          `${key} must never be stored truncated: an impossible entry must be rejected whole`);
+        return;
+      }
+      const messages = got.messages;
+      const last = messages[messages.length - 1];
       const actual = key === 'tool_call_id' ? last.tool_call_id : last.content[0][key];
       const expected = key === 'tool_call_id' ? huge : huge;
       assert.equal(actual, expected,

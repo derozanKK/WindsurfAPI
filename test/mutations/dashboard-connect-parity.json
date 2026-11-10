@@ -3,9 +3,10 @@
     "test/dashboard-models-connect-parity.test.js",
     "test/connect-discovery-rebuild.test.js",
     "test/cloud-catalog-backend-boundary.test.js",
-    "test/models-live-catalog.test.js"
+    "test/models-live-catalog.test.js",
+    "test/connect-cost-tier-free-list.test.js"
   ],
-  "expectBaselinePass": 35,
+  "expectBaselinePass": 49,
   "mutations": [
     {
       "name": "the original defect: dashboard stops annotating and reports everything reachable",
@@ -52,20 +53,20 @@
     {
       "name": "#235 unknown cost is flattened to 'billable' — a guess rendered as a fact",
       "file": "src/dashboard/api.js",
-      "anchor": "    const connectCurrentlyFree = (selector) => (!selector ? null\n      : isConnectSelectorCurrentlyFree(selector) ? true\n      : (freeSet === null ? null : false));",
-      "replacement": "    const connectCurrentlyFree = (selector) => (\n      selector ? isConnectSelectorCurrentlyFree(selector) : null\n    );"
+      "anchor": "        freeNow: pricing.freeNow,",
+      "replacement": "        freeNow: pricing.freeNow === true,"
     },
     {
       "name": "#235 unknown cost is flattened to 'free' — the reporter's exact loss, reintroduced",
       "file": "src/dashboard/api.js",
-      "anchor": "    const connectCurrentlyFree = (selector) => (!selector ? null\n      : isConnectSelectorCurrentlyFree(selector) ? true\n      : (freeSet === null ? null : false));",
-      "replacement": "    const connectCurrentlyFree = (selector) => (!selector ? null\n      : (freeSet === null ? true : isConnectSelectorCurrentlyFree(selector)));"
+      "anchor": "        freeNow: pricing.freeNow,",
+      "replacement": "        freeNow: pricing.freeNow !== false,"
     },
     {
       "name": "#235 the field is dropped entirely — the panel goes back to not answering the question",
       "file": "src/dashboard/api.js",
-      "anchor": "        currentlyFree: connectCurrentlyFree(selector),\n      };\n    });",
-      "replacement": "      };\n    });"
+      "anchor": "        connectSelector: selector,\n        ...pricingFields(selector),\n      };\n    });",
+      "replacement": "        connectSelector: selector,\n      };\n    });"
     },
     {
       "name": "predicate ignores the transport — a Cascade deployment gets its panel filtered by connect rules",
@@ -136,14 +137,32 @@
     {
       "name": "the Dashboard live-only producer drops the tri-state pricing field",
       "file": "src/dashboard/api.js",
-      "anchor": "          connectSelector: selector,\n          currentlyFree: connectCurrentlyFree(selector),\n        });",
-      "replacement": "          connectSelector: selector,\n        });"
+      "anchor": "          connectSelector: selector,\n          ...pricingFields(selector),\n        });\n      }\n\n      for (const selector of FREE_REACHABLE_SELECTORS) {",
+      "replacement": "          connectSelector: selector,\n        });\n      }\n\n      for (const selector of FREE_REACHABLE_SELECTORS) {"
     },
     {
       "name": "the Dashboard stops synthesizing the universal free selector floor",
       "file": "src/dashboard/api.js",
       "anchor": "      for (const selector of FREE_REACHABLE_SELECTORS) {",
       "replacement": "      for (const selector of []) {"
+    },
+    {
+      "name": "the static whitelist becomes a union again over live cost-tier data",
+      "file": "src/auth.js",
+      "anchor": "  for (const selector of rateFree || []) {\n    if (isConnectSelectorCurrentlyFree(selector)) out.add(selector);\n  }\n  return [...out];",
+      "replacement": "  for (const selector of rateFree || []) {\n    if (isConnectSelectorCurrentlyFree(selector)) out.add(selector);\n  }\n  return [...new Set([...FREE_REACHABLE_SELECTORS, ...out])];"
+    },
+    {
+      "name": "the cost tier is ignored when deciding whether a selector is free",
+      "file": "src/auth.js",
+      "anchor": "  const costFree = getCloudCostTierFreeSelectors();",
+      "replacement": "  const costFree = null;"
+    },
+    {
+      "name": "a promo end date is ignored — an expired promotion stays free",
+      "file": "src/models.js",
+      "anchor": "  if (info.promoEndsAtMs != null && info.promoEndsAtMs <= now) return false;\n",
+      "replacement": ""
     }
   ]
 }

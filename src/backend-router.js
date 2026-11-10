@@ -47,13 +47,16 @@ function specialAgentEnabled(env = process.env) {
   return backend === 'devin-cli' || env?.DEVIN_CLI_ENABLED === '1';
 }
 
-// Observed gpt-5.6 SKUs Cascade rejects with "This model is only in Devin Local".
-// Anchored to luna/sol/terra (+ effort / -priority). Do not prefix-match gpt-5.60.
-// swe-2* is catalogued as backend: 'special_agent' and is handled by that branch.
-const GPT56_LOCAL_SKU = /^(?:gpt-5[.-]6|gpt5[.-]6)-(luna|sol|terra)(?:-(none|low|medium|high|xhigh|max)(?:-priority)?)?$/;
+// SKUs Cascade rejects with "This model is only in Devin Local": the gpt-5.6
+// luna/sol/terra family and the gpt-6 luna/sol/astra (+ 6.1 sol) family. The
+// effort tier and the -priority lane suffix are optional, matching the catalog
+// names in models.js. Anchored to the family names so lookalikes (gpt-5.60,
+// gpt-6-lunar, gpt-60-*) never hijack routing. swe-2* is catalogued as
+// backend: 'special_agent' and is handled by that branch.
+const DEVIN_LOCAL_ONLY_SKU = /^(?:(?:gpt-5[.-]6|gpt5[.-]6)-(?:luna|sol|terra)|(?:gpt-6|gpt6)(?:[.-]1)?-(?:luna|sol|astra))(?:-(?:none|low|medium|high|xhigh|max)(?:-priority)?)?$/;
 
 function isDevinLocalOnlyModel(modelInfo) {
-  return [modelInfo?.name, modelInfo?.modelUid].some((k) => GPT56_LOCAL_SKU.test(String(k || '').trim().toLowerCase()));
+  return [modelInfo?.name, modelInfo?.modelUid].some((k) => DEVIN_LOCAL_ONLY_SKU.test(String(k || '').trim().toLowerCase()));
 }
 
 /**
@@ -73,11 +76,30 @@ function devinCliMode(env = process.env) {
  * upstream is decommissioned. Defaults OFF, so behaviour is unchanged until an
  * operator flips it.
  *
- * NOTE (unverified, needs live probe): routing a model like claude-4.5-sonnet
- * here makes Devin the *nominal* backend, but the current ACP path only passes
- * the requested model name as a prompt hint (devin-acp.js session/prompt) — it
- * does NOT switch Devin's underlying core to that model. Whether Devin can
- * actually serve a specific model is an open question gated on a live probe.
+ * NOTE (model selection is settled; per-account serving is not): routing a model like
+ * claude-4.5-sonnet here makes Devin the *nominal* backend. The ACP path passes that model
+ * to the CLI launch as `devin acp --model <key>` (devin-acp.js:530-531) and ALSO adds a
+ * prompt-side hint alongside it (devin-acp.js:579-582). The CLI's `--model` **does** switch
+ * the underlying core, and the name is resolved server-side — but in TWO different places, and
+ * merging them into one is the wrong reading: **router-style names** (the `adaptive` /
+ * `arena-*` family) resolve through the AssignModel RPC — its own log line is literally
+ * `Resolving model router '' via AssignModel RPC` and its method path is
+ * `/exa.api_server_pb.ApiServerService/AssignModel` — while **ordinary fuzzy names** (the
+ * family slug / alias / partial name vocabulary the CLI's help promises, "the same fuzzy
+ * names as /model") are matched against the **server-side model catalog**
+ * (`GetCliModelConfigs`); the binary carries no local name→uid table (whether every fuzzy name
+ * takes that path is beyond static evidence). That a `--model` value is
+ * resolved rather than ignored is also carried by a runtime string: `devin acp --model` value
+ * did not resolve to an available model → falls back to the configured `agent.model`
+ * (file offset 0x80051f0). A prompt hint cannot produce server-side resolution, and the client
+ * never resolves a uid locally (old ledger §1c:
+ * extra-hands/RESEARCH/windsurfapi-verification-ledger-2026-10-01.md; corrected attribution +
+ * new strings: board ACPMAP, windsurf-re-20261015/derived/acpmap/L-ASSIGNMODEL.md §5.10/§6).
+ * So model selection is a routing change, not a capability gap. Honest boundary: the last hop is
+ * not statically provable — that the downstream inference request really carries the switched
+ * model needs one live ACP session — and whether a given account can *serve* a specific model
+ * (entitlement) stays live-only; the tool layer remains the real gap: special-agent.js:804
+ * hard-400s any request carrying caller-local tools[].
  */
 function devinOnlyEnabled(env = process.env) {
   return getBackendSwitch('devinOnly', env);

@@ -1,0 +1,11 @@
+{
+  "_comment": [
+    "Expected request-byte differences for test/wire-byte-identity.test.js.",
+    "Each entry allows exactly one comparison (fixture x route x native x env) to differ from the released base, and only in the shape named by `expected`: every byte outside top-level field #3 identical, the same message payloads modulo the per-message #1 uuid, and the declared role order before/after.",
+    "Any other byte difference fails the gate. An entry that no longer matches a differing comparison is reported as stale and fails too — the allowlist must be used exactly. Delete an entry once the release it compares against contains the change.",
+    "The reason prefix #273 names the issue that made call-before-result order deliberate; the repair is orderToolResultsAfterCalls() in src/handlers/tool-emulation.js, pinned by test/wire-h4-tool-pair-order.test.js.",
+    "Measured 2026-10-25 against v3.141.592654 (d5e7ace) and v3.10.1 (b00b3b9): 258/270 comparisons byte-identical, 12 differ, all fixture 5 ([tool, assistant, user]) on the two routes that run the native normalizer. Those 12 entries were removed after v3.141.592655 absorbed #273; the list is empty because the compared release now contains the change."
+  ],
+  "schema": 1,
+  "entries": []
+}

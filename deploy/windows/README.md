@@ -11,8 +11,9 @@
   - **首次运行会自动打开** `http://127.0.0.1:3003/dashboard`(之后启动不再自动开;`WINDSURFAPI_NO_OPEN=1` 可关掉)。
   - 首次运行若同目录没有 `API_KEY` / `DASHBOARD_PASSWORD`,exe 会**自动生成**强随机值,写入同目录 `.env`,并在控制台打印一次。下次启动沿用,不必手写。要自己设,在 `.env` 里覆盖即可。
   - 关窗口 = 停止。换新版 = 下载新 exe 覆盖,`Windsurf_data/` 与 `.env` 不动。
+  - **先验签再运行**(v3.10.0 起):每个资产都带 cosign keyless 签名。把 exe、`SHA256SUMS` 及同名 `.sig` / `.pem` / `.sigstore.json` 下载到同一目录,按 [docs/RELEASE-SIGNING.md](../../docs/RELEASE-SIGNING.md) 用 `cosign verify-blob --bundle ...` 验证,再用 `Get-FileHash` 核对已验签的清单。exe 会读取同目录的 `.env` 和 `accounts.json`,不要运行未验证的下载。
 
-**B. 源码 + 脚本(需装 Node 20+,零 npm 依赖)** —— 开发/自更新首选,`git pull` 即拉最新。
+**B. 源码 + 脚本(需装 Node 22.13+,零 npm 依赖)** —— 开发/自更新首选,`git pull` 即拉最新。
 双击 `start.bat`(见下),它生成 `.env` + 打印密钥 + 前台监督循环。
 
 **C. 系统匣托盘(推荐,零黑窗)** —— 双击 `tray.vbs`,右下角系统匣出现图标,右键菜单【打开面板 / 复制面板密码 / 复制 API Key / 状态 / 重启 / 退出】。
@@ -21,7 +22,7 @@
 ## 快速开始(源码方式)
 
 1. **首次引导**:双击 `start.bat`。它会:
-   - 校验 Node ≥ 20
+   - 校验 Node ≥ 22.13
    - 幂等生成项目根 `.env`(UTF-8 无 BOM),填缺失键:`PORT=3003`、`HOST=127.0.0.1`、强随机 `API_KEY` / `DASHBOARD_PASSWORD`、`DEVIN_CONNECT=1`
    - 打印两把密钥 + 面板地址 `http://127.0.0.1:3003/dashboard`
    - 进入前台监督循环(可 Ctrl-C 优雅停,最利首次调试)

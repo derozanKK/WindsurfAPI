@@ -61,6 +61,10 @@ function makeTransport(routes) {
   return fn;
 }
 
+// The authoritative method probe (measured live 2026-10-22). Without it the
+// probe would fall through to CheckUserLoginMethod — and, with the fallback
+// flag on, to app.devin.ai — which these password-path tests do not exercise.
+const CONN_OK = ['windsurf.com/_devin-auth/connections', { status: 200, data: { auth_method: { method: 'auth1', has_password: true, enterprise_sso_domain: false }, connections: [{ id: 'email', type: 'email', enabled: true }] } }];
 const PROBE = ['SeatManagementService/CheckUserLoginMethod', { status: 200, data: { userExists: true, hasPassword: true } }];
 const PRIMARY_FAIL = ['windsurf.com/_devin-auth/password/login', { status: 400, data: { detail: 'Invalid email or password' } }];
 const PRIMARY_OK = ['windsurf.com/_devin-auth/password/login', { status: 200, data: { token: 'auth1-primary' } }];
@@ -74,7 +78,7 @@ afterEach(() => { __setLoginTransportForTests(null); _resetEmailLockoutForTests(
 describe('host fallback — flag OFF (default, behavior unchanged)', () => {
   it('successful primary login only hits windsurf.com', async () => {
     setFlag(false);
-    const t = makeTransport([PROBE, PRIMARY_OK, POSTAUTH_OK]);
+    const t = makeTransport([CONN_OK, PROBE, PRIMARY_OK, POSTAUTH_OK]);
     __setLoginTransportForTests(t);
     const result = await windsurfLogin(EMAIL, PASSWORD, null);
     assert.equal(result.apiKey, 'devin-session-token$NEW');
@@ -83,7 +87,7 @@ describe('host fallback — flag OFF (default, behavior unchanged)', () => {
 
   it('primary failure surfaces directly — no second host', async () => {
     setFlag(false);
-    const t = makeTransport([PROBE, PRIMARY_FAIL]);
+    const t = makeTransport([CONN_OK, PROBE, PRIMARY_FAIL]);
     __setLoginTransportForTests(t);
     await assert.rejects(() => windsurfLogin(EMAIL, PASSWORD, null));
     assert.ok(!t.seen.some(u => u.includes('app.devin.ai')), 'flag off → no fallback');
@@ -93,7 +97,7 @@ describe('host fallback — flag OFF (default, behavior unchanged)', () => {
 describe('host fallback — flag ON', () => {
   it('falls back to app.devin.ai after the primary windsurf.com path fails', async () => {
     setFlag(true);
-    const t = makeTransport([PROBE, PRIMARY_FAIL, DEVIN_CONN_OK, DEVIN_LOGIN_OK, POSTAUTH_OK]);
+    const t = makeTransport([CONN_OK, PROBE, PRIMARY_FAIL, DEVIN_CONN_OK, DEVIN_LOGIN_OK, POSTAUTH_OK]);
     __setLoginTransportForTests(t);
     const result = await windsurfLogin(EMAIL, PASSWORD, null);
     assert.equal(result.apiKey, 'devin-session-token$NEW');
@@ -105,7 +109,7 @@ describe('host fallback — flag ON', () => {
   it('tolerates a failing app.devin.ai connections probe and still logs in', async () => {
     setFlag(true);
     const t = makeTransport([
-      PROBE, PRIMARY_FAIL,
+      CONN_OK, PROBE, PRIMARY_FAIL,
       ['app.devin.ai/api/auth1/connections', { status: 404, data: { detail: 'not found' } }],
       DEVIN_LOGIN_OK, POSTAUTH_OK,
     ]);
@@ -117,7 +121,7 @@ describe('host fallback — flag ON', () => {
   it('both hosts fail → rejects with the ORIGINAL primary error (no fake success)', async () => {
     setFlag(true);
     const t = makeTransport([
-      PROBE, PRIMARY_FAIL,
+      CONN_OK, PROBE, PRIMARY_FAIL,
       DEVIN_CONN_OK,
       ['app.devin.ai/api/auth1/password/login', { status: 400, data: { detail: 'Invalid email or password' } }],
     ]);
@@ -133,7 +137,7 @@ describe('host fallback — flag ON', () => {
   it('app.devin.ai login OK but its PostAuth has no sessionToken → fail, no fake success', async () => {
     setFlag(true);
     const t = makeTransport([
-      PROBE, PRIMARY_FAIL, DEVIN_CONN_OK, DEVIN_LOGIN_OK,
+      CONN_OK, PROBE, PRIMARY_FAIL, DEVIN_CONN_OK, DEVIN_LOGIN_OK,
       ['WindsurfPostAuth', { status: 200, data: { somethingElse: true } }],
     ]);
     __setLoginTransportForTests(t);
@@ -142,7 +146,7 @@ describe('host fallback — flag ON', () => {
 
   it('flag ON but primary SUCCEEDS → app.devin.ai never contacted', async () => {
     setFlag(true);
-    const t = makeTransport([PROBE, PRIMARY_OK, POSTAUTH_OK]);
+    const t = makeTransport([CONN_OK, PROBE, PRIMARY_OK, POSTAUTH_OK]);
     __setLoginTransportForTests(t);
     const result = await windsurfLogin(EMAIL, PASSWORD, null);
     assert.equal(result.apiKey, 'devin-session-token$NEW');

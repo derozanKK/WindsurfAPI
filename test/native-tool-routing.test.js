@@ -5,7 +5,7 @@ import {
   getApiKey,
   removeAccount,
 } from '../src/auth.js';
-import { parseFields, writeMessageField, writeStringField, writeVarintField } from '../src/proto.js';
+import { parseFields, getField, writeMessageField, writeStringField, writeVarintField } from '../src/proto.js';
 import {
   applyToolPreambleBudget,
   buildToolRoutingPlan,
@@ -957,5 +957,67 @@ describe('O5 tool_choice required distinguishability', () => {
     const lastUser = [...captured].reverse().find(m => m.role === 'user');
     const text = typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content);
     assert.doesNotMatch(text, /MUST call at least one/i);
+  });
+});
+
+describe('native bridge history truth (V-13)', () => {
+  it('V-13: the wire keeps unmapped history and sends the observed mapped step with its failure status', async () => {
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE = '1';
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF;
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_TOOLS;
+    delete process.env.DEVIN_CONNECT;
+    const account = addAccountByKey(`v13-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'v13');
+    createdAccountIds.push(account.id);
+
+    let captured = null;
+    let capturedOpts = null;
+    class FakeClient {
+      async cascadeChat(messages, _modelEnum, _modelUid, opts) {
+        captured = messages;
+        capturedOpts = opts;
+        return Object.assign([{ text: 'ok' }], { toolCalls: [] });
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'claude-sonnet-4.6',
+      stream: false,
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'call_bash', type: 'function', function: { name: 'Bash', arguments: JSON.stringify({ command: 'ls /nope' }) } },
+            { id: 'call_weather', type: 'function', function: { name: 'get_weather', arguments: JSON.stringify({ city: 'x' }) } },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'call_bash', content: 'Exit code: 2\nOutput:\nls: cannot access /nope' },
+        { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
+      ],
+      tools: [fnTool('Bash'), fnTool('get_weather')],
+    }, {
+      waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'csrf', generation: 1 }),
+      WindsurfClient: FakeClient,
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(capturedOpts.additionalSteps.length, 1, 'the mapped+observed call becomes exactly one step');
+    const step = parseFields(capturedOpts.additionalSteps[0]);
+    const body = parseFields(getField(step, 28, 2).value);
+    assert.equal(getField(body, 6, 0).value, 2, 'the failed Bash keeps its non-zero exit_code on the wire');
+
+    const text = captured.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''))).join('\n');
+    assert.match(text, /sunny/, 'the unmapped tool result survives on the wire');
+    assert.doesNotMatch(text, /ls: cannot access/, 'the mapped result is not duplicated into the text history');
+    assert.equal(
+      captured.some(m => Array.isArray(m.tool_calls) && m.tool_calls.some(tc => tc.function?.name === 'Bash')),
+      false,
+      'the bridge-owned call is not replayed as emulation text',
+    );
   });
 });

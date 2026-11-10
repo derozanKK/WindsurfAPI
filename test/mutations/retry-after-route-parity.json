@@ -7,8 +7,8 @@
     {
       "name": "the PRIMARY loss returns: messages.js drops result.headers in the error translation, one step before the router",
       "file": "src/handlers/messages.js",
-      "anchor": "      return withUpstreamHeaders(toAnthropicError(\n        result.status,\n        result.body?.error?.type,\n        result.body?.error?.message,\n      ), result.headers);",
-      "replacement": "      return toAnthropicError(\n        result.status,\n        result.body?.error?.type,\n        result.body?.error?.message,\n      );"
+      "anchor": "      return toAnthropicChatError(result);",
+      "replacement": "      return toAnthropicError(result.status, result.body?.error?.type, result.body?.error?.message);"
     },
     {
       "name": "the PRIMARY loss returns on the Gemini side",

@@ -194,8 +194,16 @@ export function handleModels(env = process.env) {
     // This is a floor, not a widening: every selector added here is one that
     // isConnectSelectorAllowedForAccount already admits for ANY account, so it can
     // never advertise something the pool cannot run.
+    //
+    // `entitled` is still required. The static floor is unpaid-tier ENTITLEMENT;
+    // existence comes from the account's live catalog, and a selector that catalog
+    // omits cannot be called (measured: `swe-1-6-slow` is absent from the live
+    // 240-selector catalog and 502s "daily usage quota has been exhausted"). On a
+    // cold start with no catalog rows the predicate stays permissive, which is the
+    // case this floor exists for.
     for (const selector of FREE_REACHABLE_SELECTORS) {
       if (seen.has(selector)) continue;
+      if (!entitled(selector)) continue;
       seen.add(selector);
       data.push({
         id: selector,

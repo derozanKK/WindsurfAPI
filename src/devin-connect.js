@@ -21,7 +21,8 @@
  *
  * Endpoint : POST https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage
  * Transport: Connect-RPC, application/connect+proto, single request envelope,
- *            multi-frame streaming response (text deltas in response field #9).
+ *            multi-frame streaming response (answer text in response field #3;
+ *            #9 is the separate reasoning/thinking stream).
  *
  * Zero npm deps. Nothing dials the network at import time.
  */
@@ -32,7 +33,6 @@ import { randomUUID, randomBytes, createHmac } from 'crypto';
 import * as _wireFs from 'fs';
 import * as _wirePath from 'path';
 import { log } from './config.js';
-import { strictUsageTotal } from './runtime-config.js';
 import {
   writeMessageField, writeStringField, writeVarintField, writeFixed64Field,
   parseFields, getField, getAllFields,
@@ -42,6 +42,18 @@ import { wrapRequest, wrapEnvelope, StreamingFrameParser, connectHeaders, tryGun
 // recordArgRepair from cline-compat). cc-compat is a zero-I/O, zero-pipeline-
 // import pure module, so this cannot create a cycle or perturb the wire path.
 import { recordSchemaNormalized } from './handlers/cc-compat.js';
+// Observability only, same rationale as recordSchemaNormalized above: the
+// metrics module has no imports of its own, so it cannot create a cycle.
+import { bumpConnect } from './devin-connect-metrics.js';
+// Bounded remote-image fetch (deadline, byte cap, MIME allowlist, per-hop SSRF
+// lookup hook). image.js imports only config/pdf/net-safety/vendor codecs, so this
+// cannot create a cycle back into the connect pipeline.
+import {
+  fetchImageUrl,
+  MAX_SIZE as MAX_IMAGE_BYTES,
+  MAX_BASE64_LEN as MAX_IMAGE_BASE64_LEN,
+  MIME_OK as IMAGE_MIME_ALLOWLIST,
+} from './image.js';
 
 const HOST = 'server.codeium.com';
 const PATH = '/exa.api_server_pb.ApiServerService/GetChatMessage';
@@ -51,6 +63,81 @@ const PATH = '/exa.api_server_pb.ApiServerService/GetChatMessage';
 // ClientMetadata #21. See mintUserJwt below for why this ships default-OFF.
 const USER_JWT_PATH = '/exa.auth_pb.AuthService/GetUserJwt';
 const METADATA_USER_JWT_FIELD = 21;
+
+// Ceiling for an untrusted upstream response body. Generous next to any real
+// Connect-RPC error — upstream returns a JSON envelope or a short text line —
+// and far below V8's ~512MiB string limit, so the toString() can never be the
+// thing that throws. 8MiB leaves room for a pathological proxy error page
+// while keeping the process nowhere near the allocator's ceiling.
+// Read once at module load rather than per response: this is a safety ceiling,
+// not a tuning knob, and the hot path should not re-parse an env var on every
+// error. Overridable so the ceiling itself is testable without allocating
+// megabytes per case; a non-positive or unparseable value falls back to the
+// default rather than disabling the cap, because "no cap" is the bug.
+export const MAX_ERROR_BODY_BYTES = (() => {
+  const raw = Number.parseInt(String(process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES ?? ''), 10);
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : 8 * 1024 * 1024;
+})();
+
+// Strict positive-integer env reader (same fallback rule as client.js/auth.js:
+// unparseable or non-positive values fall back to the default rather than
+// disabling the bound — "no cap" is the bug). Used by the per-stream queue
+// caps below; read once per request, never on the per-frame path.
+function positiveIntEnv(value, fallback) {
+  const n = Number.parseInt(String(value ?? ''), 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+// Appended when the ceiling is hit, so the truncation is visible to whoever
+// reads the error rather than the error silently describing a prefix of
+// itself. Mirrors RESPONSE_STORE's TRUNCATION_MARKER.
+export const ERROR_BODY_TRUNCATION_MARKER = '\n[... truncated: upstream error body exceeded the cap ...]';
+
+/**
+ * Bounded accumulator for an upstream response body.
+ *
+ * EVERY reader that takes an HTTP body off the wire uses this — the streamChat
+ * non-200 branch, postConnectUnary (GetUserJwt) and the catalog unary probe
+ * (GetCliModelConfigs / GetUserStatus / AssignModel) — so the ceiling and the
+ * truncation behavior cannot drift between call sites.
+ *
+ * Why a ceiling at all: concatenating without one is an availability bug, not
+ * a parsing one. A misbehaving or hostile upstream can stream past V8's
+ * ~512MiB string limit, at which point Buffer.concat(...).toString('utf8')
+ * throws ERR_STRING_TOO_LONG. That throw happens inside the 'end' listener,
+ * where nothing catches it: it escapes as an uncaughtException and
+ * src/index.js exits the process, so one bad response from one upstream
+ * disconnects every tenant. Same shape as the decodeGrpcMessage guard in
+ * grpc.js:21-34.
+ *
+ * Keep a genuine prefix rather than whole chunks. Slicing the chunk that
+ * crosses the ceiling is what makes this correct for a body that arrives as
+ * one large chunk: dropping that chunk instead would leave nothing behind and
+ * the error would be a bare truncation marker describing no upstream output at
+ * all. The tail is discarded, never accumulated.
+ */
+export function createBoundedBodyAccumulator() {
+  const chunks = [];
+  let bytes = 0;
+  let truncated = false;
+  return {
+    onData(chunk) {
+      if (truncated) return;
+      const room = MAX_ERROR_BODY_BYTES - bytes;
+      if (chunk.length <= room) {
+        bytes += chunk.length;
+        chunks.push(chunk);
+        return;
+      }
+      if (room > 0) chunks.push(chunk.subarray(0, room));
+      bytes = MAX_ERROR_BODY_BYTES;
+      truncated = true;
+    },
+    /** @returns {{ raw: Buffer, truncated: boolean }} */
+    finish() {
+      return { raw: Buffer.concat(chunks), truncated };
+    },
+  };
+}
 
 function validatedAccountConnectHost(host) {
   const refused = () => Object.assign(new Error('ERR_CONNECT_ACCOUNT_HOST_NOT_ALLOWED'), {
@@ -131,7 +218,7 @@ const SOURCE = Object.freeze({ USER: 1, ASSISTANT: 2, TOOL_RESULT: 4 });
 
 // CompletionConfig defaults, matched to the captured CLI request.
 // #2 = max_tokens, #3 = max_newlines (schema-confirmed); see buildCompletionConfig.
-const DEFAULT_CONTEXT_WINDOW = 128000;
+const DEFAULT_MAX_NEWLINES = 128000;
 const DEFAULT_MAX_TOKENS = 4096;
 // What goes on the wire at #2 when the caller named no cap. Deliberately NOT
 // DEFAULT_MAX_TOKENS: since the tag fix, #2 is an ENFORCED output cap, and a defaulted
@@ -209,17 +296,103 @@ function deriveDeviceBytes(seed, info, len) {
   return Buffer.concat(out).subarray(0, len);
 }
 
+// ── File/document content (P-03) ─────────────────────────────────────────
+//
+// The GetChatMessage ChatMessage wire has NO attachment field. Its calibrated
+// shape is {uuid #1, role #2, text #3, tool_call_id #7, images #10} plus the
+// optional reasoning tag (see encodeChatMessage below); `text` is a single
+// string. So a typed file/document block cannot be "preserved through the
+// builder": there is nowhere on the wire to put it. `messageText()` used to
+// filter only `{type:'text'}` parts, which turned a Responses `input_file`
+// (or Chat `file`) block into '' — the model answered the instruction without
+// the document and no layer reported the loss.
+//
+// Cascade is different: image.js `extractImages` turns PDF file blocks into
+// text before the prompt is built, so responses.js deliberately keeps the
+// typed block. This module is the Connect boundary and must refuse instead of
+// silently flattening. The handler raises the 400 before account acquisition;
+// buildGetChatMessageRequest repeats the check for direct callers.
+
+const FILE_CONTENT_TYPES = new Set(['file', 'input_file', 'document']);
+const NON_FILE_CONTENT_TYPES = new Set([
+  'text', 'input_text', 'output_text', 'image', 'image_url', 'input_image',
+  'input_audio', 'audio', 'thinking', 'tool_use', 'tool_result',
+]);
+
+/** True for a content block carrying a file/document payload. */
+export function isFileContentPart(part) {
+  if (!part || typeof part !== 'object') return false;
+  const type = String(part.type || '').toLowerCase();
+  if (FILE_CONTENT_TYPES.has(type)) return true;
+  // Known text/image/tool blocks are never file payloads, even if a client
+  // attaches an unrelated `file` property.
+  if (NON_FILE_CONTENT_TYPES.has(type)) return false;
+  // Shape-only / defensive variants: {file:{...}} with no type (or an unknown
+  // type), or the Responses `file_data` / `file_id` fields at the top level.
+  if (part.file && typeof part.file === 'object') return true;
+  if (typeof part.file_data === 'string' && part.file_data) return true;
+  if (typeof part.file_id === 'string' && part.file_id) return true;
+  return false;
+}
+
+/** First file/document block in a content array, or null. */
+export function findFileContentPart(content) {
+  if (!Array.isArray(content)) return null;
+  for (const part of content) {
+    if (isFileContentPart(part)) return part;
+  }
+  return null;
+}
+
+/** First file/document block anywhere in a [{role, content}] message list. */
+export function findFilePartInMessages(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (const msg of messages) {
+    const found = findFileContentPart(msg?.content);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Stable 400-class error for a file/document block the Connect wire cannot
+ * carry. `param` names the request field the caller must change: `input` on
+ * /v1/responses, `messages` on /v1/chat/completions.
+ */
+export function unsupportedFilePartError(part, { param = 'input' } = {}) {
+  const type = String(part?.type || 'file').toLowerCase();
+  const rawName = part?.file?.filename || part?.filename || part?.file?.name || '';
+  const name = String(rawName).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 120);
+  const label = name ? `${type} "${name}"` : type;
+  const error = new Error(
+    `Unsupported content part (${label}): the Devin Connect backend carries only text and images `
+    + '(ChatMessage has no file/document field), so this payload cannot reach the model. '
+    + `Remove it from \`${param}\` or use a backend/model that supports document input.`,
+  );
+  error.code = 'unsupported_input_file';
+  error.param = param;
+  error.status = 400;
+  return error;
+}
+
 /**
  * Flatten an OpenAI-style message content into plain text. Cloud GetChatMessage
  * takes a single string per ChatMessage; structured/tool content is degraded to
  * text the same way the legacy Raw path does (see windsurf.js).
+ *
+ * File/document parts are NOT silently flattened (P-03): they would become ''
+ * here while `hasMultimodalContent`/the answerability guard still counted them
+ * as content. They throw the stable unsupported-input error instead.
  */
 export function messageText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
+    const filePart = findFileContentPart(content);
+    if (filePart) throw unsupportedFilePartError(filePart);
     return content.filter(c => c?.type === 'text').map(c => c.text).join('\n');
   }
   if (content == null) return '';
+  if (isFileContentPart(content)) throw unsupportedFilePartError(content);
   return JSON.stringify(content);
 }
 
@@ -251,8 +424,9 @@ export function getImageFieldTag(env = process.env) {
  * Pull data-URL / base64 image blocks out of OpenAI-style message content,
  * yielding the same { base64_data, mime_type } shape the Cascade ImageData
  * encoder consumes. Synchronous: only inline data-URL / base64 sources are
- * handled here (remote https image URLs would need an async fetch and are out
- * of scope for the wire builder — extract those upstream if needed).
+ * handled here. http(s) sources are resolved BEFORE the builder runs, by
+ * `inlineRemoteImages` in streamChat(); a URL that still reaches this function
+ * is named by the builder's unresolved-URL pass instead of vanishing silently.
  */
 export function extractInlineImages(content) {
   if (!Array.isArray(content)) return [];
@@ -274,6 +448,225 @@ export function extractInlineImages(content) {
     }
   }
   return images;
+}
+
+/**
+ * True for a content block that would ride the connect wire as an image.
+ * Mirrors the two extractors (extractInlineImages above, remoteImageUrl below)
+ * rather than a looser `type.startsWith('image')`: a PDF dressed as an Anthropic
+ * image block is a document (extractInlineImages skips it), and a bare
+ * `image_url` string without `.url` extracts to nothing.
+ */
+function isWireImageBlock(block) {
+  if (!block || typeof block !== 'object') return false;
+  const type = String(block.type || '').toLowerCase();
+  if (type === 'image') {
+    const src = block.source || {};
+    const mime = String(src.media_type || '').toLowerCase();
+    if (mime === 'application/pdf') return false;
+    return (src.type === 'base64' || !src.type) && !!src.data;
+  }
+  if (type === 'image_url') {
+    const url = block.image_url?.url;
+    return typeof url === 'string' && url.length > 0;
+  }
+  // Responses-API shape; responses.js normalises it to image_url before the chat
+  // handler, but a direct caller of this helper should still lose the image.
+  if (type === 'input_image') {
+    const raw = block.image_url;
+    if (typeof raw === 'string') return raw.length > 0;
+    return typeof raw?.url === 'string' && raw.url.length > 0;
+  }
+  return false;
+}
+
+/**
+ * Remove wire-bound image blocks from OpenAI/Anthropic-shaped messages.
+ *
+ * Used when the live catalog EXPLICITLY declares the resolved selector
+ * text-only (supports_images=false): the text turn is preserved, the images are
+ * not sent, and the caller counts what was dropped. System turns are skipped —
+ * they are hoisted into the text-only system_prompt field (#2), so an image
+ * there was never going to ride the wire and counting it would be a false drop.
+ *
+ * Copy-on-write: the caller's array and message objects are never mutated (the
+ * same params object is re-passed on retry/failover). Returns the input array
+ * unchanged when nothing was dropped.
+ *
+ * @param {Array} messages
+ * @returns {{messages: Array, dropped: number}}
+ */
+export function stripImageParts(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return { messages, dropped: 0 };
+  let out = null;
+  let dropped = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || msg.role === 'system' || !Array.isArray(msg.content)) continue;
+    const kept = msg.content.filter((block) => !isWireImageBlock(block));
+    const removed = msg.content.length - kept.length;
+    if (!removed) continue;
+    dropped += removed;
+    if (!out) out = messages.slice();
+    out[i] = { ...msg, content: kept };
+  }
+  return { messages: out || messages, dropped };
+}
+
+// ─── Remote image_url resolution (http/https) ───────────────────────────────
+//
+// `extractInlineImages` is SYNCHRONOUS and only understands data: URLs, so an
+// ordinary OpenAI `image_url` block pointing at https://… used to be discarded
+// without a trace: the text reached the model, the picture did not, and nothing
+// was logged. Measured 2026-10-23 on all four connect families
+// (evidence/ToolMatrixLive.md §images): inline PNG answered "Red"/"Green" while
+// the same PNG behind an HTTPS URL answered "Unknown"/"cannot see".
+//
+// The wire builder has to stay synchronous (dozens of call sites and wire tests
+// depend on that), so the fetch happens once, here, in streamChat() — the only
+// production caller of the builder — before the proto is assembled. Each URL is
+// resolved through image.js's `fetchImageUrl`, which already carries every bound
+// this needs: an 8 s absolute deadline shared across redirect hops, a 5 MB body
+// cap, an image/* content-type allowlist, http(s)-only, and a DNS lookup hook
+// that refuses private/loopback/link-local targets on EVERY hop (net-safety.js
+// `isPrivateIp`). Reusing it keeps one SSRF policy in the tree instead of a
+// second, subtly different one on the connect route.
+//
+// Bounds beyond the per-fetch ones: at most REMOTE_IMAGE_MAX_PER_REQUEST fetches
+// per request, sequential, sharing one REMOTE_IMAGE_FETCH_BUDGET_MS wall-clock
+// budget — a caller cannot turn one chat request into an unbounded stream of
+// outbound connections. Failures are logged (host only: URLs may carry signed
+// query strings), counted, and the image is dropped; the text still goes
+// upstream.
+export const REMOTE_IMAGE_MAX_PER_REQUEST = 20;
+export const REMOTE_IMAGE_FETCH_BUDGET_MS = 8000;
+
+function imageAbortError() {
+  const err = new Error('The operation was aborted');
+  err.name = 'AbortError';
+  err.code = 'ABORT_ERR';
+  return err;
+}
+
+/** The http(s) URL of an image_url block, or '' for every other block shape. */
+function remoteImageUrl(block) {
+  if (!block || typeof block !== 'object' || block.type !== 'image_url') return '';
+  const url = block.image_url?.url;
+  return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : '';
+}
+
+/** Host only — never log a full URL, which may carry a signed query string. */
+function imageUrlHost(url) {
+  try { return new URL(url).host || '(unparseable)'; } catch { return '(unparseable)'; }
+}
+
+// Reject with AbortError as soon as the caller aborts, without waiting for the
+// fetch's own deadline. The underlying fetch keeps its promise handlers attached
+// (no unhandled rejection) and still tears its socket down at the 8 s deadline.
+function withAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(imageAbortError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(imageAbortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err); },
+    );
+  });
+}
+
+/**
+ * Replace every http(s) `image_url` block with an equivalent data URL, fetching
+ * it through a bounded transport. Returns a NEW messages array when anything was
+ * fetched or dropped (the caller's array and message objects are never mutated —
+ * the same params are re-passed on retry/failover), otherwise the input as-is.
+ *
+ * `fetchImpl` is injectable for tests; it must resolve { base64_data, mime_type }.
+ *
+ * @param {Array} messages OpenAI-shaped messages
+ * @param {{ signal?: AbortSignal, fetchImpl?: Function }} [opts]
+ * @returns {Promise<Array>}
+ */
+export async function inlineRemoteImages(messages, { signal, fetchImpl = fetchImageUrl } = {}) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  if (signal?.aborted) throw imageAbortError();
+
+  const deadline = Date.now() + REMOTE_IMAGE_FETCH_BUDGET_MS;
+  let fetched = 0;
+  let out = null; // copy-on-write: untouched arrays stay shared with the caller
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    // System turns are hoisted into field #2 as text; they have no image slot.
+    if (!msg || msg.role === 'system' || !Array.isArray(msg.content)) continue;
+    if (!msg.content.some((b) => remoteImageUrl(b))) continue;
+
+    const blocks = [];
+    let changed = false;
+    for (const block of msg.content) {
+      const url = remoteImageUrl(block);
+      if (!url) { blocks.push(block); continue; }
+
+      if (fetched >= REMOTE_IMAGE_MAX_PER_REQUEST) {
+        log.warn(`DEVIN_CONNECT: more than ${REMOTE_IMAGE_MAX_PER_REQUEST} remote image_url blocks in one request — image from ${imageUrlHost(url)} not fetched and dropped`);
+        bumpConnect('remote_image_fetch_failed');
+        changed = true;
+        continue;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        log.warn(`DEVIN_CONNECT: remote image fetch budget (${REMOTE_IMAGE_FETCH_BUDGET_MS} ms) exhausted — image from ${imageUrlHost(url)} dropped`);
+        bumpConnect('remote_image_fetch_failed');
+        changed = true;
+        continue;
+      }
+      fetched++;
+      let img;
+      try {
+        img = await withAbort(
+          fetchImpl(url, Math.min(remaining, REMOTE_IMAGE_FETCH_BUDGET_MS)),
+          signal,
+        );
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err;
+        log.warn(`DEVIN_CONNECT: remote image_url fetch failed (${imageUrlHost(url)}): ${err.message} — image dropped, text preserved`);
+        bumpConnect('remote_image_fetch_failed');
+        changed = true;
+        continue;
+      }
+
+      const mime = String(img?.mime_type || '').toLowerCase();
+      const data = typeof img?.base64_data === 'string' ? img.base64_data : '';
+      // fetchImageUrl already enforces both, but this helper also accepts an
+      // injected transport: re-check the RESULT so a different/regressed fetcher
+      // cannot smuggle non-image bytes or an oversized payload onto the wire.
+      if (!data || !IMAGE_MIME_ALLOWLIST.has(mime)) {
+        log.warn(`DEVIN_CONNECT: remote image_url returned unsupported type "${mime || 'none'}" (${imageUrlHost(url)}) — image dropped`);
+        bumpConnect('remote_image_fetch_failed');
+        changed = true;
+        continue;
+      }
+      if (data.length > MAX_IMAGE_BASE64_LEN) {
+        log.warn(`DEVIN_CONNECT: remote image_url exceeds ${MAX_IMAGE_BYTES} bytes (${imageUrlHost(url)}) — image dropped`);
+        bumpConnect('remote_image_fetch_failed');
+        changed = true;
+        continue;
+      }
+
+      blocks.push({
+        ...block,
+        image_url: { ...(block.image_url || {}), url: `data:${mime};base64,${data}` },
+      });
+      bumpConnect('remote_images_inlined');
+      changed = true;
+    }
+
+    if (!changed) continue;
+    if (!out) out = messages.slice();
+    out[i] = { ...msg, content: blocks };
+  }
+  return out || messages;
 }
 
 /** Encode one ImageData sub-message. Inner tags are calibratable via
@@ -306,6 +699,7 @@ function encodeChatMessage({
   toolCallId = '',
   reasoning = '',
   reasoningTagNum = 0,
+  signature = '',
   env = process.env,
 }) {
   const fields = [
@@ -322,6 +716,8 @@ function encodeChatMessage({
   if (reasoning && reasoningTagNum) {
     fields.push(writeStringField(reasoningTagNum, reasoning));
   }
+  // #12 thinking signature, only beside its #11 thinking (signed replay).
+  if (signature && reasoning && reasoningTagNum === 11) fields.push(writeStringField(12, signature));
   return Buffer.concat(fields);
 }
 
@@ -332,7 +728,7 @@ function encodeChatMessage({
 // serde-JSON": the ENVELOPE is protobuf, only the args VALUE is JSON. Wire wins.
 // Symmetric with the response-side ChatToolCall #6{1:id,2:name,3:arguments}
 // pinned in parseToolCallTagMap.
-function encodeAssistantToolCall({ id, name, argsJson, reasoning, reasoningTagNum = 11 }) {
+function encodeAssistantToolCall({ id, name, argsJson, reasoning, reasoningTagNum = 11, signature = '' }) {
   const toolCall = Buffer.concat([
     writeStringField(1, id),
     writeStringField(2, name),
@@ -353,6 +749,8 @@ function encodeAssistantToolCall({ id, name, argsJson, reasoning, reasoningTagNu
   // only when reasoningTagNum is truthy: field 0 is RESERVED in protobuf and a zero tag
   // would serialize makeTag(0,2) — an invalid frame — so the encoder refuses it itself.
   if (reasoning && reasoningTagNum) parts.push(writeStringField(reasoningTagNum, reasoning));
+  // #12 thinking signature, only beside its #11 thinking (signed replay).
+  if (signature && reasoning && reasoningTagNum === 11) parts.push(writeStringField(12, signature));
   return Buffer.concat(parts);
 }
 
@@ -382,7 +780,8 @@ function encodeAssistantToolCall({ id, name, argsJson, reasoning, reasoningTagNu
 //
 // Accepted forms of DEVIN_CONNECT_TOOL_DEF_TAGS (fail-closed to null on any
 // malformed value — never emit a broken frame):
-//   - key=val:   "name=1,description=2,parameters=3[,strict=6][,outer=10]"
+//   - key=val:   "name=1,description=2,parameters=3[,strict=12][,outer=10]"
+//     (strict is #12 on the current server; #4 is reserved there)
 //   - positional (back-compat): STRICT 4-tuple "10,1,2,3" = outer,name,description,schema.
 // To omit outer (use the #10 default), use the key=val form — a positional
 // 3-tuple is ambiguous and fails closed to null.
@@ -447,14 +846,17 @@ export function getToolDefTags(env = process.env, { useDefault = false } = {}) {
  * swapping writeStringField→writeBytesField here (zero risk). ← SWITCH POINT.
  *
  * strict (OpenAI function.strict) is emitted as a varint bool ONLY when the
- * operator calibrated a `strict` tag AND the tool asked for it. custom_tool /
- * defer_loading are Devin-proprietary and never emitted (getToolDefTags rejects
- * their keys).
+ * operator calibrated a `strict` tag AND the tool asked for it — calibrate
+ * `strict=12` (the field's number on the current server; #4 is reserved there).
+ * The default tag map has no strict key, so nothing is emitted unless an
+ * operator opts in. custom_tool / defer_loading are Devin-proprietary and
+ * never emitted (getToolDefTags rejects their keys).
  */
 // Normalize an OpenAI/MCP function-parameters JSON Schema into the minimal,
 // well-formed shape upstream accepts. Real clients (OpenCode, MCP servers) emit
 // schemas with missing/loose fields or proprietary keys ($schema, unevaluated
-// keywords) that a strict upstream can reject (→ UPSTREAM_INTERNAL). Portable
+// keywords) that a strict upstream can reject (→ `invalid_argument` → 400
+// REQUEST_REJECTED). Portable
 // hardening (kiro's normalize_json_schema, repo-hank9999): guarantee an object
 // schema with a `properties` object and a string[] `required`, and DROP keys the
 // upstream doesn't want ($schema). Non-destructive to the caller's real schema
@@ -489,7 +891,7 @@ export function normalizeToolSchema(schema) {
       if (req.length) out.required = req; else delete out.required;
     }
   }
-  return stripSchemaDescriptions(out);
+  return normalizeSchemaTree(out);
 }
 
 // ★ Strip top-level oneOf/anyOf/allOf combinators in place (ported from kiro.rs
@@ -529,27 +931,91 @@ function stripTopLevelCombinators(out) {
   return stripped;
 }
 
-// ★ Strip `description` annotations from JSON Schema recursively, but preserve
-// properties that happen to be NAMED "description" (a real parameter, e.g.
-// Cursor's Task tool has a `description` property). Only schema-annotation
-// `description` keys (siblings of `type`/`properties`/`required`) are removed.
-// This neutralizes upstream's MCP-gate fingerprinting on parameter descriptions
-// while keeping the full schema structure (types, required, enums, nested
-// objects) intact for the model.
-function stripSchemaDescriptions(value, inProperties = false) {
-  if (Array.isArray(value)) return value.map((item) => stripSchemaDescriptions(item));
+const LITERAL_VALUE_KEYS = new Set(['default', 'examples', 'enum', 'const']);
+// ★ Recursively normalize a JSON Schema tree for the native ToolDef path.
+// Two jobs, both required by upstream's decoder:
+//  1. Strip `description` ANNOTATIONS, but preserve properties that happen to
+//     be NAMED "description" (a real parameter, e.g. Cursor's Task tool has a
+//     `description` property). Only schema-annotation `description` keys
+//     (siblings of `type`/`properties`/`required`) are removed. This
+//     neutralizes upstream's MCP-gate fingerprinting on parameter descriptions
+//     while keeping the full schema structure (types, required, enums, nested
+//     objects) intact for the model.
+//  2. Lower every `type` ARRAY to an equivalent `anyOf` of single-type members.
+//     Upstream rejects the whole request with `invalid_argument` on
+//     `"type": ["number","null"]` (reproduced live with omp grep's `skip`
+//     parameter), while `anyOf: [{type:"number"},{type:"null"}]` is accepted.
+//     The lowering is lossless: `anyOf` with one `{type: member}` per member
+//     accepts exactly the same values, nullability included.
+// The traversal is the existing one: every object/array is rebuilt (so the
+// caller's schema is never mutated). `inProperties` keeps its original meaning
+// (the current object is a `properties` MAP, whose keys are parameter names) so
+// description stripping stays byte-identical. `kind` is the accurate container
+// check used only for type lowering:
+//   'schema'     — a JSON Schema object (the only place a `type` keyword lives)
+//   'properties' — a properties MAP: its KEYS are parameter names, its VALUES
+//                  are schemas (so a parameter named "properties"/"default"
+//                  still gets lowered)
+//   'literal'    — caller data from default/examples/enum/const. STICKY: every
+//                  descendant, including through arrays and nested objects, is
+//                  data, never a schema.
+function normalizeSchemaTree(value, inProperties = false, kind = 'schema') {
+  if (Array.isArray(value)) {
+    // Tuple items/prefixItems/combinator arrays contain schemas; literal arrays
+    // (enum/examples values) stay literal all the way down.
+    const itemKind = kind === 'literal' ? 'literal' : 'schema';
+    return value.map((item) => normalizeSchemaTree(item, false, itemKind));
+  }
   if (!value || typeof value !== 'object') return value;
   const out = {};
+  // Only a schema object carries the `type` keyword; inside a `properties` map
+  // `type` is just a parameter name. A malformed (non-string-member) or empty
+  // array is left untouched rather than rejected.
+  const typeMembers = kind === 'schema'
+    && Array.isArray(value.type)
+    && value.type.length > 0
+    && value.type.every((member) => typeof member === 'string')
+    ? value.type
+    : null;
   for (const [key, child] of Object.entries(value)) {
     if (key === 'description' && !inProperties) continue;
-    out[key] = stripSchemaDescriptions(child, key === 'properties');
+    if (key === 'type' && typeMembers) continue;
+    // A schema's `properties` value is a map; a schema's literal-value keys are
+    // caller data. Inside a properties map every value is a schema; inside a
+    // literal everything stays literal.
+    const childKind = kind === 'literal'
+      ? 'literal'
+      : kind === 'properties'
+        ? 'schema'
+        : key === 'properties'
+          ? 'properties'
+          : LITERAL_VALUE_KEYS.has(key) ? 'literal' : 'schema';
+    out[key] = normalizeSchemaTree(child, key === 'properties', childKind);
+  }
+  if (typeMembers) {
+    const lowered = typeMembers.map((member) => ({ type: member }));
+    // `anyOf` is the only combinator key the lowering would collide with. Keep
+    // an existing one and AND the lowered union in through `allOf` (created, or
+    // appended when it already exists) so neither semantic is dropped:
+    //   anyOf(A...) AND type∈T  ≡  anyOf(A...) AND allOf(anyOf(T...))
+    // (a sibling allOf is the intersection, so no branch cross-product is
+    // needed). oneOf/allOf are independent keywords and simply coexist.
+    if (out.anyOf === undefined) {
+      out.anyOf = lowered;
+    } else if (Array.isArray(out.allOf)) {
+      out.allOf = [...out.allOf, { anyOf: lowered }];
+    } else if (out.allOf === undefined) {
+      out.allOf = [{ anyOf: lowered }];
+    } else {
+      out.type = [...value.type]; // malformed anyOf + allOf: preserve the original
+    }
   }
   return out;
 }
 
 // ★ Tool-description length cap (2026-07-10, verified from live paid probes).
 // SUPERSEDED (2026-07-13): the MCP-gate fix below (encodeToolDef replaces the
-// top-level description with the tool name and stripSchemaDescriptions removes
+// top-level description with the tool name and normalizeSchemaTree removes
 // parameter-schema `description` annotations) is the authoritative approach —
 // it neutralizes BOTH the description-length threshold AND the MCP-gate
 // fingerprint match in one pass. capToolDescription is no longer called by
@@ -583,7 +1049,7 @@ function capToolDescription(desc, env = process.env) {
 // Fix: replace the top-level description with the tool name (the model
 // identifies tools by name, not by description prose) and strip all
 // `description` annotations from the parameter JSON Schema (see
-// stripSchemaDescriptions in normalizeToolSchema). Schema structure (types,
+// normalizeSchemaTree in normalizeToolSchema). Schema structure (types,
 // required, enums, nested objects, properties named "description") is
 // preserved — only human-readable annotation text is removed.
 //
@@ -651,6 +1117,27 @@ export function isUserJwtEnabled(env = process.env) {
 const USER_JWT_REFRESH_SKEW_MS = 60_000;
 const USER_JWT_CACHE_MAX = 500;
 
+/**
+ * Absolute deadline for one GetUserJwt mint, ms. Overridable per call via
+ * `mintUserJwt(token, { timeoutMs })`; a non-finite or non-positive override
+ * falls back here.
+ *
+ * This RPC runs BEFORE the chat request is built (`streamChat` awaits the mint),
+ * so a peer that accepts the connection and then never answers used to pin the
+ * whole chat request — and, through the coalescing map above, every other
+ * request sharing that token — with no timer running anywhere: the stream's own
+ * absolute deadline (DEVIN_CONNECT_TIMEOUT_MS) starts later, and a cold cache
+ * has nothing to serve. 15s is the ceiling for an RPC that gates a user-visible
+ * request: a healthy mint is one small round trip well under a second, so a peer
+ * still silent at 15s is dead and the caller is better off on the historical
+ * no-JWT wire. The catalog's metadata unary probe waits 30s
+ * (devin-connect-catalog.js:84) but sits in front of no user request.
+ *
+ * Deliberately NOT env-configurable: the failure this bound prevents is
+ * unbounded, so every value a switch could offer is a worse one.
+ */
+export const USER_JWT_MINT_TIMEOUT_MS = 15_000;
+
 function pruneUserJwtCache(now) {
   for (const [key, entry] of _userJwtCache) {
     if (entry.expMs - USER_JWT_REFRESH_SKEW_MS <= now) _userJwtCache.delete(key);
@@ -691,7 +1178,9 @@ export function userJwtExpiryMs(jwt) {
  * rather than fail the user's request. That is also why nothing here throws.
  *
  * @param {string} sessionToken
- * @param {{host?: string, signal?: AbortSignal, now?: number}} [opts]
+ * @param {{host?: string, signal?: AbortSignal, now?: number, timeoutMs?: number}} [opts]
+ *   `timeoutMs` overrides USER_JWT_MINT_TIMEOUT_MS for this mint (non-finite or
+ *   non-positive → that default, never "no deadline").
  * @returns {Promise<string|null>}
  */
 export async function mintUserJwt(sessionToken, opts = {}) {
@@ -720,7 +1209,7 @@ export async function mintUserJwt(sessionToken, opts = {}) {
     try {
       const proto = writeMessageField(1, buildClientMetadata(sessionToken, opts.deviceSeed));
       const framed = wrapEnvelope(proto, { compress: false });
-      const raw = await postConnectUnary(host, USER_JWT_PATH, framed, sessionToken, opts.signal);
+      const raw = await postConnectUnary(host, USER_JWT_PATH, framed, sessionToken, opts.signal, opts.timeoutMs);
       if (!raw) return null;
       const jwt = getField(parseFields(raw), 1, 2)?.value?.toString('utf8')?.trim();
       if (!jwt) return null;
@@ -750,13 +1239,26 @@ export async function mintUserJwt(sessionToken, opts = {}) {
 /**
  * One unary Connect-RPC round trip → the response's single protobuf frame.
  *
- * Resolves null (never rejects) for any non-200 or malformed body: every caller
- * here treats failure as "carry on without the optional credential".
+ * Resolves null (never rejects) for any non-200, malformed body, transport
+ * failure, or `timeoutMs` expiry: every caller here treats failure as "carry on
+ * without the optional credential".
  */
-function postConnectUnary(host, path, framed, sessionToken, signal) {
+function postConnectUnary(host, path, framed, sessionToken, signal, timeoutMs) {
+  // The one place the deadline is resolved, so a bad override can neither
+  // disable the bound nor arm an instant timer — a 0 here would fire on the
+  // next turn of the loop, kill a healthy mint and silently turn the opt-in
+  // feature into an always-null no-op.
+  const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs : USER_JWT_MINT_TIMEOUT_MS;
   return new Promise((resolve) => {
     let settled = false;
-    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    let timer = null;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolve(v);
+    };
     let req;
     try {
       req = requestImpl({
@@ -771,11 +1273,22 @@ function postConnectUnary(host, path, framed, sessionToken, signal) {
         }),
         signal,
       }, (res) => {
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
+        // Bounded read even though a non-200 body is discarded below: the
+        // response is attacker-controlled and reading it unbounded is the same
+        // availability bug the streamChat non-200 branch is guarded against
+        // (see createBoundedBodyAccumulator). The same ceiling also covers a
+        // 200 body — a unary frame (GetUserJwt) is small, so a body past the
+        // ceiling is malformed either way and is treated as such rather than
+        // parsed from a truncated prefix.
+        const buffer = createBoundedBodyAccumulator();
+        res.on('data', buffer.onData);
         res.on('end', () => {
+          const { raw: body, truncated } = buffer.finish();
+          if (truncated) {
+            log.warn(`[devin-connect] ${path} response body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated`);
+            return done(null);
+          }
           if (res.statusCode !== 200) return done(null);
-          const body = Buffer.concat(chunks);
           // Connect envelope: [flags][len:4BE][payload]. A trailer-only response
           // (flag 0x02) carries no message and must not be parsed as one.
           if (body.length < 5) return done(null);
@@ -788,6 +1301,15 @@ function postConnectUnary(host, path, framed, sessionToken, signal) {
         res.on('error', () => done(null));
       });
       req.on('error', () => done(null));
+      // Absolute deadline from request start — not a socket idle timeout, which
+      // any byte of traffic resets and which does not cover the connect phase.
+      // Armed BEFORE end() so the write can never run ahead of the bound; on
+      // expiry the socket is destroyed and the promise leaves through the same
+      // resolve(null) door as every other failure above.
+      timer = setTimeout(() => {
+        try { req.destroy(); } catch { /* already closed */ }
+        done(null);
+      }, deadlineMs);
       req.end(framed);
     } catch {
       done(null);
@@ -864,6 +1386,30 @@ const TOOL_CHOICE_DEFAULT_TAGS = Object.freeze({ choice: 12, parallel: 11 });
 
 export function isToolChoicePassthroughEnabled(env = process.env) {
   return String(env.DEVIN_CONNECT_TOOL_CHOICE ?? '').trim() === '1';
+}
+
+/**
+ * True when the caller asked for sequential tool calls (`parallel_tool_calls:false`)
+ * and this build will serve the request WITHOUT honouring that hint.
+ *
+ * The hint can only be honoured natively, through #11 `disable_parallel_tool_calls`,
+ * which is opt-in because its tag is unconfirmed (see the header above). With the
+ * switch off the field is not emitted, so the request goes upstream unchanged and
+ * the model is free to return N calls in one turn — the live matrix measured 4/4
+ * models doing exactly that with the flag set false (evidence/ToolMatrixLive.md §8).
+ *
+ * This is a PREFERENCE, not a correctness requirement, so the handler serves the
+ * request, logs the drop once per process and counts it
+ * (`parallel_tool_calls_hint_ignored`). It used to answer 400 `unsupported_parameter`
+ * instead, which made Codex CLI 0.164 — it sends the hint on every request — fail on
+ * its first turn under the shipped default (evidence/ClientSandboxes.md §3.3 C1).
+ *
+ * Serialising at the proxy is NOT an alternative either: the upstream decides the
+ * call count inside one turn, so emitting only the first of N would discard work the
+ * model already performed and the client would never learn the rest existed.
+ */
+export function isParallelToolCallsHintIgnored(parallelToolCalls, env = process.env) {
+  return parallelToolCalls === false && !isToolChoicePassthroughEnabled(env);
 }
 
 // Top-level tags GetChatMessageRequest already occupies. An override that lands on
@@ -946,12 +1492,18 @@ export function buildToolChoice(toolChoice, env = process.env) {
   if (!isToolChoicePassthroughEnabled(env)) return null;
   const norm = normalizeToolChoice(toolChoice);
   if (!norm) return null;
-  const parts = [writeStringField(1, norm.optionName)];
-  if (norm.toolName) parts.push(writeStringField(2, norm.toolName));
+  // ChatToolChoice is `oneof choice { option_name = 1; tool_name = 2; }`
+  // (exa.chat_pb). Emitting BOTH members is a schema violation — a conformant
+  // decoder keeps only the last one, so a forced tool name and the "function"
+  // option overwrote each other. Write exactly one: the name when the caller
+  // forced a tool, otherwise the option keyword.
+  const parts = norm.toolName
+    ? [writeStringField(2, norm.toolName)]
+    : [writeStringField(1, norm.optionName)];
   return Buffer.concat(parts);
 }
 
-// ─── Explicit prompt caching (#13), opt-in ──────────────────────────────────
+// ─── Explicit prompt caching (#13) ──────────────────────────────────────────
 //
 // WHAT IS MEASURED (repo history, paid Teams account):
 //   - A cache HIT costs ~17.8% of a miss (#220). The upside is real and large.
@@ -962,8 +1514,9 @@ export function buildToolChoice(toolChoice, env = process.env) {
 //     on the connect path until b0f8330, a day later), and chat.js:2004 records the
 //     three-account experiment — identical body on a second account is a WRITE, a
 //     repeat on the first is a READ.
-//   - So we already get IMPLICIT caching, and the sticky-session subsystem already
-//     pins a caller to one account, which is the condition that makes it work.
+//   - So Claude-family selectors already get IMPLICIT caching, and the
+//     sticky-session subsystem pins a caller to one account, which is the condition
+//     that makes it work.
 //
 // WHAT IS NOT MEASURED: that field #13 is the tag for system_prompt_cache_options,
 // or that requesting EPHEMERAL improves on what we get implicitly. #13 comes from
@@ -971,14 +1524,40 @@ export function buildToolChoice(toolChoice, env = process.env) {
 // tag gaps, so declaration order is not a wire tag. Same epistemic position as the
 // billing tags above: we know where to look, not what is true.
 //
-// Hence default-OFF (DEVIN_CONNECT_PROMPT_CACHE=1). Off → no #13 on the wire and
-// the request is unchanged. An operator turns it on with a capture in hand, and can
-// confirm the effect with DEVIN_CONNECT_BILLING_TAGS=cache_read_tokens=5 (already
+// WHY THE gpt-6 FAMILY DEFAULTS ON (2026-10-23): the live matrix
+// (evidence/ToolMatrixLive.md §cache) sent five identical gpt-6-luna-max requests.
+// Every one reported fresh prompt=3, cache_write=3984, and ZERO cache reads — a
+// write on every round, never a hit — while Claude served 6884 cached tokens on
+// every warm round and Gemini 2031. So the implicit-caching argument above does
+// NOT hold for this family as observed. Two explanations survive the data:
+// (a) the upstream only serves GPT reads when asked (this hint is the only
+// cache-control field the wire exposes), or (b) the usage map's read tag (5,
+// calibrated on Claude) is wrong for GPT and the reads exist but are invisible.
+// Defaulting the hint ON for this family makes the next live sample settle (a):
+// reads appear → hint required; reads stay 0 with writes still counted → the next
+// suspect is (b), the tag map, not the hint. The field carries a single enum and
+// no prompt bytes, so the experiment is bounded and reversible.
+//
+// Defaults: UNSET → ON for the gpt-6 family only, OFF everywhere else (historical
+// wire unchanged). "1" → ON for every family. Any other non-empty value
+// ("0", "false", …) → OFF, preserving the exact-"1" opt-in rule for operators.
+// Confirm the effect with DEVIN_CONNECT_BILLING_TAGS=cache_read_tokens=5 (already
 // calibrated) showing a higher read share.
 const PROMPT_CACHE_EPHEMERAL = 1;
 
-export function isPromptCacheEnabled(env = process.env) {
-  return String(env.DEVIN_CONNECT_PROMPT_CACHE ?? '').trim() === '1';
+// Selectors the catalog exposes for this family: gpt-6-luna-*, gpt-6-sol-*,
+// gpt-6-astra-*, and the 6.1 sol variants. Dotted aliases are accepted too so a
+// caller that passes the raw name (not the resolved selector) still matches.
+const GPT6_CACHE_DEFAULT = /^(?:gpt-6|gpt6)(?:[.-]1)?-(?:luna|sol|astra)(?:-|$)/i;
+
+/**
+ * @param {object} [env]
+ * @param {string} [model] resolved model selector; decides the family default
+ */
+export function isPromptCacheEnabled(env = process.env, model = '') {
+  const raw = String(env.DEVIN_CONNECT_PROMPT_CACHE ?? '').trim();
+  if (raw) return raw === '1';
+  return GPT6_CACHE_DEFAULT.test(String(model || ''));
 }
 
 /**
@@ -989,10 +1568,11 @@ export function isPromptCacheEnabled(env = process.env) {
  *
  * @param {string} systemPrompt  the prompt the cache would key on
  * @param {object} [env]
+ * @param {string} [model] resolved model selector; decides the family default
  * @returns {Buffer|null}
  */
-export function buildSystemPromptCacheOptions(systemPrompt, env = process.env) {
-  if (!isPromptCacheEnabled(env)) return null;
+export function buildSystemPromptCacheOptions(systemPrompt, env = process.env, model = '') {
+  if (!isPromptCacheEnabled(env, model)) return null;
   // Nothing to cache: an absent or trivially short system prompt cannot pay for a
   // cache write. Upstream bills a write at roughly an order of magnitude more than
   // a read (chat.js:2004), so asking to cache a 20-byte prompt is a pure loss.
@@ -1002,7 +1582,7 @@ export function buildSystemPromptCacheOptions(systemPrompt, env = process.env) {
   return writeVarintField(1, PROMPT_CACHE_EPHEMERAL);
 }
 
-function buildCompletionConfig({ maxTokens, temperature, topK, topP, contextWindow } = {}) {
+function buildCompletionConfig({ maxTokens, temperature, topK, topP, maxNewlines } = {}) {
   // LIVE FINDING (free-tier swe-1-6-slow, 2026-06-30): temperature=0 reliably
   // makes the upstream return "an internal error occurred" (3/3), while 0.001
   // succeeds. OpenAI/Anthropic clients routinely send temperature=0 for
@@ -1031,7 +1611,10 @@ function buildCompletionConfig({ maxTokens, temperature, topK, topP, contextWind
     // `|| 8192` fallbacks in handlers/messages.js and handlers/gemini.js), not the old
     // dead constant. DEFAULT_MAX_TOKENS stays 4096 for callers that read it directly.
     writeVarintField(2, maxTokens ?? WIRE_DEFAULT_MAX_TOKENS),
-    writeVarintField(3, contextWindow ?? DEFAULT_CONTEXT_WINDOW),
+    // #3 = max_newlines: an explicit value wins, else the calibrated default.
+    // A context window has no member in CompletionConfiguration and is never
+    // written here.
+    writeVarintField(3, maxNewlines ?? DEFAULT_MAX_NEWLINES),
     writeFixed64Field(5, f64le(temp)),
     writeVarintField(7, topK ?? DEFAULT_TOP_K),
     writeFixed64Field(8, f64le(topP ?? DEFAULT_TOP_P)),
@@ -1052,6 +1635,12 @@ function buildCompletionConfig({ maxTokens, temperature, topK, topP, contextWind
 export function buildGetChatMessageRequest({ token, messages, model, sessionId, completion, tools, nativeToolCall = false, deviceSeed, userJwt, toolChoice, parallelToolCalls, env = process.env, sessionModelConfig, continuityTrail } = {}) {
   if (!token) throw new Error('DEVIN_CONNECT: missing session token');
   if (!model) throw new Error('DEVIN_CONNECT: missing model selector');
+  // P-03: refuse a file/document payload before any encoding. ChatMessage has
+  // no attachment field, and messageText() would otherwise flatten the block
+  // to '' and let the turn run without the document. This is the last-line
+  // guard for direct builder callers; the HTTP handlers reject even earlier.
+  const unsupportedFilePart = findFilePartInMessages(messages);
+  if (unsupportedFilePart) throw unsupportedFilePartError(unsupportedFilePart);
 
   // Probe: gated replay of reasoning into tag #11 (or #9 for negative control).
   // Fact A3 (2026-08-03): upstream swe-1-7 accepts reasoning tags (#11, #9) without error
@@ -1069,6 +1658,30 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
   let continuityCollapsed = false;
   let pendingSystemParts = [];
   const chatMessages = [];
+
+  // Images on an ASSISTANT turn never reach the model: role=2 #10 is accepted on
+  // the wire but ignored upstream (measured 2026-10-21, issue #272 — the same
+  // image on a user turn answers "Checkerboard", on an assistant turn the model
+  // reports no image, on Anthropic and Gemini alike). Two paths therefore
+  // DISCARD such images: the empty-turn filter below (image-only turn → dropped
+  // whole) and the native tool-call branch (only #6 calls are encoded). Both call
+  // this, because issue #272 is about the drop being SILENT, not about the drop.
+  // The wire itself is unchanged: admitting an image-only turn would ship bytes
+  // the upstream throws away.
+  const noteDroppedAssistantImages = (msg) => {
+    if (!imageTag) return 0;
+    // Remote URLs count too: a direct builder caller can reach this branch with
+    // one, and that drop must be named for the same reason (#272 is about the
+    // silence, not the drop). streamChat resolves them first, so in production
+    // this is the data-URL count.
+    const inline = extractInlineImages(msg.content);
+    const remote = Array.isArray(msg.content) ? msg.content.filter((b) => remoteImageUrl(b)).length : 0;
+    const dropped = inline.length + remote;
+    if (!dropped) return 0;
+    bumpConnect('assistant_images_dropped', dropped);
+    log.warn(`DEVIN_CONNECT: dropped ${dropped} inline image(s) from an assistant turn (#272) — the upstream ignores image fields on role=assistant, so they are not encoded; put the image on a user turn to have the model see it`);
+    return dropped;
+  };
 
   const consumeCollapsedSystem = (text = '') => {
     if (!collapseSystem) return text;
@@ -1123,6 +1736,24 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
     mergedMessages.push(m);
   }
 
+  // Name any remote image_url that reached the SYNC builder unresolved. In
+  // production streamChat() has already turned those into data URLs
+  // (inlineRemoteImages), so this fires only for a direct caller of this
+  // function — and it fires instead of the old silent drop. Assistant turns are
+  // excluded: their images are dropped on purpose and already reported by
+  // noteDroppedAssistantImages (#272), so warning here too would double-report.
+  if (imageTag) {
+    for (const msg of mergedMessages) {
+      if (msg.role === 'system' || msg.role === 'assistant') continue;
+      for (const block of Array.isArray(msg.content) ? msg.content : []) {
+        const url = remoteImageUrl(block);
+        if (!url) continue;
+        log.warn(`DEVIN_CONNECT: remote image_url (${imageUrlHost(url)}) reached the wire builder unresolved — the image is NOT sent; streamChat() inlines http(s) images, direct buildGetChatMessageRequest() callers must resolve them first`);
+        bumpConnect('remote_image_unresolved');
+      }
+    }
+  }
+
   for (const msg of mergedMessages) {
     if (msg.role === 'system') {
       const t = messageText(msg.content);
@@ -1136,10 +1767,25 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
     // The Kimi workaround records 10/10 empty retries for empty assistant turns.
     // Preserve that exclusion unless enabled replay supplies a non-blank payload;
     // otherwise a disabled probe would reintroduce a text-empty wire frame.
-    // Image-only assistants retain the legacy exclusion: image emission is on
-    // by default, so admitting them needs approval to change default wire.
+    //
+    // IMAGE-ONLY ASSISTANT TURNS (#272): messageText() reads `text` parts only, so
+    // a turn whose whole payload is an inline image arrives here with empty text
+    // and is dropped — BEFORE the `images:` extraction at the two encode sites
+    // below, which is why the loss used to leave no trace anywhere.
+    //
+    // The drop itself is DELIBERATE and stays. Measured 2026-10-21 on a paid
+    // account: the same image on a role=user turn answers "Checkerboard", while
+    // on role=assistant the model reports no image (Anthropic and Gemini alike)
+    // even though #10 arrives intact on the wire. Admitting the turn would ship
+    // bytes the upstream discards and change the default wire for no capability.
+    // What was actually wrong is the SILENCE — issue #272 is filed as "silently
+    // dropped" — so the drop is named in the log and counted. If a future
+    // upstream starts honouring assistant-role images, this is the single place
+    // to change (plus test/wire-h1-empty-assistant.test.js T4 and mutation M5).
     if (msg.role === 'assistant' && messageText(msg.content).trim() === '' && !msg.tool_calls?.length
-      && !(reasoningTagNum && String(msg.reasoning || msg.reasoning_content || '').trim())) {
+      && !(reasoningTagNum && String(msg.reasoning || msg.reasoning_content || '').trim())
+      && !(msg.reasoning_signature && String(msg.reasoning_content || '').length > 0)) {
+      noteDroppedAssistantImages(msg);
       continue;
     }
     const source = msg.role === 'assistant' ? SOURCE.ASSISTANT : SOURCE.USER;
@@ -1157,14 +1803,27 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
       // duplicate the payload, and changing precedence would rewrite history.
       // Unlike the fallback branch, native replay retains whitespace verbatim.
       const preText = messageText(msg.content);
-      const reasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';
+      // Signed Claude thinking (messages.js, DEVIN_CONNECT_REPLAY_SIGNED_THINKING)
+      // rides #11 thinking + #12 signature on EVERY role=2 frame of the turn — the
+      // exact shape measured 2026-10-28 (verified upstream, recalled in the tool
+      // loop). It wins over the REPLAY_REASONING probe so #11 is never doubled.
+      const signedThinking = msg.reasoning_signature && msg.reasoning_content
+        ? { text: String(msg.reasoning_content), signature: String(msg.reasoning_signature) }
+        : null;
+      const turnReasoningTag = signedThinking ? 11 : reasoningTagNum;
+      const probeReasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';
+      const reasoningText = signedThinking ? signedThinking.text : probeReasoningText;
+      // This branch encodes text and #6 tool calls only — no image slot exists —
+      // so any image riding this turn is discarded. Say so (#272).
+      noteDroppedAssistantImages(msg);
       if (preText) {
         const parts = [
           writeStringField(1, randomUUID()),
           writeVarintField(2, SOURCE.ASSISTANT),
           writeStringField(3, preText),
         ];
-        if (reasoningText) parts.push(writeStringField(reasoningTagNum, reasoningText));
+        if (reasoningText) parts.push(writeStringField(turnReasoningTag, reasoningText));
+        if (signedThinking) parts.push(writeStringField(12, signedThinking.signature));
         chatMessages.push(Buffer.concat(parts));
       }
       for (const tc of msg.tool_calls) {
@@ -1176,7 +1835,8 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
           name,
           argsJson,
           reasoning: reasoningText,
-          reasoningTagNum,
+          reasoningTagNum: turnReasoningTag,
+          signature: signedThinking ? signedThinking.signature : '',
         }));
       }
       continue;
@@ -1208,13 +1868,20 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
     const reasoningText = source === SOURCE.ASSISTANT && reasoningTagNum
       ? String(msg.reasoning || msg.reasoning_content || '').trim()
       : '';
+    // Signed Claude thinking on a plain assistant turn: #11 verbatim (never
+    // trimmed, the signature seals the exact text) + #12, same as the tool-call
+    // branch. Wins over the REPLAY_REASONING probe so #11 is never doubled.
+    const signedThinking = source === SOURCE.ASSISTANT && msg.reasoning_signature && msg.reasoning_content
+      ? { text: String(msg.reasoning_content), signature: String(msg.reasoning_signature) }
+      : null;
     chatMessages.push(encodeChatMessage({
       source,
       text,
       images: imageTag ? extractInlineImages(msg.content) : [],
       imageTag,
-      reasoning: reasoningText,
-      reasoningTagNum,
+      reasoning: signedThinking ? signedThinking.text : reasoningText,
+      reasoningTagNum: signedThinking ? 11 : reasoningTagNum,
+      signature: signedThinking ? signedThinking.signature : '',
       env,
     }));
   }
@@ -1252,23 +1919,28 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
   // trail's whole purpose is letting the next turn see the prior reasoning as-is.
   if (!collapseSystem && continuityTrail) systemPrompt += continuityTrail;
 
-  // ModelConfig #15. RE-CALIBRATED FROM THE FULL CAPTURE SET (not just req022):
-  // decoding all 9 GetChatMessage requests of one live session (9501aa2c) shows
-  //   #15.1 = a STABLE per-session config UUID (same across every turn),
+  // #15 CortexTrajectoryReference — descriptor: exa.cortex_pb
+  //   { trajectory_id=1, step_index=2, trajectory_type=3, step_type=4 }.
+  // RE-CALIBRATED FROM THE FULL CAPTURE SET (not just req022): decoding all 9
+  // GetChatMessage requests of one live session (9501aa2c) shows
+  //   #15.1 = a STABLE per-session trajectory UUID (same across every turn),
   //   #15.2 = a MONOTONIC per-session turn counter (req009→022: 1,2,3,4,5,6,7,8),
-  //   #15.3 = 4 (constant).
+  //   #15.3 = 4 (trajectory_type = CORTEX_TRAJECTORY_TYPE_CASCADE).
+  // The CLI also sends #15.4 step_type = USER_INPUT (14); we omit it (the sibling
+  // Go implementation sends it — see the Q7 field map).
   // Stateless default (fresh uuid, turn 1) matches turn-1 capture req009. Since
-  // PR #226 the gateway CAN hold a stable session (#16); when it does and the
+  // PR #226 the gateway CAN hold a stable session; when it does and the
   // DEVIN_CONNECT_MODEL_CONFIG_STABLE gate is on, chat.js passes the session's
   // {id, turn} via sessionModelConfig so #15 matches devin.exe's shape too.
-  const modelConfigBuf = Buffer.concat([
+  const trajectoryRefBuf = Buffer.concat([
     writeStringField(1, sessionModelConfig?.id || randomUUID()),
     writeVarintField(2, sessionModelConfig?.turn || 1),
     writeVarintField(3, 4),
   ]);
 
-  // Null unless DEVIN_CONNECT_PROMPT_CACHE=1 and the prompt is worth caching.
-  const cacheOptionsBuf = buildSystemPromptCacheOptions(systemPrompt, env);
+  // Null unless the switch resolves ON for this model (gpt-6 defaults on; every
+  // other family needs DEVIN_CONNECT_PROMPT_CACHE=1) and the prompt is worth caching.
+  const cacheOptionsBuf = buildSystemPromptCacheOptions(systemPrompt, env, model);
   // Both null unless DEVIN_CONNECT_TOOL_CHOICE=1. `disableParallel` is only emitted
   // when the caller explicitly said parallel_tool_calls:false — protobuf omits a
   // false bool anyway, so sending it for the default (true) would be a no-op field.
@@ -1289,7 +1961,10 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
     ...(toolChoiceBuf ? [writeMessageField(toolChoiceTags.choice, toolChoiceBuf)] : []),
     // #13 system_prompt_cache_options — opt-in, see buildSystemPromptCacheOptions.
     ...(cacheOptionsBuf ? [writeMessageField(13, cacheOptionsBuf)] : []),
-    writeMessageField(15, modelConfigBuf),
+    writeMessageField(15, trajectoryRefBuf),
+    // #16 = cascade_id (descriptor). The value is the cascade the CLI was
+    // launched with, NOT a session id; the newer web schema adds `session_id`
+    // at #28, which we do not emit.
     writeStringField(16, sessionId || randomUUID()),
     writeVarintField(20, 1),
     writeStringField(21, model),
@@ -1332,28 +2007,29 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
 
 const FIELD = Object.freeze({ CONTENT: 3, FINISH: 5, META: 7, REASONING: 9 });
 // The top-level #5 finish signal maps to the OpenAI finish_reason vocabulary in
-// mapFinishReason() below (live-anchored 2→'stop', the rest calibratable).
+// mapFinishReason() below (descriptor-backed; 2 and 4 additionally live-anchored).
 
 // Billing passthrough (GROUNDWORK, opt-in via DEVIN_CONNECT_BILLING_TAGS).
 //
-// The static recon (P2-apiserver-methods-fields.md §2.4) verifies that the
-// response carries `credit_cost`, `committed_credit_cost`, `committed_acu_cost`
-// and `committed_overage_cost_cents` — but only as a FIELD DECLARATION ORDER,
-// not wire tag numbers (prost allows gaps; declaration order ≠ tag). These
-// fields could NOT be calibrated against a free account: a free tier isn't
+// The binary descriptor set (exa.api_server_pb.GetChatMessageResponse /
+// exa.codeium_common_pb) pins the paid scalars: credit_cost=14,
+// committed_credit_cost=18, committed_acu_cost=22 (double),
+// committed_quota_cost_basis_points=26 and committed_overage_cost_cents=27.
+// They could NOT be calibrated against a free account: a free tier isn't
 // billed, the values are 0, and protobuf does not encode zero-valued scalars —
-// so the fields are physically ABSENT from every free-account capture we have.
-// This is the same shape as the vision image-tag (also un-calibratable on free).
+// so the fields are physically ABSENT from every free-account capture we have,
+// and the paid frames seen so far carry no values either.
 //
-// So billing decode is configuration-driven, default-OFF: until an operator
-// runs the calibration on a PAID token and pins the real tags, nothing is
-// parsed and usage carries no billing keys (zero regression). The env var maps
-// logical billing keys to the integer tag observed in the metadata sub-message:
+// So billing decode is configuration-driven, default-OFF: nothing is parsed
+// until an operator points the map at the tags they want (the descriptor
+// coordinates above are the verified starting point), and usage carries no
+// billing keys (zero regression). The env var maps logical billing keys to the
+// integer tag observed in the metadata sub-message:
 //
 //   DEVIN_CONNECT_BILLING_TAGS="credit_cost=6,committed_credit_cost=7,committed_acu_cost=8"
 //
-// All tags are read from the #7 metadata sub-message as varints. A future paid
-// calibration run (scripts/devin-connect-paid-verify.mjs style) discovers them.
+// All tags are read from the #7 metadata sub-message; readNumericProtoField
+// handles the varint / fixed64 / fixed32 encodings.
 //
 // CONFIRMED 2026-07-23 (paid teams account, live A/B — issue #220): the cache-read
 // counter is tag 5. Two requests sharing a long system prefix: round-1 (miss) meta
@@ -1364,8 +2040,8 @@ const FIELD = Object.freeze({ CONTENT: 3, FINISH: 5, META: 7, REASONING: 9 });
 // surfaces prompt_tokens_details.cached_tokens. This also settles #220: caching is
 // billed correctly (hit cost measured at 17.8% of miss); the gap was purely that
 // the dashboard couldn't SEE the cache split, not that credits were over-spent.
-// credit_cost / committed_* remain declaration-order-only and still need their own
-// paid calibration run.
+// credit_cost / committed_* now have descriptor-verified coordinates
+// (14/18/22/26/27) but no observed values yet, so they stay out of the default map.
 // CONFIRMED 2026-07-25 (same paid account): the cache-WRITE counter is tag 4.
 // Claude-family selectors split prompt input the way Anthropic's own API does —
 // fresh input in tag 2, cache-creation in tag 4 — so a cache-writing turn reported
@@ -1447,35 +2123,29 @@ function parseBillingTagMap(env = process.env) {
 
 // Native tool-call DECODE (GROUNDWORK, opt-in via DEVIN_CONNECT_TOOL_CALL_TAGS).
 //
-// The response carries `delta_tool_calls` (repeated ChatToolCall). Per the
-// reverse-engineering (NW1: docs-internal/workflow-results/native-tool-wire/NATIVE-WIRE-FIELDS.md
-// §1.2/§2, sourced from the devin.exe prost declaration string at
-// strings-ascii.txt:249887) the ChatToolCall struct is, with [verified] FIELD NAMES:
+// The response carries `delta_tool_calls` (repeated ChatToolCall). The
+// descriptor (exa.codeium_common_pb.ChatToolCall) defines, with tags:
 //   ChatToolCall {
-//     is_custom_tool_call  bool   (custom tool vs a built-in harness tool)
-//     invalid_json_str     string (raw args the model emitted when they were NOT valid JSON)
-//     arguments_json       string (the valid JSON args — OpenAI function.arguments)
-//     id                   string (OpenAI tool_calls[].id)
-//     invalid_json_err     string (parse-error description for invalid_json_str)
+//     id                   string (1) — OpenAI tool_calls[].id
+//     name                 string (2) — OpenAI function.name
+//     arguments_json       string (3) — the valid JSON args (OpenAI function.arguments)
+//     invalid_json_str     string (4) — raw args the model emitted when NOT valid JSON
+//     invalid_json_err     string (5) — parse-error description for invalid_json_str
+//     is_custom_tool_call  bool   (6) — custom tool vs a built-in harness tool
 //   }
 //
-// ★ CRITICAL [verified]: the RESPONSE-side ChatToolCall has NO `name` field. The
-// REQUEST-side ToolCall does, but the response item does not (NW1 §2 "最关键的实现锚点").
-// A native decode therefore yields id + arguments but NOT the function name. We
-// resolve name from, in priority order: (1) a pinned `name` tag IF a paid frame
-// ever proves the release carries one in an unnamed subfield — CANDIDATE only,
-// UNVERIFIED, NW1 §2 candidate #3; (2) caller-supplied reverse-lookup against the
-// request-side tools (decodeFrame opts.toolNames), unambiguous when exactly one
-// tool was offered. If neither resolves, name is left undefined and the OpenAI
-// builder defaults it to 'unknown' (devin-connect-openai.js:127) — shape intact.
+// ★ The response ChatToolCall DOES carry the function name: `name = 2`, and the
+// live CLI captures populate it (id + name on the first fragment, arguments_json
+// on later frames). The earlier "the response item has no name" reading was
+// wrong. decodeFrame still falls back to a caller-supplied reverse-lookup
+// (opts.toolNames) when a frame omits it, unambiguous when exactly one tool was
+// offered. If neither resolves, name is left undefined and the OpenAI builder
+// defaults it to 'unknown' (devin-connect-openai.js:127) — shape intact.
 //
-// As with billing/vision the FIELD NAMES are [verified] but every wire TAG is
-// [unknown / UNVERIFIED]: a free capture never emits tool calls (the free models
-// we can reach don't tool-call over this path), so the sub-message is physically
-// absent and un-calibratable here. The tags are NOT guessed in code — they stay
-// unset, and decode stays OFF, until a real PAID proto dump pins them. Default
-// OFF → tool calls keep coming from prompt emulation (parseToolCallsFromText),
-// which works everywhere and remains the only production path.
+// Every tag below is descriptor-verified and was independently pinned from
+// static disasm of devin.exe (2026-07-04). Default OFF → tool calls keep coming
+// from prompt emulation (parseToolCallsFromText), which works everywhere and
+// remains the only production path.
 //
 // Tags PINNED from static disasm of devin.exe (2026-07-04, verified-from-binary):
 //   DEVIN_CONNECT_TOOL_CALL_TAGS="outer=6,id=1,name=2,arguments_json=3,invalid_json_str=4,invalid_json_err=5,is_custom_tool_call=6"
@@ -1510,12 +2180,12 @@ export function parseToolCallTagMap(env = process.env, { useDefault = false } = 
   return map.outer ? map : null;
 }
 
-// Thinking-signature DECODE config (GROUNDWORK, opt-in). The response declares
-// `delta_signature` (string, the encrypted-thinking payload increment),
-// `delta_signature_type` (enum) and `thinking_id` (string) at the top level —
-// names [verified] from recon, wire tags [unknown] (free tier never emits them).
-// Default OFF: until a paid/thinking capture pins the tags, nothing is decoded
-// and streamChat yields exactly as today (zero regression).
+// Thinking-signature DECODE config (GROUNDWORK, opt-in). The descriptor pins the
+// top-level fields: delta_signature = 10 (string, the encrypted-thinking payload
+// increment), delta_signature_type = 21 (enum), thinking_id = 16 (string), and
+// thinking_redacted = 11 (bool, not decoded). Free-tier captures never emit them.
+// Default OFF: nothing is decoded until an operator opts in, and streamChat
+// yields exactly as today (zero regression).
 //
 //   DEVIN_CONNECT_SIGNATURE_TAG=N           (the delta_signature tag; mandatory)
 //   DEVIN_CONNECT_SIGNATURE_TYPE_TAG=N       (delta_signature_type; optional)
@@ -2000,6 +2670,21 @@ export function parseResetDuration(text) {
   return Math.min(ms, 6 * 3600_000);
 }
 
+// gRPC 4xx-class statuses that mean "the REQUEST itself is invalid" — the
+// upstream request VALIDATOR refused these bytes. `invalid_argument` is measured
+// for both an unsupported image (evidence/AccountMatrix.md §7.1) and a malformed
+// tool history (#273.1: "There is an issue with this request, please try a
+// different model."); `failed_precondition` is its sibling status. The quota-dry
+// body also rides `failed_precondition`, which is why the narrower QUOTA_EXHAUSTED
+// text arm runs BEFORE these codes are claimed.
+//
+// Permanent by construction: identical bytes fail identically on every retry, and
+// nothing here is evidence about the account or its credential.
+const REQUEST_REJECTION_CODES = new Set(['invalid_argument', 'failed_precondition']);
+function isRequestRejectionCode(code) {
+  return typeof code === 'string' && REQUEST_REJECTION_CODES.has(code);
+}
+
 /**
  * @param {string} text   raw body or trailer message
  * @param {string|null} code  upstream code if already known
@@ -2066,7 +2751,16 @@ export function classifyUpstreamError(text, code = null, status = null) {
   // Observed live (free account <redacted>): GetUserStatus + liveness
   // both pass while completions return this 3/3 with fresh trace IDs. Distinct
   // from the gRPC `internal` code handled above.
-  if (/internal error occurred/i.test(lc)) {
+  //
+  // The TEXT alone is not the verdict: an explicit 4xx-class VALIDATOR code wins
+  // over it. Measured 2026-10-25 (evidence/AccountMatrix.md §7.1), an image sent
+  // to a model whose /v1/models row OMITS `supports_images` returned a 106-byte
+  // trailer `{"error":{"code":"invalid_argument","message":"an internal error
+  // occurred"}}` — the validator refusing these exact bytes, identical on every
+  // retry. Claiming it here surfaced a permanent capability rejection as 503
+  // UPSTREAM_INTERNAL and charged the internal-error breaker. See the
+  // REQUEST_REJECTED arm at the end of this function.
+  if (/internal error occurred/i.test(lc) && !isRequestRejectionCode(code)) {
     return { code: 'UPSTREAM_INTERNAL', message: body || 'DEVIN_CONNECT: upstream internal error' };
   }
   // CONTENT POLICY block (2026-07-10, live-confirmed). Upstream returns
@@ -2090,11 +2784,104 @@ export function classifyUpstreamError(text, code = null, status = null) {
   // tier-wall pattern so "insufficient credit" never reads as a free-tier
   // /upgrade prompt. "entitlement" stays a tier wall (you lack the plan, not
   // the balance), matching the /upgrade semantics.
-  if (/insufficient.*(credit|quota|balance|funds)|out of (credit|quota)|quota.*exceeded|credit.*exhausted/i.test(lc)) {
+  //
+  // `(quota|credit|usage|balance|allowance).*exhausted` is load-bearing and was
+  // measured missing. The live body for a Pro account whose daily bucket is dry is
+  //
+  //   "Your daily usage quota has been exhausted. Visit
+  //    https://app.devin.ai/settings/usage ... (trace ID: …)"
+  //
+  // carried on gRPC code `failed_precondition`. The old pattern only knew
+  // `quota.*exceeded`, so that body matched NOTHING here, fell through to the
+  // verbatim passthrough below, and came back as `failed_precondition`. That code
+  // is (a) rendered as HTTP 502 `upstream_error` by connectErrorToHttp, (b) NOT in
+  // isAccountFailoverError, so a dry account never failed over to a funded peer,
+  // and (c) in TRANSPORT_FAULT_CODES, so every quota-dry call incremented the
+  // internal-error breaker (2 hits → 120 s quarantine). One missing word turned a
+  // routine per-account dry-well into a client-visible 502 plus a benched account.
+  //
+  // Also covers the on-demand shapes ("Your on-demand usage has been exhausted",
+  // "on-demand balance exhausted") and the balance/allowance variants, all of
+  // which are the same account state. Ordered after CAPACITY and CONTENT_BLOCKED
+  // so those keep their narrower meanings.
+  if (code === 'insufficient_quota'
+      || /insufficient.*(credit|quota|balance|funds)/i.test(lc)
+      || /out of (credit|quota|balance|funds)/i.test(lc)
+      || /(credit|quota|balance|allowance|usage)[\s\w-]{0,40}?(exceeded|exhausted|depleted|used up)/i.test(lc)
+      || /on.?demand[^.]{0,60}(exhausted|exceeded|depleted|out of|insufficient)/i.test(lc)
+      || /run(?:ning)? out of (credit|quota|balance|funds|usage)/i.test(lc)) {
     return { code: 'QUOTA_EXHAUSTED', message: body || 'DEVIN_CONNECT: account out of credit/quota' };
+  }
+  // ── MODEL-LEVEL rejection scoped to (ACCOUNT, SELECTOR) ──────────────────
+  // Measured body: "This model is no longer available for your account",
+  // carried on gRPC `permission_denied` / HTTP 401. The session token is ALIVE
+  // — the same account serves every other selector — so this must NOT reach
+  // the UNAUTHORIZED arm below. Before this branch existed it did, and the
+  // whole chain was wrong for it:
+  //   (a) finalizeConnectAccount charged the account's error budget, so three
+  //       requests for one retired selector flipped a perfectly healthy
+  //       account to status='error' (persisted) — a pool-wide blackout for
+  //       every OTHER model the account could still serve;
+  //   (b) the same arm fired a re-login for a token that was never dead, and
+  //       the handler's dead-token path ran requestReauthCheck, i.e. an
+  //       account-scoped reauth verdict from a selector-scoped fact;
+  //   (c) the request never failed over, because isAccountFailoverError only
+  //       knew QUOTA_EXHAUSTED / RATE_LIMITED.
+  // The honest scope is the PAIR: this canonical selector is no longer
+  // entitled for THIS account, while the account stays healthy for the rest.
+  // Checked BEFORE the /upgrade tier-wall arm so a per-account signal wins
+  // over an inferred tier wall (a tier wall is shared by every account of a
+  // tier; this one is not, so a peer may well serve it).
+  //
+  // NARROWED to the measured account-scoped wording. This arm used to also
+  // accept plan/tier/subscription/workspace and the "not available" variant,
+  // which reclassified an explicit tier wall ("… no longer available for your
+  // plan. Please /upgrade …") as a per-account selector verdict. The two codes
+  // route differently: MODEL_BLOCKED is excluded from failover on purpose
+  // (every account of that tier hits the same wall), while
+  // SELECTOR_NOT_ELIGIBLE hops and latches. Those nouns are not evidence
+  // about ONE account; only "your account" is.
+  if (/(?:this |the )?(?:model|selector)\b[^.]{0,60}?\bno longer available for your account\b/i.test(lc)) {
+    return { code: 'SELECTOR_NOT_ELIGIBLE', message: body || 'DEVIN_CONNECT: model not available for this account' };
   }
   if (/\/upgrade|upgrade to access|insufficient.*entitlement|requires? .*(paid|pro|team|enterprise)/i.test(lc)) {
     return { code: 'MODEL_BLOCKED', message: body || 'model requires a paid Devin entitlement' };
+  }
+  // ── REQUEST VALIDATOR REJECTION (4xx-class) ─────────────────────────────
+  // `invalid_argument` / `failed_precondition` that matched no narrower verdict:
+  // the upstream refused the REQUEST, not the account. Measured shapes are the
+  // §7.1 image frame handled above (its text arm is skipped when the code is in
+  // this set) and #273.1's "There is an issue with this request, please try a
+  // different model." Both are permanent — the same bytes fail identically on
+  // every retry — yet they used to surface as 503 (UPSTREAM_INTERNAL) or 502
+  // (verbatim passthrough), telling clients to retry something that can never
+  // succeed.
+  //
+  // PRECEDENCE (P2-5): this arm MUST run before the HTTP 401/403 auth shell
+  // below. The measured delivery mode for a validator verdict is a 401/403
+  // shell (the §7.1 trailer), so the status arm used to claim it first: the
+  // proxy charged account health and started a re-login for a token that was
+  // never dead. An explicit 4xx-class code is evidence about the BYTES and is
+  // strictly more specific than the HTTP status; a real auth failure carries
+  // no such code (or `permission_denied`/`unauthenticated`, which are not in
+  // this set) and still reaches the UNAUTHORIZED arm unchanged.
+  //
+  // 400 invalid_request_error with the upstream message PLUS the capability hint
+  // the caller needs to act on: the §7.1 rows are exactly the models whose
+  // /v1/models row omits `supports_images`. Keep the hint free of the internal
+  // leak markers messages.js generalizes on (devin_connect / session token /
+  // failover / ...), or an Anthropic client would receive the generic text.
+  // NO account penalty (the token is alive) and NO in-process retry
+  // (isRetryable excludes the code).
+  if (isRequestRejectionCode(code)) {
+    const detail = body || `upstream rejected the request (${code})`;
+    return {
+      code: 'REQUEST_REJECTED',
+      message: `${detail} [upstream rejected the request as invalid (${code}): the selected model `
+        + 'may not support this input — e.g. an image on a model whose /v1/models row omits '
+        + 'supports_images — or the message/tool shape is unsupported. Check supports_images in '
+        + 'GET /v1/models and retry with a capable model or request shape]',
+    };
   }
   // `code === 'unauthenticated'` is claimed here alongside 'permission_denied'. The
   // body-text arm already caught the common shape, but a bare gRPC status with a
@@ -2135,7 +2922,13 @@ export function isRetryable(err) {
   // same-token retry just amplifies load, #35). Short-circuit BEFORE the 5xx
   // status branch, which would otherwise re-admit it when the fault arrives as
   // a genuine 5xx rather than in a 401/403 shell (audit F4).
-  if (err.code === 'UPSTREAM_INTERNAL') return false;
+  //
+  // REQUEST_REJECTED joins it for the same reason and one more: the rejection is
+  // about the BYTES, so a replay is guaranteed to fail identically. The 5xx
+  // status branch would otherwise re-admit it when the upstream wraps the
+  // validator verdict in a 5xx shell (measured delivery mode for transient
+  // faults), turning a permanent 400-class verdict into a retry storm.
+  if (err.code === 'UPSTREAM_INTERNAL' || err.code === 'REQUEST_REJECTED') return false;
   if (err.code && RETRYABLE_CODES.has(err.code)) return true;
   // HTTP 5xx (except 501) are transient; 4xx are not.
   if (typeof err.status === 'number') return err.status >= 500 && err.status !== 501;
@@ -2144,61 +2937,65 @@ export function isRetryable(err) {
 
 /** Map the upstream finish enum to the OpenAI finish_reason vocabulary.
  *
- * The upstream `StopReason` enum's variant NAMES are known from the binary
- * (recon strings dump 208551): `end_turn, max_tokens, max_turn_requests,
- * refusal, cancelled` — Anthropic-style. But the integer→name mapping is only
- * partially calibrated: a normal free-tier completion was observed live as the
- * top-level #5 finish field == 2, which we anchor to OpenAI 'stop'. The enum's
- * zero value is almost certainly UNSPECIFIED (prost convention), so the named
- * variants start at 1; we can't pin each integer without a live capture of a
- * truncated / refused / tool-stopped turn.
+ * `StopReason` is no longer inferred from variant names: the binary descriptor
+ * set (exa.codeium_common_pb.StopReason, 0–13, Q7 audit) pins every integer,
+ * and the independent Go decoder in devin-2api agrees on the non-trivial rows
+ * (INCOMPLETE / MAX_TOKENS / PARTIAL → length, FUNCTION_CALL → tool_use,
+ * ERROR → error).
  *
- * So the map is: the live-anchored 2→'stop' is fixed, a best-effort default for
- * the remaining values follows the Anthropic→OpenAI convention, and an operator
- * can override the whole table from a real capture via DEVIN_CONNECT_STOP_REASON_MAP
- * (e.g. "1=stop,2=stop,3=length,5=content_filter"). Unknown values fall back to
- * 'stop' so a completed stream is NEVER surfaced as an error.
+ *   0 UNSPECIFIED               → stop
+ *   1 INCOMPLETE                → length
+ *   2 STOP_PATTERN              → stop   (live-anchored free-tier stop)
+ *   3 MAX_TOKENS                → length
+ *   4 MIN_LOG_PROB              → stop   (live-anchored paid stop)
+ *   5 MAX_NEWLINES              → length
+ *   6 EXIT_SCOPE                → stop
+ *   7 NONFINITE_LOGIT_OR_PROB   → stop
+ *   8 FIRST_NON_WHITESPACE_LINE → stop
+ *   9 PARTIAL                   → length
+ *  10 FUNCTION_CALL             → tool_calls
+ *  11 CONTENT_FILTER            → content_filter
+ *  12 NON_INSERTION             → stop
+ *  13 ERROR                     → error
+ *
+ * 2 and 4 keep their live anchors: a free-tier completion returned 2, and a
+ * paid teams capture (2026-07-27) returned 4 on complete answers — neither
+ * contradicts the descriptor (a min-logprob cutoff is still a finished turn).
+ * 13 has no OpenAI vocabulary entry; 'error' matches the existing special-agent
+ * stream-failure convention, and resolveFinishReason never upgrades it.
+ *
+ * An operator can override any integer from a real capture via
+ * DEVIN_CONNECT_STOP_REASON_MAP (e.g. "3=stop,13=stop"). Values outside 0–13
+ * fall back to 'stop' so a completed stream is never surfaced as an error, and
+ * are logged once per distinct value.
  */
 const STOP_REASON_DEFAULT = Object.freeze({
-  // 0 = UNSPECIFIED (prost convention) → treat as a clean stop.
-  0: 'stop',
-  // 2 = LIVE-ANCHORED normal completion (free-tier observed). Do not change.
-  2: 'stop',
-  // Best-effort for the named variants (un-pinned integers): end_turn→stop,
-  // max_tokens→length, max_turn_requests→length, refusal→content_filter,
-  // cancelled→stop. These are guesses keyed off the variant NAME order and are
-  // overridable; they only matter once a paid/edge capture pins the integers.
-  1: 'stop',        // end_turn
-  // 3 WAS 'length' on the strength of the variant NAME order alone. That guess is
-  // now retired, for the same reason the 4→'length' guess had to be: an integer
-  // guessed wrong makes every COMPLETE response read as truncated, and on
-  // /v1/responses a 'length' closes the turn as `response.incomplete`, which is a
-  // whole-turn hard failure for Codex-style clients. 4 proved the guess wrong once
-  // already (paid capture, §8.7). Truncation is not something to infer from an
-  // uncalibrated enum: real truncation is corroborated by completion_tokens
-  // reaching the requested cap, which resolveFinishReason checks from the usage
-  // block, so nothing is lost by defaulting to a clean stop here.
-  3: 'stop',        // was max_tokens→'length' (name-order guess, retired)
-  // 4 = LIVE-ANCHORED normal completion on a PAID (teams) account, calibrated
-  // 2026-07-27 — §8.7 had been waiting for exactly this capture. Three probes on
-  // claude-sonnet-4.6 with max_tokens 300 / 8 / 40 all returned 4, and the
-  // max_tokens=300 one answered "HI" (2 chars — unambiguously complete), so 4 is
-  // the paid tier's clean stop, not a turn-limit. It was guessed as
-  // max_turn_requests→'length' from the variant NAME order, which made EVERY
-  // complete paid response read as truncated: finish_reason='length' on
-  // /v1/chat/completions and status='incomplete' on /v1/responses. Clients that
-  // auto-continue on a length finish would loop on complete answers.
-  // Override with DEVIN_CONNECT_STOP_REASON_MAP if a future capture disagrees.
-  4: 'stop',        // normal completion (paid); was max_turn_requests guess
-  // 5 WAS 'content_filter' from the same name-order guess, and it is the most
-  // damaging one to get wrong: content_filter also closes /v1/responses as
-  // `response.incomplete`, AND the messages route maps it to Anthropic
-  // `stop_reason:'refusal'` — so a normal completion would be reported to the
-  // client as the model refusing. A real refusal is visible in the answer text;
-  // a fabricated one is not recoverable by the client.
-  5: 'stop',        // was refusal→'content_filter' (name-order guess, retired)
-  6: 'stop',        // cancelled
+  0: 'stop',            // STOP_REASON_UNSPECIFIED
+  1: 'length',          // INCOMPLETE
+  2: 'stop',            // STOP_PATTERN (live-anchored clean stop)
+  3: 'length',          // MAX_TOKENS
+  4: 'stop',            // MIN_LOG_PROB (live-anchored paid clean stop)
+  5: 'length',          // MAX_NEWLINES
+  6: 'stop',            // EXIT_SCOPE
+  7: 'stop',            // NONFINITE_LOGIT_OR_PROB
+  8: 'stop',            // FIRST_NON_WHITESPACE_LINE
+  9: 'length',          // PARTIAL
+  10: 'tool_calls',     // FUNCTION_CALL
+  11: 'content_filter', // CONTENT_FILTER
+  12: 'stop',           // NON_INSERTION
+  13: 'error',          // ERROR
 });
+
+// Unknown enum values are logged once each: a single mis-mapped turn should be
+// visible in the log, but a server that repeats an out-of-range value must not
+// turn one bug into a log flood. Capped so a hostile stream cannot grow the set.
+const MAX_UNKNOWN_STOP_REASON_LOGS = 16;
+const _unknownStopReasonsLogged = new Set();
+function noteUnknownStopReason(n) {
+  if (_unknownStopReasonsLogged.has(n) || _unknownStopReasonsLogged.size >= MAX_UNKNOWN_STOP_REASON_LOGS) return;
+  _unknownStopReasonsLogged.add(n);
+  log.warn(`devin-connect: unknown StopReason ${String(n)}; reporting finish_reason 'stop'`);
+}
 
 let _stopReasonMapCache = null;
 let _stopReasonMapSrc = null;
@@ -2236,11 +3033,26 @@ function stopReasonMap(env = process.env) {
  * implementation rather than a copy — the earlier test mirrored this arithmetic
  * inline, which meant degrading the production path did not fail it.
  *
- * Same semantics the Cascade path settled on (#118):
- *   prompt_tokens  = fresh input + cache_read   (cached_tokens is a SUBSET detail)
- *   total_tokens   = prompt + completion + cache_write  (full billable cost)
- *   cache_write stays OUT of prompt_tokens — it is generation-side and ships on
- *   cache_creation_input_tokens.
+ * Connect semantics (O2, evidence/ClientSandboxes.md §5.3):
+ *   prompt_tokens  = fresh + cache_read + cache_write  (the input the model processed)
+ *   total_tokens   = prompt + completion               (identity holds by construction)
+ *   prompt_tokens_details.cached_tokens = cache_read   (a SUBSET of prompt_tokens)
+ *   cache_creation_input_tokens        = cache_write   (Anthropic sibling for relays)
+ *   fresh_input_tokens                 = fresh         (explicit bucket; see below)
+ *
+ * Why cache_write is INSIDE prompt_tokens here while the Cascade path keeps it out
+ * (#118): on a connect cache-write turn the upstream reports the prefix it just
+ * processed on tag 4 and only the new tail on tag 2. Measured on claude-sonnet-4.6:
+ * round-1 write=14361, round-2 read=14356 + fresh=5 — i.e. the write IS the same
+ * input, not a generation-side extra. Excluding it made omp render "3 in" for an
+ * 11.5k prompt on 2/7 turns, and those two turns were exactly the prefix-miss
+ * (cache-write) requests. The Cascade split stays as #118 chose it, so consumers
+ * must NOT re-derive fresh as `prompt - cached` on this shape: `fresh_input_tokens`
+ * carries it explicitly (auth.js fullBillableTokens, messages.js, dashboard stats).
+ *
+ * `prompt_tokens_details` is emitted even when the upstream reported no cache read
+ * (tag 5 is absent on a write turn). Omitting it made the breakdown vanish on
+ * exactly the responses that needed explaining.
  *
  * Returns null for a missing usage block so callers can pass it straight through.
  */
@@ -2250,27 +3062,17 @@ export function normalizeConnectUsage(lastUsage) {
   const cacheRead = lastUsage.cache_read_tokens || 0;
   const cacheWrite = lastUsage.cache_write_tokens || 0;
   const completion = lastUsage.completion || 0;
-  const promptTokens = fresh + cacheRead;
-  // WINDSURFAPI_STRICT_USAGE_TOTAL=1 restores OpenAI's arithmetic identity
-  // (total == prompt + completion) for clients that validate it. Off by default: the
-  // identity break is cosmetic for nearly every consumer, whereas dropping cache_write
-  // from the total under-reports real spend, so spec-strictness is the opt-in.
-  //
-  // IMPORTED rather than re-parsed here. This line used to be its own
-  // `String(process.env...) === '1'`, which meant the "only the literal 1 counts" rule —
-  // the one with an explicit assertion behind it — bound chat.js and silently not this
-  // module. Two copies of an env parse is one copy too many when the thing it gates is
-  // billing-shaped.
-  const strictTotal = strictUsageTotal();
+  // cache_write is input on this path, so it is part of prompt_tokens and must not
+  // be added to the total a second time. WINDSURFAPI_STRICT_USAGE_TOTAL is therefore
+  // a no-op here — the OpenAI identity already holds (asserted in
+  // test/strict-usage-total.test.js so a future re-split has to revisit it).
+  const promptTokens = fresh + cacheRead + cacheWrite;
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completion,
-    total_tokens: strictTotal
-      ? promptTokens + completion
-      : promptTokens + completion + cacheWrite,
-    ...(lastUsage.cache_read_tokens != null
-      ? { prompt_tokens_details: { cached_tokens: cacheRead } }
-      : {}),
+    total_tokens: promptTokens + completion,
+    prompt_tokens_details: { cached_tokens: cacheRead },
+    fresh_input_tokens: fresh,
     ...(lastUsage.cache_write_tokens != null
       ? { cache_creation_input_tokens: cacheWrite }
       : {}),
@@ -2282,26 +3084,66 @@ export function mapFinishReason(finish, env = process.env) {
   const n = typeof finish === 'bigint' ? Number(finish) : finish;
   const map = stopReasonMap(env);
   // Unknown values → 'stop': a completed stream must never read as an error.
-  return map[n] || 'stop';
+  // hasOwn keeps a non-numeric finish from resolving through Object.prototype.
+  if (Object.hasOwn(map, n)) return map[n];
+  noteUnknownStopReason(n);
+  return 'stop';
+}
+
+/**
+ * Apply the caller's output cap to a terminal finish reason.
+ *
+ * LIVE FINDING (evidence/ToolMatrixLive.md, flag 2): `gemini-3-6-flash-medium`
+ * max_tokens does not bound thinking. Probes returned completion_tokens 105
+ * under max_tokens:64 and 271 under 128 while the visible answer was a short
+ * string — the upstream counts thinking inside completion_tokens but spends it
+ * OUTSIDE the cap. The old check here used strict equality (`completion === cap`),
+ * so every overrun sailed past it and the turn reported a clean 'stop': a budget
+ * overrun indistinguishable from a complete answer. GPT overran the same way at
+ * 16 (32 > 16), so the rule is model-agnostic, not Gemini-specific.
+ *
+ * `>=` is the honest test: the caller asked for at most `cap` output tokens and
+ * the upstream produced at least that many. The equality half keeps the older,
+ * narrower truncation signal.
+ *
+ * Why this reports instead of enforces: the only EXACT token count is the
+ * upstream's, and it arrives on the terminal frame after every delta has been
+ * delivered. The proxy has no tokenizer (chars/4 is an estimate), so cutting the
+ * stream at the cap would drop delivered content mid-answer and could label a
+ * complete answer truncated — the failure mode this same comment has warned
+ * about since the paid stop-reason calibration. Reporting 'length' leaves the
+ * answer intact and tells the client its budget was exceeded.
+ *
+ * Only a clean 'stop' can be upgraded: tool_calls / content_filter / error are
+ * stronger statements about what the turn did. An explicit operator override in
+ * resolveFinishReason still wins over this inference.
+ *
+ * @param {string} finishReason  already-mapped OpenAI finish_reason
+ * @param {object|null} usage    normalized usage ({completion_tokens})
+ * @param {number|null} maxTokens  output cap the caller requested, if any
+ * @returns {string} the reason to report
+ */
+export function applyOutputCap(finishReason, usage, maxTokens) {
+  if (finishReason !== 'stop') return finishReason;
+  const cap = Number(maxTokens);
+  const completion = Number(usage?.completion_tokens);
+  if (Number.isFinite(cap) && cap > 0 && Number.isFinite(completion) && completion >= cap) {
+    return 'length';
+  }
+  return finishReason;
 }
 
 /**
  * Resolve the OpenAI finish_reason for a completed connect turn.
  *
- * The enum alone cannot tell us about truncation: only 2 and 4 are pinned by live
- * captures, and every name-order guess for the rest has been wrong so far (4 was
- * 'length' and made every complete paid response read as truncated). So the enum
- * now defaults to 'stop' and truncation is detected from a signal that does not
- * depend on the un-calibrated integers: `completion_tokens` reaching the output cap
- * the caller asked for. That is the same test an OpenAI client would apply itself.
- *
- * The check is deliberately conservative — equality with the cap, not >=, and only
- * when the caller set an explicit cap:
- *   - `max_tokens` is NOT enforced upstream on every tier (a free-tier probe varied
- *     16 → 1000 with byte-identical output), so a turn that never approaches the cap
- *     is unaffected either way;
- *   - reporting a complete answer as truncated is the more harmful error (clients
- *     that auto-continue on 'length' loop forever), so ambiguity resolves to 'stop'.
+ * The descriptor now pins the enum (see STOP_REASON_DEFAULT), so MAX_TOKENS (3)
+ * reports 'length' without inference. The usage check stays as a second line of
+ * defense for the values the descriptor calls a clean stop (2/4): a turn that
+ * reached or overran the caller's output budget is still truncated, and that
+ * signal does not depend on the enum at all — it is the same test an OpenAI
+ * client would apply itself. See applyOutputCap for why the comparison is `>=`
+ * rather than equality (thinking is counted in completion_tokens but not bounded
+ * by the cap on every tier).
  *
  * An explicit DEVIN_CONNECT_STOP_REASON_MAP override always wins: an operator who
  * HAS captured the real integers is a better authority than this inference.
@@ -2321,15 +3163,7 @@ export function resolveFinishReason(finish, usage, maxTokens, env = process.env)
   const { overrides } = stopReasonMapAndOverrides(env);
   const key = typeof finish === 'bigint' ? Number(finish) : finish;
   if (finish != null && overrides.has(key)) return mapped;
-  // Only a clean stop can be upgraded to 'length'. tool_calls / content_filter are
-  // stronger signals about what the turn actually did and must not be overwritten.
-  if (mapped !== 'stop') return mapped;
-  const cap = Number(maxTokens);
-  const completion = Number(usage?.completion_tokens);
-  if (Number.isFinite(cap) && cap > 0 && Number.isFinite(completion) && completion === cap) {
-    return 'length';
-  }
-  return mapped;
+  return applyOutputCap(mapped, usage, maxTokens);
 }
 
 
@@ -2358,7 +3192,7 @@ export function resolveFinishReason(finish, usage, maxTokens, env = process.env)
 export async function* streamChat({
   messages, model, sessionId, completion, tools,
   token, signal, timeoutMs, deadlineMs, host, env = process.env, nativeToolCall = false, traceId = null,
-  deviceSeed, sessionModelConfig, continuityTrail,
+  deviceSeed, sessionModelConfig, continuityTrail, toolChoice, parallelToolCalls,
 } = {}) {
   if (signal?.aborted) {
     const err = new Error('The operation was aborted');
@@ -2413,7 +3247,17 @@ export async function* streamChat({
   const userJwt = isUserJwtEnabled(env)
     ? await mintUserJwt(sessionToken, { host: HOST, signal, deviceSeed })
     : undefined;
-  const proto = buildGetChatMessageRequest({ token: sessionToken, messages, model, sessionId, completion, tools, nativeToolCall, deviceSeed, userJwt, env, sessionModelConfig, continuityTrail });
+  // Remote (http/https) image_url blocks are fetched HERE, before the synchronous
+  // wire builder, because extractInlineImages cannot fetch. Gated on the image
+  // field being emitted at all: DEVIN_CONNECT_IMAGE_TAG=0 means images are off,
+  // so spending network time on them would be pure waste. The returned array is
+  // new only when something changed; the caller's messages are never mutated
+  // (they are re-passed on retry/failover).
+  const imageTag = getImageFieldTag(env);
+  const wireMessages = imageTag
+    ? await inlineRemoteImages(messages, { signal })
+    : messages;
+  const proto = buildGetChatMessageRequest({ token: sessionToken, messages: wireMessages, model, sessionId, completion, tools, nativeToolCall, deviceSeed, userJwt, env, sessionModelConfig, continuityTrail, toolChoice, parallelToolCalls });
   // Request envelope is sent UNCOMPRESSED (flag 0). The live calibration showed
   // the server rejects a gzipped request frame with an opaque "internal" error;
   // it still streams gzipped frames back, which the parser handles.
@@ -2442,7 +3286,32 @@ export async function* streamChat({
     effectiveHost = validatedAccountConnectHost(host);
   }
 
+  // Bounded frame queue (GFReliability). `res.on('data')` decodes frames far
+  // faster than a slow consumer drains them (a client applying backpressure
+  // suspends the generator at `yield`), and this array used to be unbounded —
+  // one stalled client could pin a whole upstream stream's decoded output in
+  // memory. Cap by frames AND bytes: pause the socket at half the cap so TCP
+  // carries the backpressure upstream, and fail the stream with QUEUE_OVERFLOW
+  // if one chunk still crosses the cap (a single data event can carry thousands
+  // of tiny frames, and pausing cannot interrupt the synchronous loop that is
+  // already running). Below the pause threshold nothing changes — same events,
+  // same order, no pause/resume.
+  const maxQueueFrames = positiveIntEnv(env.DEVIN_CONNECT_MAX_QUEUE_FRAMES, 4096);
+  const maxQueueBytes = positiveIntEnv(env.DEVIN_CONNECT_MAX_QUEUE_BYTES, 8 * 1024 * 1024);
+  const pauseQueueFrames = Math.max(1, Math.ceil(maxQueueFrames / 2));
+  const pauseQueueBytes = Math.max(1, Math.ceil(maxQueueBytes / 2));
+  // Resume well below the pause point: resuming at the threshold itself would
+  // let the producer refill to it immediately, cycling pause/resume once per
+  // event. Half the pause point lets a real batch through per cycle.
+  const resumeQueueFrames = Math.max(1, Math.floor(pauseQueueFrames / 2));
+  const resumeQueueBytes = Math.max(1, Math.floor(pauseQueueBytes / 2));
   const queue = [];
+  let queueBytes = 0;
+  let queuePaused = false;
+  let queueOverflowed = false;
+  // Assigned by the response handler (it needs `res`); the consumer loop calls
+  // it after every shift. A no-op until the response arrives.
+  let noteQueueConsumed = () => {};
   let done = false;
   let streamError = null;
   let wake = null;
@@ -2484,10 +3353,19 @@ export async function* streamChat({
     // free-tier /upgrade, UNAUTHORIZED, RATE_LIMITED) instead of an opaque
     // frame-parse failure from feeding an error body to StreamingFrameParser.
     if (res.statusCode && res.statusCode !== 200) {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      // Bound the buffer. An error body is a diagnostic, not a payload: the
+      // only thing downstream does with it is classifyUpstreamError, which
+      // reads a code, a message and an optional reset window. Reading it
+      // unbounded is an availability bug — see createBoundedBodyAccumulator
+      // for the crash it causes and why the crossing chunk is sliced.
+      const buffer = createBoundedBodyAccumulator();
+      res.on('data', buffer.onData);
       res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8');
+        const { raw, truncated } = buffer.finish();
+        const body = raw.toString('utf8') + (truncated ? ERROR_BODY_TRUNCATION_MARKER : '');
+        if (truncated) {
+          log.warn(`[devin-connect] upstream ${res.statusCode} error body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated for classification`);
+        }
         // Preserve the upstream Connect-RPC error code (audit F2): the trailer
         // path forwards parsed.error.code, but this non-200 path historically
         // dropped it (code=null), so an `unavailable`/`resource_exhausted`
@@ -2513,6 +3391,58 @@ export async function* streamChat({
       return;
     }
     const parser = new StreamingFrameParser();
+    // Queue accounting. Text dominates the retained memory (UTF-16 chars) and
+    // hex dumps are one char per wire byte; 96 bytes covers the event object
+    // itself. Deliberately cheap — it runs once per pushed event, not per byte,
+    // and the caps are safety bounds rather than an exact allocator.
+    const eventBytes = (ev) => {
+      let n = 96;
+      if (typeof ev.text === 'string') n += ev.text.length * 2;
+      // Reasoning signatures are opaque payloads of the same order as content,
+      // but they ride in `reasoning_signature`, not `text`. Without this the
+      // byte cap would charge them a flat 96 bytes and a thinking-heavy stream
+      // could exceed the bound by maxQueueFrames × signature size.
+      if (typeof ev.reasoning_signature === 'string') n += ev.reasoning_signature.length * 2;
+      if (typeof ev.hex === 'string') n += ev.hex.length;
+      return n;
+    };
+    const pushEvent = (ev) => {
+      if (queueOverflowed) return;
+      queue.push(ev);
+      queueBytes += eventBytes(ev);
+      if (queue.length > maxQueueFrames || queueBytes > maxQueueBytes) {
+        // Hard cap. Drop what is buffered: the consumer has not seen these
+        // events yet and the stream is failing anyway — retaining them would
+        // defeat the bound this exists to enforce.
+        queueOverflowed = true;
+        queue.length = 0;
+        queueBytes = 0;
+        streamError = Object.assign(
+          new Error(`DEVIN_CONNECT: frame queue exceeded ${maxQueueFrames} frames / ${maxQueueBytes} bytes (consumer too slow)`),
+          { code: 'QUEUE_OVERFLOW' },
+        );
+        done = true;
+        req.destroy();
+        pump();
+        return;
+      }
+      // High-water mark: stop reading the socket and let TCP carry the
+      // backpressure upstream. A transport without pause() still gets the hard
+      // cap above, so the bound holds either way.
+      if (!queuePaused && typeof res.pause === 'function'
+          && (queue.length >= pauseQueueFrames || queueBytes >= pauseQueueBytes)) {
+        queuePaused = true;
+        res.pause();
+      }
+    };
+    noteQueueConsumed = (ev) => {
+      queueBytes = Math.max(0, queueBytes - eventBytes(ev));
+      if (queuePaused && !queueOverflowed
+          && queue.length <= resumeQueueFrames && queueBytes <= resumeQueueBytes) {
+        queuePaused = false;
+        if (typeof res.resume === 'function') res.resume();
+      }
+    };
     const _wireCapture = String(process.env.DEVIN_CONNECT_WIRE_DUMP || '') === '1'
       || (String(process.env.WINDSURFAPI_TRACE || '') === '1' && !!traceId);
     const _wireResChunks = _wireCapture ? [] : null;
@@ -2523,6 +3453,7 @@ export async function* streamChat({
       try { frames = parser.drain(); }
       catch (err) { streamError = err; done = true; req.destroy(); pump(); return; }
       for (const frame of frames) {
+        if (queueOverflowed) break;
         if (frame.isEndStream) {
           sawEndOfStream = true;
           // Trailer is JSON: {} on success, {"error":{...}} on failure.
@@ -2531,7 +3462,7 @@ export async function* streamChat({
           // so a probe can check whether usage/billing ever rides the trailer
           // rather than a frame. Pure additive; zero effect on production.
           if (env.DEVIN_CONNECT_DUMP_RAW === '1') {
-            queue.push({ type: 'raw-frame', endStream: true, hex: frame.payload.toString('hex'), text });
+            pushEvent({ type: 'raw-frame', endStream: true, hex: frame.payload.toString('hex'), text });
           }
           if (text && text !== '{}') {
             try {
@@ -2562,7 +3493,7 @@ export async function* streamChat({
         // exactly where billing cost fields (likely doubles) would hide. Pure
         // additive; only under DEVIN_CONNECT_DUMP_RAW.
         if (env.DEVIN_CONNECT_DUMP_RAW === '1') {
-          queue.push({ type: 'raw-frame', endStream: false, hex: frame.payload.toString('hex') });
+          pushEvent({ type: 'raw-frame', endStream: false, hex: frame.payload.toString('hex') });
         }
         if (frameDump) log.info(`DEVIN_CONNECT frame dump (top-level tag=value): ${JSON.stringify(frameDump)}`);
         if (metaDump) log.info(`DEVIN_CONNECT meta dump (tag=value varints): ${JSON.stringify(metaDump)}`);
@@ -2570,7 +3501,7 @@ export async function* streamChat({
         // When dumping, also surface the raw dumps as a structured event so a
         // calibration consumer can aggregate tags without scraping logs. Pure
         // additive — only emitted under DEVIN_CONNECT_DEBUG_META.
-        if (frameDump || metaDump || subDump) { queue.push({ type: 'frame-dump', frameDump: frameDump || null, metaDump: metaDump || null, subDump: subDump || null }); }
+        if (frameDump || metaDump || subDump) { pushEvent({ type: 'frame-dump', frameDump: frameDump || null, metaDump: metaDump || null, subDump: subDump || null }); }
         if (actualModel) lastActualModel = actualModel;
         if (signature) {
           // delta_signature is an INCREMENT (like Anthropic signature_delta).
@@ -2586,15 +3517,15 @@ export async function* streamChat({
             ...(signature.signatureType != null ? { signatureType: signature.signatureType } : {}),
             ...(signature.thinkingId != null ? { thinkingId: signature.thinkingId } : {}),
           };
-          queue.push({
+          pushEvent({
             type: 'signature',
             reasoning_signature: signature.text,
             ...(signature.signatureType != null ? { signatureType: signature.signatureType } : {}),
             ...(signature.thinkingId != null ? { thinkingId: signature.thinkingId } : {}),
           });
         }
-        if (reasoning) { queue.push({ type: 'reasoning', text: reasoning }); }
-        if (content) { queue.push({ type: 'content', text: content }); }
+        if (reasoning) { pushEvent({ type: 'reasoning', text: reasoning }); }
+        if (content) { pushEvent({ type: 'content', text: content }); }
         if (finish != null) lastFinish = finish;
         if (usage) lastUsage = usage;
         if (billing) lastBilling = { ...lastBilling, ...billing };
@@ -2636,7 +3567,10 @@ export async function* streamChat({
     done = true;
     pump();
   }, absoluteDeadlineMs);
-  // Don't let the deadline timer keep the event loop alive on its own.
+  // The deadline timer stays OUT of the loop's ref set by default: it must never hold the
+  // process open on its own (a caller that walks away from the iterator without closing it
+  // would otherwise pin shutdown for up to absoluteDeadlineMs). The consumer wait below
+  // re-refs it for exactly the window in which it is the only thing that can make progress.
   if (typeof deadlineTimer.unref === 'function') deadlineTimer.unref();
 
   req.write(framed);
@@ -2645,7 +3579,12 @@ export async function* streamChat({
   // Consumer loop: drain the queue, awaiting more data until the stream ends.
   try {
     while (true) {
-      if (queue.length) { yield queue.shift(); continue; }
+      if (queue.length) {
+        const ev = queue.shift();
+        noteQueueConsumed(ev);
+        yield ev;
+        continue;
+      }
       if (streamError) throw streamError;
       if (done) {
         // wire-01: flush any trailing bytes the decoders were holding (an
@@ -2684,19 +3623,17 @@ export async function* streamChat({
           // defaulted call's truncation undetectable — the stream would stop at the
           // wire cap and still report a clean 'stop'.
           reason: resolveFinishReason(lastFinish, finishUsage, completion?.maxTokens ?? WIRE_DEFAULT_MAX_TOKENS, env),
-          // Same normalization the Cascade path already applies (chat.js, #118):
-          // prompt_tokens INCLUDES cache_read (cached_tokens is a SUBSET detail of
-          // it, per OpenAI's shape), and total_tokens carries the full cost
-          // including cache_write so per-account accounting stays honest.
-          //
-          // Without this the connect path reported the upstream's raw fresh-input
-          // figure as prompt_tokens, so on a cache-hit turn it emitted
-          // cached_tokens=1765 alongside prompt_tokens=3 — a superset field larger
-          // than the field it is a subset of — and total_tokens=158 against ~1768
-          // real input tokens, a ~91% under-report. Every relay in front of this
-          // proxy (one-api / new-api and friends) meters from exactly these
-          // numbers, and all four protocol routes read this one object, so fixing
-          // it at the birth point corrects them together. Live-reproduced.
+          // Normalized at the birth point, so all four protocol routes read one
+          // object: prompt_tokens is the FULL input (fresh + cache_read +
+          // cache_write), cached_tokens is its SUBSET detail, and total_tokens is
+          // prompt + completion. Without this the connect path reported the
+          // upstream's raw fresh-input figure as prompt_tokens, so on a cache-hit
+          // turn it emitted cached_tokens=1765 alongside prompt_tokens=3 — a
+          // superset field larger than the field it is a subset of — and on a
+          // cache-WRITE turn it showed "3 in" for an 11.5k prompt (O2,
+          // evidence/ClientSandboxes.md §5.3). Every relay in front of this proxy
+          // (one-api / new-api and friends) meters from exactly these numbers.
+          // Live-reproduced.
           usage: finishUsage,
           // Billing detail (credit/acu cost) only present when an operator has
           // calibrated DEVIN_CONNECT_BILLING_TAGS against a paid token. Null on
@@ -2717,7 +3654,19 @@ export async function* streamChat({
         };
         return;
       }
-      await new Promise((resolve) => { wake = resolve; });
+      // While this wait is pending, the absolute deadline is the ONLY handle that can make
+      // progress (the fake/hung upstream delivers no data, no error and no socket activity),
+      // so it must be ref'd for the duration. Node 20/22 cancel a pending await the moment the
+      // event loop drains — "Promise resolution is still pending but the event loop has
+      // already resolved" — which turned a hung upstream into a cancelled test and, in
+      // production, into a request the runtime silently gives up on. It is unref'd again as
+      // soon as the wait settles, so it still never holds the process open (Node 24 behaviour
+      // is unchanged: the timer fires at the same instant and the same code is thrown).
+      await new Promise((resolve) => {
+        wake = resolve;
+        if (typeof deadlineTimer.ref === 'function') deadlineTimer.ref();
+      });
+      if (typeof deadlineTimer.unref === 'function') deadlineTimer.unref();
     }
   } finally {
     // Clear the deadline timer on EVERY exit (success, error, or early return

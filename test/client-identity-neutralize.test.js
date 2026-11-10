@@ -241,6 +241,46 @@ describe('neutralizeClientIdentity', () => {
     process.env.WINDSURFAPI_NEUTRALIZE_CLIENT_ID = '0';
     assert.equal(neutralizeClientIdentity(APPLY_PATCH_DESC), APPLY_PATCH_DESC, 'opt-out leaves it verbatim');
   });
+
+  // 2026-10-24 (a8): Claude Code subagent system-prompt trigger, live-bisected via
+  // /v1/messages replay (Claude Code 2.1.310). Every subagent prompt carries the
+  // Notes bullet below; that sentence alone blocks (permission_denied), and the
+  // full subagent request with only MUST -> should passed 3/3. Near-miss variants
+  // that passed live are pinned as untouched so the rule stays sentence-anchored.
+  const SUBAGENT_NOTES = [
+    'Notes:',
+    '- Agent threads always have their cwd reset between bash calls, as a result please only use absolute file paths.',
+    '- For clear communication with the user the assistant MUST avoid using emojis.',
+    '- Do not use a colon before tool calls.',
+  ].join('\n');
+
+  it('(a8) rewrites the Claude Code subagent emoji bullet and keeps the rest of the block', () => {
+    const out = neutralizeClientIdentity(SUBAGENT_NOTES);
+    assert.ok(!/the assistant MUST avoid using emojis/.test(out), 'trigger sentence gone');
+    assert.match(out, /^- For clear communication with the user the assistant should avoid using emojis\.$/m, 'instruction kept with should');
+    assert.match(out, /^- Agent threads always have their cwd reset/m, 'preceding bullet preserved');
+    assert.match(out, /^- Do not use a colon before tool calls\.$/m, 'following bullet preserved');
+  });
+
+  it('(a8) is idempotent — a second pass is a no-op', () => {
+    const once = neutralizeClientIdentity(SUBAGENT_NOTES);
+    assert.equal(neutralizeClientIdentity(once), once, 'already-neutralized text unchanged');
+  });
+
+  it('(a8) leaves the near-miss variants that passed live untouched', () => {
+    for (const src of [
+      'The assistant MUST avoid using emojis.',
+      'For clear communication with the user, avoid using emojis.',
+      'For clear communication with the user the assistant should avoid using emojis.',
+    ]) {
+      assert.equal(neutralizeClientIdentity(src), src, `untouched: ${src}`);
+    }
+  });
+
+  it('(a8) respects the main off-switch', () => {
+    process.env.WINDSURFAPI_NEUTRALIZE_CLIENT_ID = '0';
+    assert.equal(neutralizeClientIdentity(SUBAGENT_NOTES), SUBAGENT_NOTES, 'opt-out leaves it verbatim');
+  });
 });
 
 // 2026-07-16 (a6-grok/a6-grok2): Grok CLI's system prompt opens with "You are

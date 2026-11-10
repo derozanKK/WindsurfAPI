@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   addAccountByKey, removeAccount, getAccountList, getApiKey, releaseAccount,
-  markRateLimited, getAccountAvailability,
+  markRateLimited, getAccountAvailability, getAccountInternal,
   __setReloginDeps, __resetReloginState,
 } from '../src/auth.js';
+import { classifyUpstreamError } from '../src/devin-connect.js';
 import {
   handleChatCompletions, __setConnectDeps, __resetConnectDeps,
 } from '../src/handlers/chat.js';
@@ -364,6 +365,51 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     assert.ok(frames.some(f => f !== '[DONE]' && f.error), 'surfaced an error frame');
   });
 
+  // A pre-content error must not be closed with [DONE]: the OpenAI stream
+  // contract treats [DONE] as a completed turn, which turns an upstream failure
+  // into a clean empty answer. Content already on the wire keeps the historical
+  // clean-close behavior (the previous test).
+  it('a pre-content upstream error ends without [DONE]', async () => {
+    seed('s-pre-err');
+    __setConnectDeps({
+      streamChatCompletion: async () => {
+        throw Object.assign(new Error('blocked by upstream'), { code: 'CONTENT_BLOCKED' });
+      },
+    });
+
+    const result = await handleChatCompletions(
+      { model: 'swe-1-6-slow', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      { callerKey: '' },
+    );
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseFrames(res.body);
+    assert.ok(frames.some(f => f !== '[DONE]' && f.error), 'surfaced an error frame');
+    assert.equal(frames.includes('[DONE]'), false, 'no [DONE] after a pre-content error');
+  });
+
+  // A pre-content 429 must keep the rate-limit class on the wire; OpenAI SDKs
+  // back off on rate_limit_error, not on api_error.
+  it('a pre-content 429 keeps rate_limit_error on the stream', async () => {
+    seed('s-429');
+    __setConnectDeps({
+      streamChatCompletion: async () => {
+        throw Object.assign(new Error('rate limited'), { code: 'RATE_LIMITED' });
+      },
+    });
+
+    const result = await handleChatCompletions(
+      { model: 'swe-1-6-slow', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      { callerKey: '' },
+    );
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseFrames(res.body);
+    const err = frames.find(f => f !== '[DONE]' && f.error);
+    assert.equal(err?.error?.type, 'rate_limit_error');
+    assert.equal(frames.includes('[DONE]'), false);
+  });
+
   // R1 (stream): a pre-emit RATE_LIMITED on the first account fails over to a
   // healthy one instead of erroring the stream — replay is safe while !emitted.
   it('R1 stream: fails over on a pre-emit RATE_LIMITED, then streams from the healthy account', async () => {
@@ -448,17 +494,13 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     assert.ok(!seen.includes(b.apiKey), 'did not fail over to a second account');
   });
 
-  it('replays once on the SAME token after a pre-emit transient 5xx, then streams (P1 #34)', async () => {
-    const a = seed('s-transient-1');
+  it('does NOT replay a pre-emit transient 5xx in the handler (the adapter owns that retry, P1 #34)', async () => {
+    seed('s-transient-1');
     let calls = 0;
-    const seen = [];
     __setConnectDeps({
-      streamChatCompletion: async (params, send) => {
+      streamChatCompletion: async () => {
         calls++;
-        seen.push(params.token);
-        if (calls === 1) throw transient(); // 503 before any byte
-        send({ id: 's', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'RECOVERED' }, finish_reason: null }] });
-        send({ id: 's', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+        throw transient(); // 503 before any byte
       },
     });
 
@@ -469,18 +511,18 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     const res = fakeRes();
     await result.handler(res);
     const frames = parseFrames(res.body);
-    assert.equal(calls, 2, 'retried once on the transient blip');
-    assert.equal(seen[0], seen[1], 'replay used the SAME token (no failover hop)');
-    assert.ok(frames.some(f => f !== '[DONE]' && f.choices?.[0]?.delta?.content === 'RECOVERED'), 'streamed after replay');
-    assert.ok(!frames.some(f => f !== '[DONE]' && f.error), 'no error frame after a successful replay');
+    // Q5 ownership: devin-connect-openai.js performs the single bounded
+    // pre-emit transport retry; the handler must not add a second one.
+    assert.equal(calls, 1, 'one adapter call — the adapter owns the bounded retry');
+    assert.ok(frames.some(f => f !== '[DONE]' && f.error), 'the transient error still reaches the client');
   });
 
-  it('CAPACITY (high-demand) replays on the SAME token, never re-logs in or fails over (P0 #56/#57)', async () => {
+  it('CAPACITY (high-demand) never re-logs in or fails over in the handler (P0 #56/#57)', async () => {
     // The regression that motivated this: a momentary "high demand" on a free
     // token was classified UNAUTHORIZED → auto re-login → still busy → mislabeled
-    // MODEL_BLOCKED → free model cooled down forever. Now it's CAPACITY: a
-    // transient, replayed once on the same token. If the replay succeeds we
-    // stream clean; re-login must NEVER fire (it would burn the account).
+    // MODEL_BLOCKED → free model cooled down forever. The single in-place replay
+    // is now owned by the adapter (retry-ownership.test.js); this test pins the
+    // handler half: a capacity blip must NEVER re-login or hop accounts.
     const a = seed('s-capacity-1');
     const b = seed('s-capacity-2');
     process.env.DEVIN_CONNECT_AUTO_RELOGIN = '1';
@@ -493,12 +535,10 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     let calls = 0;
     const seen = [];
     __setConnectDeps({
-      streamChatCompletion: async (params, send) => {
+      streamChatCompletion: async (params) => {
         calls++;
         seen.push(params.token);
-        if (calls === 1) throw capacity(); // first hit: model busy, before any byte
-        send({ id: 's', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'AFTERBUSY' }, finish_reason: null }] });
-        send({ id: 's', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+        throw capacity(); // model busy, before any byte
       },
     });
 
@@ -509,12 +549,10 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     const res = fakeRes();
     await result.handler(res);
     const frames = parseFrames(res.body);
-    assert.equal(calls, 2, 'replayed once on the capacity blip');
-    assert.equal(seen[0], seen[1], 'replay used the SAME token (no failover, no fresh token)');
+    assert.equal(calls, 1, 'one handler attempt — the adapter owns the in-place replay');
     assert.equal(reloginCalls, 0, 'CAPACITY must NEVER trigger re-login');
     assert.ok(!seen.includes(b.apiKey), 'did not fail over to the second account');
-    assert.ok(frames.some(f => f !== '[DONE]' && f.choices?.[0]?.delta?.content === 'AFTERBUSY'), 'streamed after the busy blip cleared');
-    assert.ok(!frames.some(f => f !== '[DONE]' && f.error), 'no error frame after a successful capacity replay');
+    assert.ok(frames.some(f => f !== '[DONE]' && f.error), 'surfaced the capacity error');
   });
 
   it('persistent CAPACITY surfaces a clean 503-class error, NOT MODEL_BLOCKED or a re-login storm (P0 #57)', async () => {
@@ -543,7 +581,7 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     await result.handler(res);
     const frames = parseFrames(res.body);
     const errFrame = frames.find(f => f !== '[DONE]' && f.error);
-    assert.equal(calls, 2, 'one in-place replay then give up (no pool storm)');
+    assert.equal(calls, 1, 'one handler attempt — the adapter owns the in-place replay (no pool storm)');
     assert.equal(reloginCalls, 0, 'CAPACITY must NEVER trigger re-login');
     assert.ok(errFrame, 'surfaced an error frame');
     assert.notEqual(errFrame.error.code, 'MODEL_BLOCKED', 'capacity must NOT escalate to a permanent entitlement wall');
@@ -596,6 +634,40 @@ describe('DEVIN_CONNECT quota vs tier wall (P1 #33)', () => {
     const avail = getAccountAvailability(a.apiKey, 'swe-1-6-slow');
     assert.equal(avail.reason, 'quota_exhausted', 'dry account is cooled on the quota dimension');
     assert.ok(avail.retryAfterMs > 0, 'cooldown carries a retry hint');
+  });
+
+  it('the LIVE quota-exhausted body reaches the dry-well path, not the internal-error breaker', async () => {
+    // The whole point of the classifier fix, exercised end to end: take the exact
+    // upstream body through the REAL classifier (what devin-connect.js does when it
+    // sees a non-200), throw the classified shape at the handler, and assert the
+    // account is cooled on the quota dimension rather than charged an internal error.
+    //
+    // Before the fix the classified code was `failed_precondition`, which is in
+    // TRANSPORT_FAULT_CODES → reportInternalError, and the request surfaced 502.
+    const a = seed('quota-live');
+    process.env.DEVIN_CONNECT_FAILOVER_MAX = '0';
+    const live = 'Your daily usage quota has been exhausted. Visit '
+      + 'https://app.devin.ai/settings/usage to review your plan and usage. (trace ID: 6f1c9a2e)';
+    __setConnectDeps({
+      toChatCompletion: async () => {
+        const classified = classifyUpstreamError(live, 'failed_precondition', 400);
+        throw Object.assign(new Error(live), classified);
+      },
+    });
+
+    const result = await handleChatCompletions(
+      { model: 'swe-2-medium', stream: false, messages: [{ role: 'user', content: 'hi' }] },
+      { callerKey: '' },
+    );
+
+    assert.equal(result.status, 402);
+    assert.equal(result.body.error.type, 'insufficient_quota');
+    const internal = getAccountInternal(a.id);
+    assert.equal(internal.internalErrorStreak || 0, 0,
+      'a quota-dry account is healthy; charging the internal-error breaker quarantines it '
+      + 'after 2 hits and takes the only working account offline');
+    assert.ok(internal.quotaResetAt > Date.now(), 'cooled on the self-healing quota dimension');
+    assert.equal(getAccountAvailability(a.apiKey, 'swe-2-medium').reason, 'quota_exhausted');
   });
 
   it('MODEL_BLOCKED (tier wall) returns 402 but does NOT cool the account down', async () => {

@@ -1,7 +1,7 @@
 {
-  "_comment": "DEVIN_CONNECT catalog whitelist. Refreshed from live GetCascadeModelConfigs 2026-07-08. Live dash-form + enum selectors; MODEL_PRIVATE_* excluded EXCEPT those referenced by SELECTOR_MAP; swe-1-6-slow free-tier fallback preserved. Extended 2026-08-11 from docs.devin.ai modelCostData (gpt-5-6-luna-*, claude-opus-5-*) — NOT yet frame-verified; selector form follows the 4-8/fable family convention.",
-  "_calibratedAt": "2026-07-08",
-  "_count": 123,
+  "_comment": "DEVIN_CONNECT catalog whitelist. Refreshed from live GetCascadeModelConfigs 2026-07-08. Live dash-form + enum selectors; MODEL_PRIVATE_* excluded EXCEPT those referenced by SELECTOR_MAP; swe-1-6-slow free-tier fallback preserved. Extended 2026-08-11 from docs.devin.ai modelCostData (gpt-5-6-luna-*, claude-opus-5-*) — NOT yet frame-verified; selector form follows the 4-8/fable family convention. Refreshed from live catalog dump 2026-10-18: +8 added (claude-haiku-5-5 family, swe-2 lightning variants); 4 MODEL_PRIVATE_* and 1 spelling-only enum excluded; 22 aliases updated; 18 kept-not-live (single account ≠ retirement); 45 deferred for review.",
+  "_calibratedAt": "2026-10-18",
+  "_count": 233,
   "models": [
     {
       "selector": "claude-opus-4-8-medium",
@@ -35,11 +35,13 @@
     },
     {
       "selector": "swe-1-7",
-      "provider": "cognition"
+      "provider": "cognition",
+      "alias": "swe-1.7"
     },
     {
       "selector": "swe-1-7-lightning",
-      "provider": "cognition"
+      "provider": "cognition",
+      "alias": "swe-1.7-lightning"
     },
     {
       "selector": "swe-2-medium",
@@ -48,11 +50,13 @@
     },
     {
       "selector": "swe-2-high",
-      "provider": "cognition"
+      "provider": "cognition",
+      "alias": "swe-2"
     },
     {
       "selector": "swe-2-max",
-      "provider": "cognition"
+      "provider": "cognition",
+      "alias": "swe-2"
     },
     {
       "selector": "claude-opus-4-7-medium",
@@ -538,63 +542,524 @@
     },
     {
       "selector": "gpt-5-6-luna-none",
-      "provider": "openai"
+      "provider": "openai",
+      "alias": "gpt-5.6-luna"
     },
     {
       "selector": "gpt-5-6-luna-low",
-      "provider": "openai"
+      "provider": "openai",
+      "alias": "gpt-5.6-luna"
     },
     {
       "selector": "gpt-5-6-luna-medium",
-      "provider": "openai"
+      "provider": "openai",
+      "alias": "gpt-5.6-luna"
     },
     {
       "selector": "gpt-5-6-luna-high",
-      "provider": "openai"
+      "provider": "openai",
+      "alias": "gpt-5.6-luna"
     },
     {
       "selector": "gpt-5-6-luna-xhigh",
-      "provider": "openai"
+      "provider": "openai",
+      "alias": "gpt-5.6-luna"
     },
     {
       "selector": "claude-opus-5-low",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-medium",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-high",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-xhigh",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-max",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-low-fast",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-medium-fast",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-high-fast",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-xhigh-fast",
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
     },
     {
       "selector": "claude-opus-5-max-fast",
+      "provider": "anthropic",
+      "alias": "claude-opus-5"
+    },
+    {
+      "selector": "claude-fable-5-1-low",
       "provider": "anthropic"
+    },
+    {
+      "selector": "claude-fable-5-1-medium",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-fable-5-1-high",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-fable-5-1-xhigh",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-fable-5-1-max",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-5-5-low",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-5-5-medium",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-5-5-high",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-5-5-xhigh",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-5-5-max",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-5-low",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-5-medium",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-5-high",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-5-xhigh",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-5-max",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "gpt-5-6-luna-max",
+      "provider": "openai",
+      "alias": "gpt-5.6-luna"
+    },
+    {
+      "selector": "gpt-5-6-sol-none",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-sol-low",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-sol-medium",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-sol-high",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-sol-xhigh",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-sol-max",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-terra-none",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-terra-low",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-terra-medium",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-terra-high",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-terra-xhigh",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-6-terra-max",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-1-sol-low",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-1-sol-medium",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-1-sol-high",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-1-sol-xhigh",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-1-sol-max",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-astra-low",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-astra-medium",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-astra-high",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-astra-xhigh",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-astra-max",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-luna-none",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-luna-low",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-luna-medium",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-luna-high",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-luna-xhigh",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-luna-max",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-sol-none",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-sol-low",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-sol-medium",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-sol-high",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-sol-xhigh",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-6-sol-max",
+      "provider": "openai"
+    },
+    {
+      "selector": "gemini-3-6-flash-minimal",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-6-flash-low",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-6-flash-medium",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-6-flash-high",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-7-flash-low",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-7-flash-medium",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-7-flash-high",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-8-flash-low",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-8-flash-medium",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-8-flash-high",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-4-argon-low",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-4-argon-medium",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-4-argon-high",
+      "provider": "google"
+    },
+    {
+      "selector": "deepseek-v4-flash-low",
+      "provider": "6"
+    },
+    {
+      "selector": "deepseek-v4-flash-high",
+      "provider": "6"
+    },
+    {
+      "selector": "deepseek-v4-flash-max",
+      "provider": "6"
+    },
+    {
+      "selector": "deepseek-v4-pro-low",
+      "provider": "6"
+    },
+    {
+      "selector": "deepseek-v4-pro-high",
+      "provider": "6"
+    },
+    {
+      "selector": "deepseek-v4-pro-max",
+      "provider": "6"
+    },
+    {
+      "selector": "deepseek-v4-1-flash-high",
+      "provider": "6"
+    },
+    {
+      "selector": "deepseek-v4-1-flash-max",
+      "provider": "6"
+    },
+    {
+      "selector": "glm-5-3-flash-low",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-3-flash-high",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-3-flash-max",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-3-low",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-3-high",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-3-max",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "grok-4-5-low",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-5-medium",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-5-high",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-6-low",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-6-medium",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-6-high",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-6-xhigh",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-7-low",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-7-medium",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-7-high",
+      "provider": "xai"
+    },
+    {
+      "selector": "grok-4-7-xhigh",
+      "provider": "xai"
+    },
+    {
+      "selector": "kimi-k3-low",
+      "provider": "moonshot"
+    },
+    {
+      "selector": "kimi-k3-high",
+      "provider": "moonshot"
+    },
+    {
+      "selector": "kimi-k3-max",
+      "provider": "moonshot"
+    },
+    {
+      "selector": "inkling-none",
+      "provider": "thinking_machines"
+    },
+    {
+      "selector": "inkling-low",
+      "provider": "thinking_machines"
+    },
+    {
+      "selector": "inkling-medium",
+      "provider": "thinking_machines"
+    },
+    {
+      "selector": "inkling-high",
+      "provider": "thinking_machines"
+    },
+    {
+      "selector": "inkling-xhigh",
+      "provider": "thinking_machines"
+    },
+    {
+      "selector": "inkling-max",
+      "provider": "thinking_machines"
+    },
+    {
+      "selector": "nemotron-3-ultra-none",
+      "provider": "nvidia"
+    },
+    {
+      "selector": "nemotron-3-ultra-medium",
+      "provider": "nvidia"
+    },
+    {
+      "selector": "nemotron-3-ultra-high",
+      "provider": "nvidia"
+    },
+    {
+      "selector": "swe-1-7-lightning-medium",
+      "provider": "windsurf",
+      "alias": "swe-1.7-lightning"
+    },
+    {
+      "selector": "swe-1-7-medium",
+      "provider": "windsurf",
+      "alias": "swe-1.7"
+    },
+    {
+      "selector": "claude-haiku-5-5-high",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-haiku-5-5-low",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-haiku-5-5-max",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-haiku-5-5-medium",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-haiku-5-5-xhigh",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "swe-2-high-lightning",
+      "provider": "cognition",
+      "alias": "swe-2"
+    },
+    {
+      "selector": "swe-2-max-lightning",
+      "provider": "cognition",
+      "alias": "swe-2"
+    },
+    {
+      "selector": "swe-2-medium-lightning",
+      "provider": "cognition",
+      "alias": "swe-2"
     }
   ]
 }

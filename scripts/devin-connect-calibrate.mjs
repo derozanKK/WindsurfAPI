@@ -114,6 +114,7 @@ export function resolveOutPath(env = process.env) {
  * Classify one observed top-level/meta tag (not in the baseline) into the target
  * bucket its wire shape best fits. Pure + exported for the self-test.
  *   - meta varint  → billing / cache_tokens (#46)
+ *   - top numeric  → billing (#46) — the top-level cost coordinates (#14/#22/#26/#27)
  *   - top string   → actual_model_uid (#47)
  *   - top message  → tool_calls (#49)
  */
@@ -130,6 +131,18 @@ export function classifyTag({ scope, tag, kind, preview, topTag, path }) {
   if (scope === 'top' && kind === 'message') {
     return { bucket: 'tool_calls', targets: ['tool_calls'], task: '#49',
       detail: `top sub-message #${tag} (${preview}) — delta_tool_calls (tool_calls) candidate` };
+  }
+  // A top-level NUMERIC field — varint, or a fixed64 double / fixed32 float, the
+  // shapes a cost field rides (committed_acu_cost #22 is a descriptor-verified
+  // double: docs/DEVIN-CONNECT-CUTOVER.md §7). The four .proto reimplementations
+  // put the top-level cost coordinates at #14/#22/#26/#27, and the shipped
+  // decoder reads them via the `^N` form of DEVIN_CONNECT_BILLING_TAGS — so this
+  // is a REAL billing candidate, unlike a #28 inner varint (the decoder cannot
+  // reach those; they stay informational). The tag itself stays un-pinned until
+  // an operator maps it; only the bucket is decided here.
+  if (scope === 'top' && (kind === 'varint' || kind === 'fixed64' || kind === 'fixed32')) {
+    return { bucket: 'billing/cache', targets: ['billing'], task: '#46',
+      detail: `top numeric #${tag}=${preview} (${kind}) — top-level cost candidate (credit_cost / committed_acu_cost / quota / overage); pin via ^${tag}` };
   }
   // Inner fields of a top-level sub-message (e.g. the recurring #28 trailer). A
   // varint inner field is the strongest billing/usage/stop-metadata signal — this
@@ -156,12 +169,21 @@ export function classifyTag({ scope, tag, kind, preview, topTag, path }) {
 /**
  * Aggregate the per-frame dumps emitted over a stream into a stable tag inventory.
  * Each dump entry value tells us the wire kind: number→varint, "<msg Nb>"→message,
+ * a fixed64/fixed32 dump entry keeps its kind (double/float preview + raw hex),
  * else→string. Returns { top:{tag:{kind,preview}}, meta:{tag:{kind,preview}} }.
  */
 export function aggregateDumps(frameDumps, metaDumps, subDumps) {
   const classify = (v) => {
     if (typeof v === 'number') return { kind: 'varint', preview: v };
     if (typeof v === 'string' && /^<msg \d+b>$/.test(v)) return { kind: 'message', preview: v };
+    // Fixed-width dump entries from decodeFrame's fixedWidthDumpEntry():
+    // { kind: 'fixed64'|'fixed32', preview: <number>, raw: <hex> }. Preserve the
+    // kind/raw — letting the object fall through to the string branch turned it
+    // into "[object Object]" and sent a top-level double (#22 committed_acu_cost)
+    // into the top-string / actual_model_uid bucket.
+    if (v && typeof v === 'object' && (v.kind === 'fixed64' || v.kind === 'fixed32')) {
+      return { kind: v.kind, preview: v.preview, raw: v.raw };
+    }
     return { kind: 'string', preview: String(v).slice(0, 48) };
   };
   const top = {}, meta = {}, sub = {};
@@ -265,8 +287,20 @@ export async function runCalibration({ token, model = DEFAULT_MODEL, prompt = DE
   for (const c of candidates) for (const t of c.targets) (byTarget[t] ||= []).push(c);
   if (byTarget.actual_model_uid?.length) envLines.push(`DEVIN_CONNECT_ACTUAL_MODEL_TAG=${byTarget.actual_model_uid[0].tag}`);
   if (byTarget.tool_calls?.length) envLines.push(`# tool_calls outer candidate at tag ${byTarget.tool_calls[0].tag} — confirm subfields then set:\n# DEVIN_CONNECT_TOOL_CALL_TAGS="outer=${byTarget.tool_calls[0].tag},id=?,name=?,arguments_json=?"`);
-  const billingTags = (byTarget.billing || byTarget.cache_tokens || []).map((c) => c.tag);
-  if (billingTags.length) envLines.push(`# meta varint candidates at tags [${billingTags.join(',')}] — map to credit_cost/cache_*; then set DEVIN_CONNECT_BILLING_TAGS / cache via DEVIN_CONNECT_BILLING_TAGS`);
+  // Split the billing hints by scope: a meta varint is pinned by its bare tag,
+  // while a top-level numeric (e.g. #22 committed_acu_cost, a double) needs the
+  // decoder's `^N` form. Same candidates, same convention — the scope picks the
+  // env syntax, so the written .env can't point the operator at the wrong block.
+  // Meta candidates target both billing AND cache_tokens, so UNION the two lists
+  // (not concat) or every meta tag is emitted twice ([14,15,14,15]).
+  const billingCands = [...new Set([...(byTarget.billing || []), ...(byTarget.cache_tokens || [])])];
+  const metaBilling = billingCands.filter((c) => c.scope === 'meta');
+  const topBilling = billingCands.filter((c) => c.scope === 'top');
+  if (metaBilling.length) envLines.push(`# meta varint candidates at tags [${metaBilling.map((c) => c.tag).join(',')}] — map to credit_cost/cache_*; then set DEVIN_CONNECT_BILLING_TAGS / cache via DEVIN_CONNECT_BILLING_TAGS`);
+  // The example stays `<field>=^N`: with several top candidates the first tag's
+  // key is unknown, and naming a specific key (#22 committed_acu_cost) next to a
+  // different tag (#14 credit_cost) would wire the wrong field.
+  if (topBilling.length) envLines.push(`# top-level numeric candidates at tags [${topBilling.map((c) => c.tag).join(',')}] — map to credit_cost / committed_acu_cost / quota / overage; pin via the ^N form, e.g. DEVIN_CONNECT_BILLING_TAGS=<field>=^${topBilling[0].tag}`);
   // Sub-message inner varints (e.g. the #28 trailer): informational — the shipped
   // billing decoder reads the #7 meta block, so these are NOT auto-wired. Surface
   // them so the operator can decide whether #28 carries the billing/usage fields.
@@ -311,6 +345,11 @@ async function selfTest() {
   assert(classifyTag({ scope: 'sub', topTag: 28, tag: 3, kind: 'varint', preview: 42 }).bucket === 'sub-billing', 'sub varint → sub-billing');
   assert(classifyTag({ scope: 'sub', topTag: 28, tag: 3, kind: 'varint', preview: 42 }).targets.length === 0, 'sub varint NOT auto-wired');
   assert(classifyTag({ scope: 'sub', topTag: 28, tag: 1, kind: 'string', preview: 'stop' }).bucket === 'sub-metadata', 'sub string → sub-metadata');
+  // Top-level numeric (#22 committed_acu_cost is a descriptor-verified double,
+  // docs/DEVIN-CONNECT-CUTOVER.md §7). A fixed64 dump entry used to be mangled to
+  // "[object Object]" and land in actual_model_uid — emitting ACTUAL_MODEL_TAG=22.
+  assert(classifyTag({ scope: 'top', tag: 22, kind: 'fixed64', preview: 0.00067 }).bucket === 'billing/cache', 'top fixed64 → billing/cache');
+  assert(classifyTag({ scope: 'top', tag: 26, kind: 'varint', preview: 1200 }).bucket === 'billing/cache', 'top varint → billing/cache');
 
   // aggregate + findCandidates against the free baseline
   const frameDumps = [
@@ -347,7 +386,33 @@ async function selfTest() {
   assert(report.envLines.some((l) => l === 'DEVIN_CONNECT_ACTUAL_MODEL_TAG=8'), 'emits actual_model env line');
   assert(report.envLines.some((l) => /outer=12/.test(l)), 'emits tool_call outer candidate');
   assert(report.envLines.some((l) => /14,15/.test(l)), 'emits billing meta candidates');
+  assert(report.envLines.some((l) => /^# meta varint candidates at tags \[14,15\] —/.test(l)), 'meta hint lists each tag once (no billing/cache_tokens duplication)');
   assert(report.envLines.some((l) => /sub-message #28\.2 inner varints/.test(l) && /3=1200/.test(l) && /4=34/.test(l)), 'emits nested sub #28.2 informational env hint');
+
+  // Top-level numeric tag #22 in the exact dump shape decodeFrame emits for a
+  // double ({kind:'fixed64', preview:<number>, raw:<hex>}): it must classify as a
+  // billing candidate and NEVER emit the model-uid env line.
+  const acuRaw = Buffer.alloc(8); acuRaw.writeDoubleLE(0.0006735000060871243, 0);
+  const acuFrame = { 1: 'bot-x', 22: { kind: 'fixed64', preview: 0.0006735000060871243, raw: acuRaw.toString('hex') } };
+  assert(aggregateDumps([acuFrame], [], []).top[22].kind === 'fixed64', 'fixed64 dump entry keeps its kind');
+  const acuReport = await runCalibration({ real: false, deps: { frameDumps: [acuFrame], metaDumps: [] } });
+  assert(acuReport.candidates.some((c) => c.scope === 'top' && c.tag === 22 && c.bucket === 'billing/cache' && c.task === '#46'), 'top numeric #22 → billing/cache (#46)');
+  assert(!acuReport.envLines.some((l) => /ACTUAL_MODEL_TAG=22/.test(l)), 'top numeric #22 never emits the actual_model env line');
+  assert(acuReport.envLines.some((l) => /\^22/.test(l)), 'top numeric #22 emits the ^N top-level pin hint');
+
+  // Multi-candidate top frame: the hint's example must stay generic — pairing a
+  // specific key with the FIRST tag (#14 = credit_cost) would wire credit as ACU.
+  const acuRaw2 = Buffer.alloc(8); acuRaw2.writeDoubleLE(0.0006735000060871243, 0);
+  const raw14 = Buffer.alloc(8); raw14.writeDoubleLE(1.25, 0);
+  const multiFrame = {
+    1: 'bot-x',
+    14: { kind: 'fixed64', preview: 1.25, raw: raw14.toString('hex') },
+    22: { kind: 'fixed64', preview: 0.0006735000060871243, raw: acuRaw2.toString('hex') },
+  };
+  const multiReport = await runCalibration({ real: false, deps: { frameDumps: [multiFrame], metaDumps: [] } });
+  const multiLine = multiReport.envLines.find((l) => /top-level numeric candidates/.test(l));
+  assert(multiLine && !/committed_acu_cost=\^14/.test(multiLine), 'multi-candidate hint never pairs a key with the wrong tag');
+  assert(multiLine && /<field>=\^14/.test(multiLine), 'multi-candidate hint shows the generic ^N form');
 
   // status table reflects discoveries + already-set env
   const tbl = statusTable(report, {});

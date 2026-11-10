@@ -1,5 +1,7 @@
 {
-  "tests": ["test/sticky-queue-on-pin.test.js"],
+  "tests": [
+    "test/sticky-queue-on-pin.test.js"
+  ],
   "expectBaselinePass": 26,
   "mutations": [
     {
@@ -29,8 +31,8 @@
     {
       "name": "successful queued turn records NO hit — affinity under-reported",
       "file": "src/auth.js",
-      "anchor": "            if (pinOnly) getStickyBinding(callerKey, modelKey, connectSelector);",
-      "replacement": "            /* mutation: success not counted */"
+      "anchor": "          if (pinOnly) getStickyBinding(callerKey, modelKey, connectSelector);",
+      "replacement": "          /* mutation: success not counted */"
     },
     {
       "name": "budget check dropped — waits regardless of stated recovery",

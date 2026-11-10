@@ -1,6 +1,8 @@
 {
-  "tests": ["test/devin-connect-warning-cache-bound.test.js"],
-  "expectBaselinePass": 5,
+  "tests": [
+    "test/devin-connect-warning-cache-bound.test.js"
+  ],
+  "expectBaselinePass": 6,
   "mutations": [
     {
       "name": "the eviction is deleted — unbounded retention returns: 1,025 distinct rejected names all stay resident",

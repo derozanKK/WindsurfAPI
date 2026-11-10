@@ -76,6 +76,12 @@ function messagesHarness({ baseline = false, poisonIterator = false } = {}) {
       flattenContentBlocks: blocks => blocks.map(b => b.text || '').join('\n'),
       annotateRiskyReadToolResult: value => value,
       extractCallerSubKey: () => '',
+      buildToolNameMap: () => ({ toUpstream: new Map(), toClient: new Map() }),
+      toolHygieneEnabled: () => true,
+      signedThinkingReplayEnabled: () => false,
+      normalizeToolIdsInMessages: (messages) => messages,
+      normalizeHistoryTail: (messages) => messages,
+      restoreToolName: name => name,
       handleChatCompletions: async b => {
         wireBodies.push(JSON.stringify(b));
         return { stream: true, handler: async () => {} };

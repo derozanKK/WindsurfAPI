@@ -15,6 +15,7 @@ it('the default secret scan includes untracked, non-ignored files and keeps fixt
     mkdirSync(join(root, 'tmp'));
     mkdirSync(join(root, 'test'));
     writeFileSync(join(root, 'scripts/secret-scan.mjs'), readFileSync(new URL('../scripts/secret-scan.mjs', import.meta.url)));
+  writeFileSync(join(root, 'scripts/secret-rules.mjs'), readFileSync(new URL('../scripts/secret-rules.mjs', import.meta.url)));
     // The real repository ignores tmp/. This fixture deliberately does not: the contract
     // is untracked AND non-ignored, not "scan all scratch files despite .gitignore".
     writeFileSync(join(root, '.gitignore'), 'ignored.js\n');
@@ -52,6 +53,7 @@ it('an explicit directory argument scans what is inside it, including gitignored
     mkdirSync(join(root, 'scripts'));
     mkdirSync(join(root, 'logs', 'nested'), { recursive: true });
     writeFileSync(join(root, 'scripts/secret-scan.mjs'), readFileSync(new URL('../scripts/secret-scan.mjs', import.meta.url)));
+  writeFileSync(join(root, 'scripts/secret-rules.mjs'), readFileSync(new URL('../scripts/secret-rules.mjs', import.meta.url)));
     // logs/ is gitignored, exactly like this repository's own runtime paths
     // (logs/, .trace/, .wire-dump/). The default input set therefore cannot reach it.
     writeFileSync(join(root, '.gitignore'), 'logs/\n');

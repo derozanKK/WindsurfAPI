@@ -6,7 +6,7 @@
     "test/devin-connect-openai.test.js",
     "test/session-continuity-commit-fallback.test.js"
   ],
-  "expectBaselinePass": 317,
+  "expectBaselinePass": 328,
   "mutations": [
     {
       "name": "T1 store: the overlap-target commit path stops saving the reasoning tail",

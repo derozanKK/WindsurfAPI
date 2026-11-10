@@ -56,6 +56,41 @@ export function startStream(module, options = {}) {
   };
 }
 
+// Unary sibling of startStream: same stubbed session, but the call settles a
+// promise instead of invoking callbacks, and the request body the module
+// actually writes is captured so a test can assert the wire framing.
+let unaryPort = 24000;
+export function startUnary(module, options = {}) {
+  const req = new EventEmitter(), session = new EventEmitter();
+  const closeCodes = [], written = [];
+  let headers;
+  req.write = (chunk) => { written.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); return true; };
+  req.end = () => {};
+  req.close = code => closeCodes.push(code);
+  session.request = value => { headers = value; return req; };
+  session.unref = () => {};
+  session.close = () => { session.closed = true; };
+  // A port per call: the module keeps a session pool keyed by port, and a
+  // reused key would hand this call the previous fake session.
+  const port = ++unaryPort;
+  const savedConnect = http2.connect;
+  http2.connect = () => session;
+  let settle;
+  const settled = new Promise((resolve) => { settle = resolve; });
+  try {
+    module.grpcUnary(port, 's2-test-csrf', '/s2/test', options.body ?? Buffer.alloc(0), options.timeout ?? 1000)
+      .then(payload => settle({ ok: true, payload }), error => settle({ ok: false, error }));
+  } finally {
+    http2.connect = savedConnect;
+  }
+  return {
+    req, closeCodes, settled,
+    get headers() { return headers; },
+    get body() { return Buffer.concat(written); },
+    cleanup() { module.closeSessionForPort(port); },
+  };
+}
+
 export function grpcFrame(payload, flags = 0) {
   const frame = Buffer.alloc(5 + payload.length);
   frame[0] = flags; frame.writeUInt32BE(payload.length, 1); payload.copy(frame, 5);

@@ -14,7 +14,9 @@ import {
 
 const ENV_OFF = { DEVIN_CONNECT: '0' };
 const ENV_ON = { DEVIN_CONNECT: '1' };
-const LIVE_ONLY = 'grok-4-5-medium';
+// Suffixed synthetic selector: a live-only fixture must never be covered by a real
+// MODELS/snapshot landing (dashboard-models-connect-parity.test.js convention).
+const LIVE_ONLY = 'grok-4-5-medium-created-stable';
 const FREE_SELECTOR = 'swe-1-6-slow';
 
 afterEach(() => clearLiveCatalogSelectors());

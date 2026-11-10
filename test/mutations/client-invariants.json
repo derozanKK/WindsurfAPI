@@ -51,8 +51,8 @@
     {
       "name": "isCascadeTransportError stops matching 'panel state' — an LS that answers InitializeCascadePanelState with 'panel state not found' is classified as a model error, so the warmup recovery path no longer resets the session state and every later request on that port repeats the same handshake against a panel the LS has already forgotten",
       "file": "src/client.js",
-      "anchor": "  return /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed|panel state/i.test(msg)",
-      "replacement": "  return /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed/i.test(msg)"
+      "anchor": "  const panelStateTransport = !terminalPanelLoss && /panel state/i.test(msg);",
+      "replacement": "  const panelStateTransport = false;"
     }
   ]
 }

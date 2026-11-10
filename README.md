@@ -4,9 +4,28 @@
 
 # WindsurfAPI · DevinAPI
 
+<!-- dwgx-banner:BEGIN -->
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner.svg?t=39eb43029984" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg?t=39eb43029984" />
+  <img src="docs/assets/banner.svg?t=39eb43029984" width="100%" alt="WindsurfAPI — 把 Windsurf/Devin 云端 100+ 模型变成 OpenAI / Anthropic / Gemini 三套兼容 API" />
+</picture>
+
+<br/>
+
+JavaScript · MIT · ★3,107
+
+[docs](https://dwgx.github.io/WindsurfAPI/) · [releases](https://github.com/dwgx/WindsurfAPI/releases) · [issues](https://github.com/dwgx/WindsurfAPI/issues)
+
+</div>
+<!-- dwgx-banner:END -->
+
+
 > 把 Windsurf / Devin 的 100+ AI 模型（Claude、GPT、Gemini、DeepSeek、Kimi、GLM、SWE…）变成 OpenAI Chat / Responses / Anthropic / Gemini 四套标准 API。零 npm 运行时依赖。
 
-> **历史账本** · 把 1387 次提交、196 个版本、82 个 PR、180 个 issue 摊开给你看：时间线主账 + 贡献者分析 + Git 树三形态（竖/横/环）+ 自伤与返工全记录 —— [**打开可视化账本**](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html)（纯原生渲染，零依赖）
+> **历史账本** · 把 1387 次提交、196 个版本、82 个 PR、180 个 issue（账本自己的口径，**数字跟到 v3.9.34 / 2026-09-15**）摊开给你看：时间线主账 + 贡献者分析 + Git 树三形态（竖/横/环）+ 自伤与返工全记录 —— [**打开可视化账本**](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html)（纯原生渲染，零依赖）
 
 
 <p align="center">
@@ -49,6 +68,26 @@
   <a href="docs/">全部文档</a> ·
   <a href="README.en.md">English</a>
 </p>
+
+## 项目定位与使用边界
+
+WindsurfAPI 是一个独立的、开源的、自托管协议兼容网关，用于将部署者**自己拥有或获授权使用的 Windsurf / Devin 账号能力**接入 OpenAI、Anthropic 和 Gemini 兼容客户端。
+
+### 使用模型
+
+- **Bring Your Own Account（BYO-account）**：部署者自行提供并控制自己的上游账号与凭据。
+- 项目本身**不提供、出售、出租、共享或打包任何 Windsurf / Devin 账号、订阅或凭据**。
+- 多账号能力用于同一部署者拥有或获授权管理的账号集合，例如故障切换、健康检查和限流隔离；它不是公共共享账号池。
+- 本项目的目标是协议互操作、自托管客户端兼容和工程研究，不以订阅转售、跨用户账号共享、绕过上游配额或规避访问控制为目的。
+- 部署者应自行确认其账号、订阅以及具体使用方式符合对应上游服务条款和适用法律。
+
+### 独立项目声明
+
+WindsurfAPI 是独立开源项目，与 Cognition、Windsurf、Devin、OpenAI、Anthropic、Google 或其他模型提供商不存在隶属、授权或背书关系，除非另有明确说明。
+
+项目代码依据 [MIT License](LICENSE) 开源。MIT License 授予的是本项目代码的使用权，并不授予任何第三方服务、模型、账号或订阅的访问权。
+
+本节只界定边界；下面说明它具体能做什么。
 
 ## 它到底在干嘛
 
@@ -147,6 +186,9 @@ flowchart LR
 
 ## 快速开始
 
+> **运行时要求**：Node.js **22.13+**（24.x 为发布门禁版本）。Node 20 已于 2026-04-30 EOL，不再支持；
+> 本地 Windsurf 账号导入需要 22.13+ 免 flag 的 `node:sqlite`，更早的 22.x 会返回 `sqlite_unavailable`。
+
 ### 一键部署
 
 ```bash
@@ -178,6 +220,22 @@ docker compose logs -f
 
 如果想改持久化目录，可在 `.env` 里设置 `DATA_DIR`。Docker 默认已设为 `/data`。
 
+### Docker 一键更新
+
+Docker 部署用 `deploy/update.sh`：拉新镜像 → 只重建 `windsurf-api` → 等 `/health` → 失败自动回滚到上一个镜像；数据卷全程不动，不需要挂 `docker.sock`，也不需要 Watchtower。
+
+```bash
+bash deploy/update.sh              # 拉 :latest 并更新
+bash deploy/update.sh --tag 3.9.52 # 固定到某个发布版本
+bash deploy/update.sh --build      # 从当前源码重建（本地镜像/分叉用）
+bash deploy/update.sh --dry-run    # 只打印计划，不做任何改动
+bash deploy/update.sh --rollback   # 手动回到上一次更新前的镜像
+```
+
+完整说明、健康门、回滚与排障见 **[docs/DOCKER-UPDATE.md](docs/DOCKER-UPDATE.md)**。
+
+> 下面的 `update.sh` 是给 git/PM2 部署用的；Docker 部署请用 `deploy/update.sh`。
+
 ### 一键更新
 
 部署过之后要拉最新修复，一条命令搞定：
@@ -199,25 +257,40 @@ cd WindsurfAPI
 # Language Server 二进制 —— 自动检测 Linux/macOS，一键下载 + chmod
 bash install-ls.sh
 
-# 下载链：WindsurfAPI release → 公开 LS mirror
-#   https://github.com/dwgx/windsurf-ls-release/releases/latest/download
-# → Exafunction/codeium fallback。需要私有镜像或回滚时可设置：
-#   WINDSURFAPI_LS_RELEASE=https://github.com/<owner>/<repo>/releases/latest/download bash install-ls.sh
-
+# 下载链（manifest 驱动，fail-closed）：
+#   1. 读取 https://windsurf-stable.codeium.com/api/versions
+#   2. 选 ls-pins.json 里最新的固定版本（当前 3.10.67），并要求 manifest 的
+#      commit + archive sha256 与 pin 完全一致
+#   3. 下载桌面端归档 → 校验 archive sha256 → 解出 LS → 校验内层 binary sha256
+#   任何一步不符都退出非 0；不会静默回落到旧 mirror。
+#
+# 先看计划、不下载（推荐首次安装前跑）：
+#   bash install-ls.sh --dry-run
+#
+# 固定版本 / 覆盖来源：
+#   bash install-ls.sh --version 3.10.67
+#   WINDSURFAPI_LS_VERSION=3.10.67 bash install-ls.sh
+#   WINDSURFAPI_LS_MANIFEST_URL=<url|本地路径> bash install-ls.sh
+#   WINDSURFAPI_LS_PINS=/path/to/ls-pins.json bash install-ls.sh
+#
+# 回滚到固定 3.5.17（显式使用 dwgx/windsurf-ls-release 的 v3.5.17 tag）：
+#   bash install-ls.sh --rollback
+#   等价于 bash install-ls.sh --version 3.5.17 --allow-mirror
+#
 # 默认安装路径：
 #   Linux x64:          /opt/windsurf/language_server_linux_x64
-#   Linux arm64:        /opt/windsurf/language_server_linux_arm
 #   macOS Apple Silicon: $HOME/.windsurf/language_server_macos_arm
 #   macOS Intel:        $HOME/.windsurf/language_server_macos_x64
+#   Linux arm64:        上游没有 arm64 归档；用 --file 装桌面端拷出的 binary。
 
 # 如果想用本地已下好的 binary：
 #   bash install-ls.sh /path/to/language_server_linux_x64
-# 或者指定 URL：
-#   bash install-ls.sh --url https://example.com/language_server_linux_x64
+# 或者指定 URL（建议同时给 --sha256；不给会打印 warning）：
+#   bash install-ls.sh --url https://example.com/language_server_linux_x64 --sha256 <64-hex>
 
-# ⚠️ LS binary 版本偏旧 / 想换一个来源？
-# 默认下载链已接入 dwgx/windsurf-ls-release 公开 mirror。
-# 如果 mirror 暂未覆盖你的平台，仍可把 Windsurf 桌面端本体里的 LS binary 拷过来：
+# ⚠️ 平台不在上游归档里 / 想换一个来源？
+# 上游只提供 linux-x64、darwin-arm64、darwin-x64 三种桌面端归档。
+# 其它平台可把 Windsurf 桌面端本体里的 LS binary 拷过来：
 #
 #   macOS:   "$HOME/Library/Application Support/Windsurf/resources/app/extensions/windsurf/bin/language_server_macos_arm"
 #   Linux:   "$HOME/.windsurf/bin/language_server_linux_x64"
@@ -314,6 +387,15 @@ curl http://localhost:3003/v1/messages \
 Gemini 原生客户端不发 `Authorization: Bearer`，它用 `x-goog-api-key` 头或 `?key=`
 查询参数 —— 两种都收，所以官方 SDK 不用改代码就能连。
 
+> **优先用请求头**：`x-goog-api-key`（或 `Authorization: Bearer`）不会把密钥写进 URL。
+> `?key=` 目前**仍然支持**（兼容用途，不是推荐用法），但完整 URL 会进反向代理日志、
+> 浏览器历史和抓包；自带 nginx 的访问日志已只记 `$uri`（丢弃全部 query），其它代理和
+> 上游日志不归本项目控制。
+>
+> **弃用路径**：`?key=` 已进入弃用流程 —— 先警告（响应头 + 只记 key 哈希的日志），再在
+> 下个主版本默认拒绝，最后移除；补丁版本不会移除。每个阶段的版本门槛、迁移命令和
+> “为什么”见 [docs/QUERY-KEY-DEPRECATION.md](docs/QUERY-KEY-DEPRECATION.md)。
+
 ```python
 from google import genai
 client = genai.Client(
@@ -372,6 +454,11 @@ curl -X DELETE http://localhost:3003/v1/responses/resp_xxx -H "Authorization: Be
 > API key 时,两个调用方发相同的 `user` 会推导出逐字节相同的 callerKey,所以别把 id
 > 当成除"难猜"以外的任何保证。
 
+> `metadata` 是**回显字段**:请求里带上它,响应对象(含流式每一帧的 `response`)和之后的
+> `GET /v1/responses/{id}` 都原样带回,便于调用方挂 trace/租户标签。按 OpenAI 契约限制
+> 最多 16 对、键 ≤64 字符、值 ≤512 字符的字符串;超限返回 400 而不是静默丢弃。它**不会**
+> 转发给上游模型,也计入存储的字节预算。
+
 ### Cline / Cursor / Aider
 
 在客户端配置里 **Custom OpenAI Compatible**：
@@ -402,10 +489,14 @@ curl -X DELETE http://localhost:3003/v1/responses/resp_xxx -H "Authorization: Be
 | `API_KEY` | 空 | 调 API 要带的密钥。空=默认 fail-closed（401，本机 bind 也一样）。本机开放需 `WINDSURFAPI_ALLOW_UNAUTHENTICATED=1` 且本机 bind |
 | `WINDSURFAPI_ALLOW_UNAUTHENTICATED` | 关 | 空 `API_KEY` 时放行本机 bind。默认关。公网 bind 即使设了也不放行 |
 | `DATA_DIR` | 项目根目录 | 持久化 JSON 状态和 `logs/` 的目录，Docker 推荐设成 `/data` |
-| `DEFAULT_MODEL` | `claude-sonnet-4.6` | 不传 model 用哪个。必须是当前后端能解析的名字。Connect 上解析不到默认 400 `model_not_found`（`WINDSURFAPI_STRICT_MODEL=0` 才静默降级到免费 selector） |
+| `DEFAULT_MODEL` | `claude-sonnet-4.6` | 不传 model 用哪个。必须是当前后端能解析的名字。Connect 上解析不到默认 400 `model_not_found`（`WINDSURFAPI_STRICT_MODEL=0` 才降级到**当前真的可调**的免费 selector；连这样的 selector 都没有时仍然 400，不再落到目录里已不存在的 `swe-1-6-slow`） |
 | `MAX_TOKENS` | `8192` | 默认最大回复 token 数 |
-| `LOG_LEVEL` | `info` | debug / info / warn / error |
+| `LOG_LEVEL` | `info` | 控制台级别：debug / info / warn / error；JSONL 文件和 Dashboard 仍接收所有级别 |
+| `LOG_RETENTION_DAYS` | `0`（关闭） | 应用 JSONL 日志保留的 UTC 日历天数，包含当天；示例 `14`。启动及每小时清理，改配置需重启 |
+| `LOG_MAX_FILE_MB` | `0`（关闭） | 单个新写入日志文件的 MiB 上限，示例 `20`；整条 JSONL 记录轮转，不拆行 |
+| `LOG_MAX_TOTAL_MB` | `0`（关闭） | app/error 日志合计的 MiB 上限，示例 `500`；按日期/分段淘汰最旧文件，可能包含当天。超限单条记录跳过磁盘写入。详见 [日志保留策略](docs/ENV-SWITCHES.md#应用磁盘日志) |
 | `WINDSURFAPI_LEAK_TRACE` | off | 推理/内容边界结构化日志(实验性,默认关闭)。开启后输出 `LEAK_TRACE` 前缀日志:原始流事件所属通道(content/reasoning)、think 标记、截断文本样本、settle 时 content/reasoning 字符数。用于在线抓取模型推理泄漏进 content 通道的问题。字段:channel/blockType/think/sample/len/reqId/account/msgId/contentChars/reasoningChars/rerouted |
+| `WAPI_ACCOUNTS_ONLY` | 空（全部） | 每实例账号隔离：逗号分隔的邮箱或账号 id，只从 `accounts.json` 加载匹配账号；大小写不敏感。设为非空但无有效 token 时 fail-closed（不加载任何账号）。多端口共享 `accounts.json` 时用它把每个端口钉到自己的账号 |
 | `WINDSURFAPI_IGNORE_CLOUD_FILTER` | `0` | Cascade 路径下，各账号云端 catalog 同步后，账号池列表展示活跃账号目录的并集，路由则校验所选账号自己的目录；设为 `1` 恢复完整静态 catalog。目录缺失、为空或同步失败时保持 fail-open；`DEVIN_CONNECT` 使用独立 selector catalog |
 | `LS_BINARY_PATH` | `/opt/windsurf/language_server_linux_x64` | LS 二进制位置 |
 | `LS_DATA_DIR` | Linux: `/opt/windsurf/data`；macOS: `~/.windsurf/data` | 每个 proxy 独立的 LS 数据根目录 |
@@ -443,6 +534,7 @@ curl -X DELETE http://localhost:3003/v1/responses/resp_xxx -H "Authorization: Be
 | `RESPONSE_STORE_MAX_BYTES` | `128m` | 会话总字节预算(支持 b/k/kb/m/mb/g/gb)。条数上限约束的是数量不是内存 —— 实测真实 agent 会话每条约 167KB,2000 条约 327MB。按条数与字节两个维度中先触发的那个驱逐 |
 | `DEVIN_CONNECT_IMAGE_TAG` | `10` | DEVIN_CONNECT 图片字段的 tag。默认使用真实 Devin schema 和 SWE-1.7 抓包共同验证的 repeated field `#10`；设 `0` 可回退为不发送图片，见下节 |
 | `DEVIN_CONNECT_COLLAPSE_SYSTEM` | `0` | 设 `1` 后把 system 内容包成 `<system>...</system>`，按顺序并入下一条 user 消息，绕开上游对 field `#2` 更严格的内容策略。默认关闭；有 tools 且 field `#2` 为空时仍只保留既有 benign placeholder |
+| `DEVIN_CONNECT_REPLAY_SIGNED_THINKING` | `0` | 设 `1` 后，`/v1/messages` 历史里带签名的 Claude thinking 以 `#11` thinking 加 `#12` signature 原生回放（工具调用轮和纯文本轮都包括），模型在工具循环内和用户发新消息之后都能读到之前的推理。需要同时设 `DEVIN_CONNECT_SIGNATURE_TAG=10`，客户端才拿得到签名。上游会校验签名，只回放未改动的块。详见 `docs/ENV-SWITCHES.md` |
 | `DEVIN_CONNECT_CATALOG_TTL_MS` | `300000` | DEVIN_CONNECT 在线模型目录的成功缓存 TTL（默认 5 分钟，最小 10 秒）。每个账号独立同步；失败或空响应保留最后一次成功目录 |
 
 完整清单在 [.env.example](.env.example) —— 上表只列常用的。
@@ -470,8 +562,19 @@ ToolDef，也不再按 `swe-*` 名字硬判定“无视觉”。
 实时目录。
 
 `DEVIN_CONNECT_IMAGE_INNER_TAGS` 仍可覆盖内部 `base64,mime` tag（默认 `1,2`），仅用于未来
-wire 变更的应急校准。远程 `https://` 图片 URL 仍不会由同步 wire builder 主动下载；请使用
-data URL / base64，或显式开启 `DEVIN_ACP_VISION=1` 走本机 Devin CLI 的 ACP 视觉通道。
+wire 变更的应急校准。远程 `http(s)://` 图片 URL 会在 `streamChat` 组装 proto 之前，用与
+Cascade 相同的 `fetchImageUrl` 有界下载（8 秒总预算、5MB 上限、`image/*` 白名单、每一跳都
+拒绝私网/回环地址），转成 data URL 后写进 `#10`；下载失败、超限或类型不符会打 warn（只记
+host，不记可能带签名的完整 URL）并只丢这一张图，文本照常发送。`DEVIN_CONNECT_IMAGE_TAG=0`
+时不做任何下载。也可以显式开启 `DEVIN_ACP_VISION=1` 走本机 Devin CLI 的 ACP 视觉通道。
+
+远程图片默认只接受 `https://`：明文 `http://` 的图片字节可被链路上任何中间人替换，而它会
+原样进入模型上下文（`#10` / Cascade 图片块）。被拒时只丢这一张图、文本照发，并打一条只含
+host 的 warn（完整 URL 可能带签名 query，不记录）。`WINDSURFAPI_ALLOW_HTTP_IMAGES=1` 只恢复
+**公网主机**的明文 http（http 与 https 都收）；默认或任何其他值只收 https。私网/回环地址
+不受该开关影响，始终被独立的 SSRF 策略拒绝（`localhost`、私网 IP，以及每一跳解析到私网地址
+的情况都包括在内），所以它不能用来接可信内网图床。该检查在 `fetchImageUrl` 的每一跳上执行，
+所以 https 首跳重定向到 http 同样会被拒。
 
 ## Dashboard 功能面板
 
@@ -486,37 +589,40 @@ data URL / base64，或显式开启 `DEVIN_ACP_VISION=1` 走本机 Devin CLI 的
 | **代理配置** | 全局或单账号的 HTTP / SOCKS5 代理 |
 | **日志** | 实时 SSE 串流 · 按级别筛 · 每条 `turns=N chars=M` 诊断多轮 |
 | **统计分析** | 时间范围 6h / 24h / 72h · 账号维度 · p50 / p95 延迟 |
+| **ACU 用量** | 按组织聚合的 ACU 限额 · 周期用量 · 每日消耗 · 分产品明细 · 按量余额（美元） |
 | **实验性** | Cascade 对话复用 · **模型身份注入（每厂商可自定义 prompt）** |
+
+**ACU 用量**面板按组织读取 `app.devin.ai/{org}/billing/*`，同一组织的成员只展示一份账本，不会按账号重复计数。真实性规则：`max_acu_limit: null` 表示不限量（不是 0）；周期合计缺失显示 `—`（不是伪造的 0）；`overage_credits` 是**带符号的美元余额**。负数表示按量余额已透支，显示为 `-$0.10 (已透支)`，不会被归零或隐藏。
 
 ## 支持的模型
 
 主线 100+ 个静态模型 + Windsurf 雲端動態下發（`mergeCloudModels` 啟動時拉取最新）。Cascade 路径下，各账号云端 catalog 同步后，`GET /v1/models` 和 Dashboard 展示活跃账号目录的并集，路由则校验所选账号自己的目录；`DEVIN_CONNECT` 继续使用独立 selector catalog；静态完整列表仍可查看 [GitHub Pages 模型清单](https://dwgx.github.io/WindsurfAPI/#models)（同步生成於 `src/models.js`）。
 
 <details>
-<summary><b>Claude（Anthropic）</b> — 36 个</summary>
+<summary><b>Claude（Anthropic）</b> — 80 个</summary>
 
-claude-3.5-sonnet / 3.7-sonnet / thinking · claude-4-sonnet / opus / thinking · claude-4.1-opus · claude-4.5-haiku / sonnet / opus · claude-sonnet-4.6（含 1m / thinking / thinking-1m） · claude-opus-4.6 / thinking · **claude-opus-4.7-medium** · **claude-opus-4.8 全系**（low / medium / high / xhigh / max + fast） · **claude-5-fable / claude-sonnet-5 / claude-opus-5 全系**（low / medium / high / xhigh / max，opus-5 含 fast）
-
-</details>
-
-<details>
-<summary><b>GPT（OpenAI）</b> — 65 个</summary>
-
-gpt-4o · gpt-4.1 · gpt-5 全系（含 medium / high / codex） · **gpt-5.1 全系**（base / low / medium / high + fast + codex 全 6 變體） · **gpt-5.2 全系**（none / low / medium / high / xhigh + fast + codex 全 5 變體） · **gpt-5.4 全系**（base / mini × low/medium/high/xhigh） · **gpt-5.5 全系**（none / low / medium / high / xhigh + fast） · **gpt-5.6-luna 全系**（none / low / medium / high / xhigh） · o3 全系（base / mini / pro） · o4-mini
+claude-3.5-sonnet / 3.7-sonnet / thinking · claude-4-sonnet / opus / thinking · claude-4.1-opus · claude-4.5-haiku / sonnet / opus · claude-sonnet-4.6（含 1m / thinking / thinking-1m） · claude-opus-4.6 / thinking · **claude-opus-4.7-medium** · **claude-opus-4.8 全系**（low / medium / high / xhigh / max + fast） · **claude-5-fable / claude-sonnet-5 / claude-opus-5 全系**（low / medium / high / xhigh / max，opus-5 含 fast） · **claude-fable-5.1 / claude-sonnet-5.5 / claude-opus-5.5 全系**（low / medium / high / xhigh / max）
 
 </details>
 
 <details>
-<summary><b>Gemini（Google）</b> — 9 个</summary>
+<summary><b>GPT（OpenAI）</b> — 118 个</summary>
 
-gemini-2.5-pro / flash · gemini-3.0-pro / flash（minimal / low / medium / high 4 個 reasoning 等級） · gemini-3.1-pro（low / high）
+gpt-4o · gpt-4.1 · gpt-5 全系（含 medium / high / codex） · **gpt-5.1 全系**（base / low / medium / high + fast + codex 全 6 變體） · **gpt-5.2 全系**（none / low / medium / high / xhigh + fast + codex 全 5 變體） · **gpt-5.4 全系**（base / mini × low/medium/high/xhigh） · **gpt-5.5 全系**（none / low / medium / high / xhigh + fast） · **gpt-5.6-luna 全系**（none / low / medium / high / xhigh / max） · **gpt-5.6-sol / terra 全系**（none / low / medium / high / xhigh / max） · **gpt-6 系列**（sol / luna 為 none / low / medium / high / xhigh / max；astra 與 gpt-6.1-sol 為 low / medium / high / xhigh / max） · o3 全系（base / mini / pro） · o4-mini
+
+</details>
+
+<details>
+<summary><b>Gemini（Google）</b> — 26 个</summary>
+
+gemini-2.5-pro / flash · gemini-3.0-pro / flash（minimal / low / medium / high 4 個 reasoning 等級） · gemini-3.1-pro（low / high） · gemini-3.6-flash（minimal / low / medium / high） · gemini-3.7 / 3.8-flash（low / medium / high） · gemini-4-argon（low / medium / high）
 
 </details>
 
 <details>
 <summary><b>开源 / 国产</b></summary>
 
-**Kimi**: kimi-k2 / k2.5 / k2-6 / k2-7 · **GLM**: glm-4.7 / 5 / 5.1 / 5.2 · **Qwen**: qwen-3 · **Grok**: grok-3 / grok-3-mini-thinking / grok-code-fast-1 · **MiniMax**: minimax-m2.5
+**Kimi**: kimi-k2 / k2.5 / k2-6 / k2-7 / k3 · **GLM**: glm-4.7 / 5 / 5.1 / 5.2 / 5.3 · **Qwen**: qwen-3 · **DeepSeek**: deepseek-v4 / v4.1-flash · **Grok**: grok-3 / grok-3-mini-thinking / grok-code-fast-1 / grok-4.5 / 4.6 / 4.7 · **MiniMax**: minimax-m2.5 · **Nemotron**: nemotron-3-ultra · **Inkling**: inkling
 
 </details>
 
@@ -529,7 +635,9 @@ swe-1.5 / 1.5-fast / 1.6 / 1.6-fast / 1.7 / 1.7-lightning · arena-fast · arena
 
 > `swe-1.6` / `swe-1.6-fast` / `adaptive` / `arena-*` 属于 special-agent 路径。direct Cascade 会报 unknown model UID / route 不通；默认不会假装可用。需要测试时显式开启 `WINDSURFAPI_SPECIAL_AGENT_BACKEND=devin-cli`，并安装/挂载 Devin CLI。当前 PoC 是 `devin -p` print 模式，默认拒绝 caller-local tools/media；ACP 工具桥接另做。
 
-> **免费账号 entitled 模型**主要是 `gemini-2.5-flash`、`glm-4.7`、`glm-5` / `5.1`、`kimi-k2` / `k2.5` / `k2-6`、`qwen-3` 等开源系列；Claude / GPT 全系 + Opus 系列要 Pro。具体每个账号的 entitled 清单看 dashboard。
+> **DEVIN_CONNECT 模型拼写**：dotted `claude-sonnet-4.6` 是刻意保留的 alias，解析到上游 `claude-sonnet-4-6-thinking`（思考变体，credit 6）。要非 thinking 基座，显式写 catalog selector `claude-sonnet-4-6`（credit 4）—— 两种拼写都 `mapped:true`，别名是默认选择而不是降级。
+
+> **免费账号 entitled 模型**主要是 `gemini-2.5-flash`、`glm-4.7`、`glm-5` / `5.1`、`kimi-k2` / `k2.5` / `k2-6`、`qwen-3` 等开源系列；Claude / GPT 全系 + Opus 系列要 Pro。具体每个账号的 entitled 清单看 dashboard。冷启动静态基表只有 `gemini-2.5-flash`；其余是**按账号探测**出来的（GetUserStatus 白名单 + 一次成功调用），新号只显示 1 个属正常，dashboard 点 Probe 后补齐。
 >
 > **工具调用稳定性**（v2.0.82+ 实测）：Claude family 走 `<tool_use>` 协议最稳；GLM-4.7 / Kimi-K2.5 走 NLU 兜底 + 可选 retry 大部分 case 能调；GLM-5.1 在 cascade 后端不稳（经常空回复 textLen=0），proxy 救不动；GPT 在 cascade 协议层不传 tools[] schema 也救不全。Claude Code 调本地工具优先 `claude-haiku-4.5` / `claude-sonnet-4.6`。
 
@@ -539,7 +647,7 @@ swe-1.5 / 1.5-fast / 1.6 / 1.6-fast / 1.7 / 1.7-lightning · arena-fast · arena
 - **账号池 + LS 池** 每个独立 proxy 一个 LS 实例 不混用
 - **NO_TOOL 模式** `planner_mode=3` 关掉 Cascade 内置工具循环，避免 `/tmp/windsurf-workspace/` 路径泄漏
 - **三层 sanitize** LS 内建工具结果过滤 · `<tool_call>` 文本解析 · 输出路径清洗
-- **真实 token 计量** 从 `CortexStepMetadata.model_usage` 抓 Cascade 真实 `inputTokens` / `outputTokens` / `cacheRead` / `cacheWrite`，`prompt_tokens` 含 cacheWrite
+- **真实 token 计量** 从 `CortexStepMetadata.model_usage` 抓 Cascade 真实 `inputTokens` / `outputTokens` / `cacheRead` / `cacheWrite`。DEVIN_CONNECT 路径的 `prompt_tokens` 是完整输入（fresh + cache_read + cache_write），cache 明细在 `prompt_tokens_details.cached_tokens` 与 `cache_creation_input_tokens`；Cascade 路径的 `prompt_tokens` 只含 fresh + cache_read，cache_write 计入 `total_tokens` 与 `cache_creation_input_tokens`
 
 ## PM2 部署
 
@@ -605,6 +713,21 @@ flowchart TD
 | 改大 `.env` 里的 timeout 但 `context deadline exceeded` 还在 | 那个超时不在这一层。见下面同名问答 |
 | 一开就"所有账号 rate-limited",怀疑代理坏了 | 大概率是 IP 级冷却,不是账号问题也不是代理问题 |
 
+**要别人帮看一条请求？先打包现场**：用 `WINDSURFAPI_TRACE=1` 复现一次（默认写到
+`.trace/`，可用 `WINDSURFAPI_TRACE_DIR` 指定目录），然后：
+
+```bash
+node scripts/support-bundle.mjs
+```
+
+它把最近 5 个 trace 目录、`/health` 的 commit、版本和**脱敏后的**开关快照打进
+`support-bundle-<utc>.zip`，旁边还有一份 `manifest.json`（文件清单 + sha256）。打包前先脱敏：
+文本 leg 里的凭证字段、账号邮箱和预签名 URL 查询参数替换为 `[redacted]`；上游请求 protobuf
+里 ClientMetadata 的会话 token / user JWT 替换为 `[redacted]`；无法脱敏的二进制 leg 不打包，
+只在 manifest 里记 path + size + sha256。然后用仓库的 secret 规则逐个文件扫描，命中即拒绝打包
+（exit 1，不写任何文件）。trace 里有 prompt 片段、没有 key，但仍是私有现场：只附在 issue 里，
+不要贴到公开渠道。
+
 排查请求链路时,**发真实请求看响应,别只读代码** —— 这是协议转换网关,两层
 key、四条出口路径,读代码容易推错。
 
@@ -620,13 +743,13 @@ A: 这是 **chat API**，不是 IDE agent。要让模型真的改文件，用 **
 A: 多账号轮询**不会**丢上下文 — 每次请求都重新打包完整 history 发给 Cascade。真正的原因通常是中转层（new-api 等）没把完整 `messages[]` 透传过来。在 Dashboard 日志面板看 `turns=N`：如果多轮对话但 `turns=1`，就是中转层在你之前就把历史丢了。
 
 **Q: 长 prompt 超时**
-A: 已修。cold stall 检测按输入长度自适应，长输入最多给 90s。
+A: 已修。cold stall 检测按输入长度自适应（基数 30s，每 1500 字符 +5s），封顶取 `CASCADE_MAX_WAIT_MS`（默认 600s）—— 曾经的 90s 固定上限已在 2026-04-20 撤掉。
 
 **Q: Claude Code 能用吗**
 A: 能。`export ANTHROPIC_BASE_URL=http://你的API` + `export ANTHROPIC_API_KEY=你的key`。`/v1/messages` 支持 system + tools + tool_use + tool_result + stream + multi-turn 全套，已实测通过。
 
 **Q: 免费账号能用什么模型**
-A: 主要是 `gemini-2.5-flash`、`glm-4.7` / `5` / `5.1`、`kimi-k2` / `k2.5` / `k2-6`、`qwen-3` 这些开源系列。Claude family + GPT 全系 + Opus / Max / Thinking 高阶模型要 Pro entitlement。具体每个账号的 entitled 清单 dashboard 里看 — `model_not_entitled` 错误返回的 `available_in_pool` 字段也会列出账号池能用的。
+A: 主要是 `gemini-2.5-flash`、`glm-4.7` / `5` / `5.1`、`kimi-k2` / `k2.5` / `k2-6`、`qwen-3` 这些开源系列。Claude family + GPT 全系 + Opus / Max / Thinking 高阶模型要 Pro entitlement。具体每个账号的 entitled 清单 dashboard 里看 — `model_not_entitled` 错误返回的 `available_in_pool` 字段也会列出账号池能用的。静态冷启动基表只有 `gemini-2.5-flash`（#149），其余靠逐账号探测；新号只显示 1 个不是 bug。
 
 **Q: 免费账号调工具稳吗**
 A: 看模型。Claude family `<tool_use>` 协议训练扎实最稳（free 账号若 entitled 也是优选）；GLM-4.7 / Kimi-K2.5 走 NLU 兜底 + `WINDSURFAPI_NLU_RETRY=1` retry-with-correction 多数 case 能调；GLM-5.1 在 cascade 后端经常空回复 proxy 救不动；GPT 系列受 cascade 协议层限制（不传 OpenAI tools[] schema）也不稳。**Claude Code / Cline / Codex 调本地文件 / 跑命令优先 `claude-haiku-4.5` 或 `claude-sonnet-4.6`**。
@@ -635,7 +758,7 @@ A: 看模型。Claude family `<tool_use>` 协议训练扎实最稳（free 账号
 A: 先看日志里的 `ToolRoute[...]`。它会列出客户端声明的工具、`tool_choice` 过滤后的有效工具、native bridge 映射/未映射工具、preamble 降级层级，以及 `tool_choice_none` / `forced_tool_not_declared` / `preamble_compacted` / `native_bridge_*` 等原因。`/v1/messages` 和 `/v1/responses` 的 server-side 工具（如 Anthropic advisor/code_execution，OpenAI file_search/mcp/computer_use）如果代理没有实现，会在翻译层丢弃；这类工具不是普通 function tool，不等于 WindsurfAPI 已经能替客户端执行。native bridge 也不是“本地 IDE 工具修复开关”：默认安全路径仍是 prompt/tool emulation，由客户端本地执行工具；native bridge 是让 Windsurf 远端 workspace 执行 Cascade 内置工具，只适合有模型/账号/API key gate 的小流量实验。
 
 **Q: 31 个 trial 账号一会儿就全 unavailable**
-A: 八成是用了周限模型 — `claude-opus-4-7-max` / `gpt-5.5-xhigh` / `claude-sonnet-4-7-thinking` 这类高 reasoning effort 变体每个账号每周只有 5 次配额，31 号 × 5 次 ≈ 150 次就到顶。换 `claude-sonnet-4.6` / `claude-haiku-4.5` daily 配额比较宽松。`docker logs windsurfapi-windsurf-api-1 | grep rate_limit` 看每个账号的 cooldown 字段验证。
+A: 八成是用了周限模型 — `claude-opus-4-7-max` / `gpt-5.5-xhigh` / `claude-opus-4-8-xhigh` 这类高 reasoning effort 变体每个账号每周只有 5 次配额，31 号 × 5 次 ≈ 150 次就到顶。换 `claude-sonnet-4.6` / `claude-haiku-4.5` daily 配额比较宽松。`docker logs windsurfapi-windsurf-api-1 | grep rate_limit` 看每个账号的 cooldown 字段验证。
 
 **Q: All accounts temporarily rate-limited / IP-level cooldown 是不是代理坏了**
 A: 通常不是。Windsurf 上游会对同一出口 IP + 同一模型的密集请求施加 cooldown，多个账号绑在同一出口时会一起被限流。WindsurfAPI 会停止继续烧账号并返回 `429 + Retry-After`；v2.0.140 起这个等待时间会按上游 `Resets in: 27m12s` 这类真实值返回，而不是固定提示 30 秒。解决方向是降并发、换更宽松模型、给账号绑定不同出口 IP，或者等上游 cooldown 到期。
@@ -683,11 +806,11 @@ A: 不能。长 thinking / 长输出在约 236-243 秒断流，是 Windsurf prov
 - [@forrinzhao](https://github.com/forrinzhao) — [PR #219](https://github.com/dwgx/WindsurfAPI/pull/219)
   定位到 codex `apply_patch` 工具描述里的 `FREEFORM tool, so do not wrap the patch in JSON.` 会触发 Devin content policy(飞书 codex bot 全量被拦),live-bisect 7/7 确定性复现,并做了关键的双片段 A/B —— 只改一处仍拦、两处都改才过。这个发现顺带暴露出更深的结构缺陷:工具描述 preamble 注入在 `neutralizeClientIdentity` **之后**,导致 native 路径上任何经由工具描述进来的触发词都绕过 a1-a6 整条防线。落地版把中和移到 preamble 注入之后,并把两条改写做成 `(a7)` 规则进既有序列(复用主开关与测试体系),因此覆盖所有客户端、所有触发词。另采纳其 `responses.js` 修复:Codex 发的 input item 是裸 `{role, content}` 不带 `type:'message'`,此前被静默丢弃导致上游收到空 messages → UPSTREAM_INTERNAL。
 - [@warelik](https://github.com/warelik) — [PR #224](https://github.com/dwgx/WindsurfAPI/pull/224) [#225](https://github.com/dwgx/WindsurfAPI/pull/225) [#226](https://github.com/dwgx/WindsurfAPI/pull/226) [#227](https://github.com/dwgx/WindsurfAPI/pull/227) [#228](https://github.com/dwgx/WindsurfAPI/pull/228) [#229](https://github.com/dwgx/WindsurfAPI/pull/229)
-  一轮六连,覆盖账号池、限流、身份中和、协议规范四个子系统。429 reset window 双链根因:上游给的 3h 重置窗口在传输层被丢(只解构 `{code, message}`),且 model-scoped 冷却对 `getApiKey(modelKey=null)` 的池选择结构上不可见 —— 两条只修一条都毫无效果,刚被 429 的账号几秒内被重选、一路撞到硬封(#224)。客户端断连不再当成账号故障:统一识别 abort(兼容 undici 与 AbortController 两种形态),流式/非流式全部退出路径不再罚 error budget、不再 failover 烧配额、不再往死 socket 写(#225)。Grok CLI 的 `You are Grok … released by xAI` self-ID 触发 content policy,补进 a1-a5 同族规则并整块剥离 `<executing_actions_with_care>`(#227)。thinking 块 `signature: ""` 改为省略,修严格客户端拒收(#228)。Responses usage 补齐 `input/output_tokens_details`,与 DEVIN_CONNECT 缓存 wire tag 校准正好凑成一条链的两半(#229)。另有 600 行零依赖的 pair-chain 会话连续性模块,从对话自身已完成的请求/响应对推导稳定 `session_id`,默认关、开关闭合时字节等价(#226)。
+  一轮六连,覆盖账号池、限流、身份中和、协议规范四个子系统。429 reset window 双链根因:上游给的 3h 重置窗口在传输层被丢(只解构 `{code, message}`),且 model-scoped 冷却对 `getApiKey(modelKey=null)` 的池选择结构上不可见 —— 两条只修一条都毫无效果,刚被 429 的账号几秒内被重选、一路撞到硬封(#224)。客户端断连不再当成账号故障:统一识别 abort(兼容 undici 与 AbortController 两种形态),流式/非流式全部退出路径不再罚 error budget、不再 failover 烧配额、不再往死 socket 写(#225)。Grok CLI 的 `You are Grok … released by xAI` self-ID 触发 content policy,补进 a1-a5 同族规则并整块剥离 `<executing_actions_with_care>`(#227)。thinking 块 `signature: ""` 改为省略,修严格客户端拒收(#228)。Responses usage 补齐 `input/output_tokens_details`,与 DEVIN_CONNECT 缓存 wire tag 校准正好凑成一条链的两半(#229)。另有零依赖的 pair-chain 会话连续性模块（引入时 600 行，现 858 行）,从对话自身已完成的请求/响应对推导稳定 `session_id`,默认关、开关闭合时字节等价(#226)。
 - [@warelik](https://github.com/warelik) — [PR #216](https://github.com/dwgx/WindsurfAPI/pull/216) + [PR #215](https://github.com/dwgx/WindsurfAPI/pull/215)
   中和上游 MCP-gate：server.codeium.com 对工具描述做指纹匹配，Cursor 21 个工具里 8 个被 permission_denied 拒掉；把 native #10 ToolDef 顶层描述换成工具名 + 递归剥参数 schema 的描述注解（保留结构和名叫 `description` 的参数），再把描述-only preamble 注入 system prompt 补回选工具上下文，21/21 全过（#216）。另修 Node 20+ IPv6 Happy Eyeballs 导致的 ETIMEDOUT：关掉 autoSelectFamily + 本地 HTTP/2 连接改用 127.0.0.1（#215）。
 
-想加入这份名单？欢迎提 [issue](https://github.com/dwgx/WindsurfAPI/issues) 或 [pull request](https://github.com/dwgx/WindsurfAPI/pulls)。Dashboard 左侧的"致谢"面板是**更完整的一份**：它从 `contributors.json` 渲染,当前 27 位贡献者、53 条记录,每条还带分级与机制说明；上面这份名单是其中人工挑选的一部分。
+想加入这份名单？欢迎提 [issue](https://github.com/dwgx/WindsurfAPI/issues) 或 [pull request](https://github.com/dwgx/WindsurfAPI/pulls)。Dashboard 左侧的"致谢"面板是**更完整的一份**：它从 `contributors.json` 渲染,当前 36 位贡献者、68 条记录,每条还带分级与机制说明；上面这份名单是其中人工挑选的一部分。
 
 ## 授权
 
@@ -695,7 +818,26 @@ MIT License. See [LICENSE](LICENSE).
 
 ## 发布与密钥边界
 
-发布流程会自动推 Docker 镜像和 GitHub Release。**别把 token、API key、cookie、上游账号凭据
+发布流程会自动推 Docker 镜像和 GitHub Release。当前发布 **v3.141.592658**；仓库共 228 个
+git tag / 218 份发布说明（2026-10-30）。从 v3.10.0 起，每个 Release 为四个发布资产
+（Windows exe/zip、macOS arm64 二进制/zip）生成 `SHA256SUMS`，并用 **cosign keyless**
+（GitHub OIDC，仓库内没有任何私钥或签名 secret）为四个资产和清单各发布一个
+`.sigstore.json`（签名、Fulcio 证书与 Rekor inclusion proof 合在一个文件里）。从
+v3.141.592657 起，Docker 镜像摘要 `image-digest.txt` 与源码 OTA 来源证明
+`release-attestation.json` 也各带一个 `.sigstore.json`。签名证明“这些字节由本仓库的 release workflow 在某个 `v*` tag 上产生”，
+不证明人工审阅或构建可复现；
+能改写仓库/tag 的人仍能重新签名，因此 tag/commit 的 out-of-band 核对依然重要。下载后先验签再
+校验哈希：`node scripts/verify-release-assets.mjs <下载目录>`（需要 cosign），或按
+[docs/RELEASE-SIGNING.md](docs/RELEASE-SIGNING.md) 用 `cosign verify-blob` 验证
+`SHA256SUMS.sigstore.json` 后再 `sha256sum -c SHA256SUMS`。清单使用**扁平文件名**，把资产
+放在同一目录即可；v3.9.53 的清单带 `dist-windows/` / `dist-macos/` 前缀，v3.10.0 之前的
+Release 没有签名。Docker 镜像按 digest 签名，摘要发布为 `image-digest.txt`；Dashboard 的
+Docker 更新会先经 daemon 解析 tag，只有与这个签名摘要一致才会 pull/deploy。git 自更新
+不下载二进制，但会校验 Release 的 `release-attestation.json`（tag→commit/tree 与各资产
+SHA-256，cosign 签名）；默认 `WINDSURFAPI_UPDATE_ATTESTATION=warn`，缺失只告警，
+设为 `required` 则拒绝。细节见 docs/RELEASE-SIGNING.md。
+
+**别把 token、API key、cookie、上游账号凭据
 写进 issue、PR、日志或提交的配置文件里。** 如果报告问题必须带上鉴权信息，只贴脱敏后的元数据
 和复现步骤。
 

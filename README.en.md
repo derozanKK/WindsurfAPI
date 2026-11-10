@@ -6,7 +6,7 @@
 
 > Turn Windsurf / Devin's 100+ AI models (Claude, GPT, Gemini, DeepSeek, Kimi, GLM, SWE…) into OpenAI / Anthropic / Gemini standard APIs. Zero npm runtime dependencies.
 
-> **History Ledger** · Every commit laid out: 1387 commits, 196 releases, 82 PRs, 180 issues — timeline, contributor analysis, Git tree (vertical / horizontal / ring), and a full account of every mistake along the way. [**Open the interactive ledger**](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html) (zero-dependency, pure vanilla).
+> **History Ledger** · Every commit laid out: 1387 commits, 196 releases, 82 PRs, 180 issues (the ledger's own frozen scope — **its numbers stop at v3.9.34 / 2026-09-15**) — timeline, contributor analysis, Git tree (vertical / horizontal / ring), and a full account of every mistake along the way. [**Open the interactive ledger**](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html) (zero-dependency, pure vanilla).
 
 
 <p align="center">
@@ -37,6 +37,15 @@ Turns [Windsurf](https://windsurf.com) (formerly Codeium, now Devin Desktop)'s A
 - `POST /v1/messages` — **Anthropic Compatible** for direct connection with Claude Code / Cline / Cursor.
 - `POST /v1beta/models/*` — **Gemini Compatible** for direct Gemini SDK use.
 
+> **Auth transport**: prefer the `Authorization: Bearer <API_KEY>` header, or
+> Gemini's `x-goog-api-key` header. `?key=` is accepted for Gemini-native
+> clients, but it puts the key in the URL, where reverse proxies, access logs,
+> browser history and packet captures can retain it. The bundled `nginx.conf`
+> logs only `$uri` (the query string is dropped); proxies you add are yours to
+> configure. `?key=` is **supported but deprecated** — see
+> [docs/QUERY-KEY-DEPRECATION.md](docs/QUERY-KEY-DEPRECATION.md) for the removal
+> plan and the header migration.
+
 **100+ Models**: Claude 4.5/4.6/Opus 4.7/5 · GPT-5/5.1/5.2/5.4/5.5/5.6-Luna series · Gemini 2.5/3.0/3.1 · Grok · Qwen · Kimi K2.x · GLM 4.7/5/5.1/5.2 · MiniMax · SWE 1.5/1.6/1.7/2 · Arena, etc. Zero npm dependencies, pure Node.js.
 
 <sub>Keywords: Windsurf reverse proxy · Devin API · Claude Code proxy · Cursor mirror · free Claude/GPT/Gemini · Codeium API · OpenAI-compatible endpoint · self-hosted LLM gateway</sub>
@@ -49,6 +58,26 @@ Turns [Windsurf](https://windsurf.com) (formerly Codeium, now Devin Desktop)'s A
   <a href="docs/">All docs</a> ·
   <a href="README.md">中文</a>
 </p>
+
+## Project Scope and Usage Boundaries
+
+WindsurfAPI is an independent, open-source, self-hosted protocol-compatibility gateway for connecting **Windsurf / Devin account capabilities that the deployer owns or is authorized to use** to OpenAI-, Anthropic-, and Gemini-compatible clients.
+
+### Usage Model
+
+- **Bring Your Own Account (BYO-account)**: the deployer supplies and controls their own upstream accounts and credentials.
+- The project itself **does not provide, sell, rent, share, or bundle any Windsurf / Devin accounts, subscriptions, or credentials**.
+- Multi-account support is for account sets owned or authorized for management by the same deployer — for example failover, health checks, and rate-limit isolation; it is not a public shared account pool.
+- The project aims at protocol interoperability, self-hosted client compatibility, and engineering research; it is not intended for subscription resale, cross-user account sharing, bypassing upstream quotas, or circumventing access controls.
+- Deployers are responsible for confirming that their accounts, subscriptions, and specific usage comply with the applicable upstream terms of service and applicable law.
+
+### Independent Project Statement
+
+WindsurfAPI is an independent open-source project and is not affiliated with, authorized by, or endorsed by Cognition, Windsurf, Devin, OpenAI, Anthropic, Google, or any other model provider, unless explicitly stated otherwise.
+
+The project code is released under the [MIT License](LICENSE). The MIT License grants rights to this project's code; it does not grant access to any third-party service, model, account, or subscription.
+
+This section only sets the boundaries; the rest of this document covers what it actually does.
 
 ## What is it doing?
 
@@ -122,6 +151,10 @@ sequenceDiagram
 
 ## Quick Start
 
+> **Runtime**: Node.js **22.13+** (24.x is the release gate). Node 20 reached EOL on 2026-04-30 and is
+> unsupported; local Windsurf account import needs the unflagged `node:sqlite` from 22.13, and earlier
+> 22.x returns `sqlite_unavailable`.
+
 ### One-Click Deployment
 
 ```bash
@@ -153,6 +186,22 @@ Default mounts:
 
 If you want a different persistence location, set `DATA_DIR` in `.env`. The Docker setup defaults it to `/data`.
 
+### One-Command Docker Update
+
+Docker deployments use `deploy/update.sh`: pull the new image → recreate only `windsurf-api` → wait for `/health` → roll back to the previous image automatically on failure. Data volumes are never touched, and no `docker.sock` mount or Watchtower is required.
+
+```bash
+bash deploy/update.sh              # pull :latest and update
+bash deploy/update.sh --tag 3.9.52 # pin a release
+bash deploy/update.sh --build      # rebuild from this checkout (local/fork images)
+bash deploy/update.sh --dry-run    # print the plan; change nothing
+bash deploy/update.sh --rollback   # restore the image from before the last update
+```
+
+Full walkthrough, health gate, rollback and troubleshooting: **[docs/DOCKER-UPDATE.md](docs/DOCKER-UPDATE.md)**.
+
+> The `update.sh` below is for git/PM2 deployments. Docker deployments use `deploy/update.sh`.
+
 ### One-Click Update
 
 To pull the latest fixes after deployment, just run one command:
@@ -174,26 +223,41 @@ cd WindsurfAPI
 # Language Server binary — auto-detects Linux/macOS, one-click download + chmod
 bash install-ls.sh
 
-# Download chain: WindsurfAPI release → public LS mirror
-#   https://github.com/dwgx/windsurf-ls-release/releases/latest/download
-# → Exafunction/codeium fallback. For a private mirror or rollback, set:
-#   WINDSURFAPI_LS_RELEASE=https://github.com/<owner>/<repo>/releases/latest/download bash install-ls.sh
-
+# Download chain (manifest-driven, fail-closed):
+#   1. Read https://windsurf-stable.codeium.com/api/versions
+#   2. Pick the newest pinned stable release in ls-pins.json (currently 3.10.67)
+#      and require the manifest's commit + archive sha256 to match the pin
+#   3. Download the desktop archive → verify archive sha256 → extract the LS →
+#      verify the inner binary sha256
+# Any mismatch exits non-zero; there is no silent fallback to the old mirror.
+#
+# Print the plan without downloading (recommended before the first install):
+#   bash install-ls.sh --dry-run
+#
+# Pin a version / override the source:
+#   bash install-ls.sh --version 3.10.67
+#   WINDSURFAPI_LS_VERSION=3.10.67 bash install-ls.sh
+#   WINDSURFAPI_LS_MANIFEST_URL=<url|local path> bash install-ls.sh
+#   WINDSURFAPI_LS_PINS=/path/to/ls-pins.json bash install-ls.sh
+#
+# Roll back to the pinned 3.5.17 (explicit dwgx/windsurf-ls-release v3.5.17 tag):
+#   bash install-ls.sh --rollback
+#   same as: bash install-ls.sh --version 3.5.17 --allow-mirror
+#
 # Default install paths:
 #   Linux x64:           /opt/windsurf/language_server_linux_x64
-#   Linux arm64:         /opt/windsurf/language_server_linux_arm
 #   macOS Apple Silicon: $HOME/.windsurf/language_server_macos_arm
 #   macOS Intel:         $HOME/.windsurf/language_server_macos_x64
+#   Linux arm64:         no upstream archive; install a desktop binary with --file.
 
 # Or use a local binary you already have:
 #   bash install-ls.sh /path/to/language_server_linux_x64
-# Or specify a custom URL:
-#   bash install-ls.sh --url https://example.com/language_server_linux_x64
+# Or specify a custom URL (prefer --sha256; without it the installer warns):
+#   bash install-ls.sh --url https://example.com/language_server_linux_x64 --sha256 <64-hex>
 
-# ⚠️ LS binary is old / want a different source?
-# The default download chain now uses the dwgx/windsurf-ls-release public mirror.
-# If the mirror does not cover your platform yet, copy the LS binary out of
-# the Windsurf desktop app bundle:
+# ⚠️ Platform not covered by the upstream archive / want a different source?
+# Upstream only ships linux-x64, darwin-arm64 and darwin-x64 desktop archives.
+# For other platforms, copy the LS binary out of the Windsurf desktop app:
 #
 #   macOS:   "$HOME/Library/Application Support/Windsurf/resources/app/extensions/windsurf/bin/language_server_macos_arm"
 #   Linux:   "$HOME/.windsurf/bin/language_server_linux_x64"
@@ -322,9 +386,13 @@ In your client's settings for **Custom OpenAI Compatible**:
 | `CODEIUM_EMAIL` | empty | Email for Windsurf account authentication. |
 | `CODEIUM_PASSWORD` | empty | Password for Windsurf account authentication. |
 | `CODEIUM_API_URL` | `https://server.self-serve.windsurf.com` | Windsurf cloud API endpoint. |
-| `DEFAULT_MODEL` | `claude-sonnet-4.6` | The model to use if `model` is not specified. Must be a name the active backend can resolve. Unmapped Connect names return 400 `model_not_found` unless `WINDSURFAPI_STRICT_MODEL=0` (legacy silent degrade to the free selector). |
+| `DEFAULT_MODEL` | `claude-sonnet-4.6` | The model to use if `model` is not specified. Must be a name the active backend can resolve. Unmapped Connect names return 400 `model_not_found` unless `WINDSURFAPI_STRICT_MODEL=0`, which degrades to a free selector the live catalog **actually exposes** — and still returns 400 when there is none, instead of falling back to `swe-1-6-slow`, which the catalog no longer carries. |
 | `MAX_TOKENS` | `8192` | Default maximum number of response tokens. |
-| `LOG_LEVEL` | `info` | debug / info / warn / error |
+| `LOG_LEVEL` | `info` | Console level: debug / info / warn / error. JSONL files and Dashboard still receive all levels. |
+| `LOG_RETENTION_DAYS` | `0` (off) | Application JSONL retention in UTC calendar days including today; e.g. `14`. Cleanup at startup and hourly. Restart after changes. |
+| `LOG_MAX_FILE_MB` | `0` (off) | MiB limit for newly written log files; e.g. `20`. Rotate between complete JSONL records. |
+| `LOG_MAX_TOTAL_MB` | `0` (off) | Combined app/error log MiB budget; e.g. `500`. Evict oldest dated segments, including today's if necessary. Oversized records skip disk persistence. See [disk-log policy](docs/ENV-SWITCHES.md#应用磁盘日志). |
+| `WAPI_ACCOUNTS_ONLY` | empty (all) | Per-instance account isolation: comma-separated emails or account ids; only matching accounts are loaded from `accounts.json`, case-insensitively. A non-blank value with no valid tokens fails closed (loads no accounts). Use it to pin each port of a multi-port deployment to its own account(s) when they share one `accounts.json` |
 | `WINDSURFAPI_IGNORE_CLOUD_FILTER` | `0` | On the Cascade transport, after per-account cloud catalogs sync, pool listings show their union and routing enforces each selected account's catalog. Set to `1` to restore the full static catalog. Missing, empty, or failed catalog syncs fail open. `DEVIN_CONNECT` uses its separate selector catalog. |
 | `LS_BINARY_PATH` | `/opt/windsurf/language_server_linux_x64` | Path to the LS binary. |
 | `LS_PORT` | `42100` | LS gRPC port. |
@@ -359,6 +427,7 @@ In your client's settings for **Custom OpenAI Compatible**:
 | `RESPONSE_STORE_MAX_BYTES` | `128m` | Total byte budget for stored conversations (b/k/kb/m/mb/g/gb). The count caps bound cardinality, not memory — a realistic agent conversation measures ~167KB, so 2000 entries is ~327MB. Eviction triggers on whichever limit binds first. |
 | `DEVIN_CONNECT_IMAGE_TAG` | `10` | DEVIN_CONNECT image-field tag. Defaults to repeated field `#10`, independently verified by the extracted Devin schema and a native SWE-1.7 capture; set `0` to stop emitting images. |
 | `DEVIN_CONNECT_COLLAPSE_SYSTEM` | `0` | Set `1` to wrap system content in `<system>...</system>` and merge it, in order, into the next user message, avoiding the stricter upstream policy path on field `#2`. Default off; when tools require a non-empty field `#2`, only the existing benign placeholder remains there. |
+| `DEVIN_CONNECT_REPLAY_SIGNED_THINKING` | `0` | Set `1` to replay signed Claude thinking from `/v1/messages` history natively as `#11` thinking + `#12` signature (tool-call and plain assistant turns), so the model can read its earlier reasoning inside a tool loop and after a new user message. Needs `DEVIN_CONNECT_SIGNATURE_TAG=10` so clients receive the signature at all. The upstream verifies the signature; only an untouched block is replayed. Details in `docs/ENV-SWITCHES.md`. |
 | `DEVIN_CONNECT_CATALOG_TTL_MS` | `300000` | Successful DEVIN_CONNECT live-catalog TTL (5 minutes by default, 10-second minimum). Accounts sync independently; failed or empty responses keep the last-known-good catalog. |
 
 The full list lives in [.env.example](.env.example); the table above covers the common ones.
@@ -388,9 +457,24 @@ upstream explicitly supplies true or false. A missing field remains unknown rath
 invented as false. Models carrying upstream `disabled #4` do not enter the live catalog.
 
 `DEVIN_CONNECT_IMAGE_INNER_TAGS` can still override the inner `base64,mime` tags (default `1,2`)
-as an emergency calibration surface for a future wire change. The synchronous builder does not
-download remote `https://` image URLs; use data URLs/base64, or explicitly enable
-`DEVIN_ACP_VISION=1` to route vision through a locally installed Devin CLI ACP transport.
+as an emergency calibration surface for a future wire change. Remote `http(s)://` image URLs are
+now downloaded by `streamChat` before the proto is assembled, through the same bounded
+`fetchImageUrl` the Cascade path uses (8 s total budget, 5 MB cap, `image/*` allowlist, and a
+private/loopback rejection on every redirect hop), then inlined as data URLs in `#10`. A failed,
+oversized, or wrong-type fetch logs a warning (host only — never a possibly signed full URL) and
+drops just that image; the text still goes upstream. With `DEVIN_CONNECT_IMAGE_TAG=0` nothing is
+downloaded. Alternatively, explicitly enable `DEVIN_ACP_VISION=1` to route vision through a
+locally installed Devin CLI ACP transport.
+
+Remote images are https-only by default: plaintext `http://` bytes can be replaced by any
+middlebox on the path, and those bytes are inlined verbatim into the model's context (`#10` /
+Cascade image blocks). A rejected fetch drops just that image and still sends the text, logging a
+warning with the host only (never the full URL, which may carry a signed query).
+`WINDSURFAPI_ALLOW_HTTP_IMAGES=1` re-allows plaintext http for **public hosts only** (both http
+and https); the default or any other value accepts https only. Private/internal/loopback targets
+stay blocked regardless of the switch — the SSRF policy is separate and not relaxable (including
+per-hop DNS resolutions), so it cannot be used for a trusted LAN mirror. The check runs on every
+`fetchImageUrl` hop, so an https → http redirect is rejected too.
 
 ## Dashboard Features
 
@@ -405,37 +489,40 @@ Open `http://YOUR_IP:3003/dashboard`:
 | **Proxy Config** | Global or per-account HTTP / SOCKS5 proxy |
 | **Logs** | Real-time SSE streaming · Filter by level · `turns=N chars=M` diagnostics per turn |
 | **Stats & Analytics** | Time range 6h / 24h / 72h · Per-account dimensions · p50 / p95 latency |
+| **ACU & Usage** | Org-scoped ACU limit · cycle usage · daily burn-down · per-product breakdown · overage balance in USD |
 | **Experimental** | Cascade conversation reuse · **Model Identity Injection (custom prompt per vendor)** |
+
+The **ACU & Usage** panel reads `app.devin.ai/{org}/billing/*` once per organization, so members sharing an org render one ledger instead of one per account. Truth rules: `max_acu_limit: null` means unlimited (never zero), an absent cycle total is unknown (`—`), and `overage_credits` is a **signed USD balance**. A negative balance is an overdrawn on-demand balance: it renders as `-$0.10 (overdrawn)` and is never clamped to zero or hidden.
 
 ## Supported Models
 
 100+ static models in the main catalog plus dynamic cloud-side models added at startup via `mergeCloudModels`. On the Cascade transport, after per-account cloud catalogs sync, `GET /v1/models` and the Dashboard show the union available across active accounts, while routing applies the selected account's own catalog. `DEVIN_CONNECT` remains governed by its separate selector catalog. The full static catalog remains available on the [GitHub Pages model catalog](https://dwgx.github.io/WindsurfAPI/#models) (auto-generated from `src/models.js`).
 
 <details>
-<summary><b>Claude (Anthropic)</b> — 36 models</summary>
+<summary><b>Claude (Anthropic)</b> — 80 models</summary>
 
-claude-3.5-sonnet / 3.7-sonnet / thinking · claude-4-sonnet / opus / thinking · claude-4.1-opus · claude-4.5-haiku / sonnet / opus · claude-sonnet-4.6 (incl. 1m / thinking / thinking-1m) · claude-opus-4.6 / thinking · **claude-opus-4.7-medium** · **claude-opus-4.8 series** (low / medium / high / xhigh / max + fast) · **claude-5-fable / claude-sonnet-5 / claude-opus-5 series** (low / medium / high / xhigh / max; opus-5 incl. fast)
-
-</details>
-
-<details>
-<summary><b>GPT (OpenAI)</b> — 65 models</summary>
-
-gpt-4o · gpt-4.1 · gpt-5 series (incl. medium / high / codex) · **gpt-5.1 series** (base / low / medium / high + fast + codex, all 6 variants) · **gpt-5.2 series** (none / low / medium / high / xhigh + fast + codex) · **gpt-5.4 series** (base / mini × low/medium/high/xhigh) · **gpt-5.5 series** (none / low / medium / high / xhigh + fast) · **gpt-5.6-luna series** (none / low / medium / high / xhigh) · o3 series (base / mini / pro) · o4-mini
+claude-3.5-sonnet / 3.7-sonnet / thinking · claude-4-sonnet / opus / thinking · claude-4.1-opus · claude-4.5-haiku / sonnet / opus · claude-sonnet-4.6 (incl. 1m / thinking / thinking-1m) · claude-opus-4.6 / thinking · **claude-opus-4.7-medium** · **claude-opus-4.8 series** (low / medium / high / xhigh / max + fast) · **claude-5-fable / claude-sonnet-5 / claude-opus-5 series** (low / medium / high / xhigh / max; opus-5 incl. fast) · **claude-fable-5.1 / claude-sonnet-5.5 / claude-opus-5.5 series** (low / medium / high / xhigh / max)
 
 </details>
 
 <details>
-<summary><b>Gemini (Google)</b> — 9 models</summary>
+<summary><b>GPT (OpenAI)</b> — 118 models</summary>
 
-gemini-2.5-pro / flash · gemini-3.0-pro / flash (minimal / low / medium / high — 4 reasoning levels) · gemini-3.1-pro (low / high)
+gpt-4o · gpt-4.1 · gpt-5 series (incl. medium / high / codex) · **gpt-5.1 series** (base / low / medium / high + fast + codex, all 6 variants) · **gpt-5.2 series** (none / low / medium / high / xhigh + fast + codex) · **gpt-5.4 series** (base / mini × low/medium/high/xhigh) · **gpt-5.5 series** (none / low / medium / high / xhigh + fast) · **gpt-5.6-luna series** (none / low / medium / high / xhigh / max) · **gpt-5.6-sol / terra series** (none / low / medium / high / xhigh / max) · **gpt-6 family** (sol / luna: none / low / medium / high / xhigh / max; astra and gpt-6.1-sol: low / medium / high / xhigh / max) · o3 series (base / mini / pro) · o4-mini
+
+</details>
+
+<details>
+<summary><b>Gemini (Google)</b> — 26 models</summary>
+
+gemini-2.5-pro / flash · gemini-3.0-pro / flash (minimal / low / medium / high — 4 reasoning levels) · gemini-3.1-pro (low / high) · gemini-3.6-flash (minimal / low / medium / high) · gemini-3.7 / 3.8-flash (low / medium / high) · gemini-4-argon (low / medium / high)
 
 </details>
 
 <details>
 <summary><b>Open source / Chinese providers</b></summary>
 
-**Kimi**: kimi-k2 / k2.5 / k2-6 / k2-7 · **GLM**: glm-4.7 / 5 / 5.1 / 5.2 · **Qwen**: qwen-3 · **Grok**: grok-3 / grok-3-mini-thinking / grok-code-fast-1 · **MiniMax**: minimax-m2.5
+**Kimi**: kimi-k2 / k2.5 / k2-6 / k2-7 / k3 · **GLM**: glm-4.7 / 5 / 5.1 / 5.2 / 5.3 · **Qwen**: qwen-3 · **DeepSeek**: deepseek-v4 / v4.1-flash · **Grok**: grok-3 / grok-3-mini-thinking / grok-code-fast-1 / grok-4.5 / 4.6 / 4.7 · **MiniMax**: minimax-m2.5 · **Nemotron**: nemotron-3-ultra · **Inkling**: inkling
 
 </details>
 
@@ -446,6 +533,8 @@ swe-1.5 / 1.5-fast / 1.6 / 1.6-fast / 1.7 / 1.7-lightning · arena-fast · arena
 
 </details>
 
+> **DEVIN_CONNECT model spellings:** the dotted `claude-sonnet-4.6` is a deliberate alias that resolves to the upstream `claude-sonnet-4-6-thinking` selector (thinking variant, credit 6). For the non-thinking base, ask for the catalog selector `claude-sonnet-4-6` explicitly (credit 4). Both spellings are `mapped:true` — the alias is a curated default, not a downgrade.
+>
 > **Free-account entitlements** typically include `gemini-2.5-flash`, `glm-4.7` / `glm-5` / `5.1`, `kimi-k2` / `k2.5` / `k2-6`, `qwen-3` and similar open-source models; Claude family, GPT family, and Opus / thinking variants require Pro. Each account's exact list shows up in the dashboard.
 >
 > **Tool-calling reliability (measured v2.0.82+):** Claude family is the most reliable (their training covered prompt-level tool protocols); GLM-4.7 / Kimi-K2.5 work for most cases via NLU fallback + optional retry-with-correction; GLM-5.1 is unreliable on the cascade backend (it often returns empty responses, no narration to recover from); GPT family is also limited because the cascade upstream doesn't carry `tools[]` schema. For Claude Code / Cline / Codex doing local tool calls, prefer `claude-haiku-4.5` or `claude-sonnet-4.6`.
@@ -460,7 +549,7 @@ The service automatically detects Chinese, Japanese, or Korean characters in you
 - **Account Pool + LS Pool** Each independent proxy gets its own LS instance, no mixing.
 - **NO_TOOL Mode** `planner_mode=3` disables Cascade's built-in tool loop to prevent `/tmp/windsurf-workspace/` path leakage.
 - **Three-layer sanitization** LS built-in tool result filtering · `<tool_call>` text parsing · Output path cleaning.
-- **Real token counting** Fetches real `inputTokens` / `outputTokens` / `cacheRead` / `cacheWrite` from `CortexStepMetadata.model_usage`. `prompt_tokens` includes cacheWrite.
+- **Real token counting** Fetches real `inputTokens` / `outputTokens` / `cacheRead` / `cacheWrite` from `CortexStepMetadata.model_usage`. On DEVIN_CONNECT, `prompt_tokens` is the full input (fresh + cache_read + cache_write), with the split on `prompt_tokens_details.cached_tokens` and `cache_creation_input_tokens`; on Cascade, `prompt_tokens` carries fresh + cache_read while cache_write lands in `total_tokens` and `cache_creation_input_tokens`.
 
 ## PM2 Deployment
 
@@ -539,13 +628,13 @@ A: This is a **chat API**, not an IDE agent. To have the model actually modify f
 A: Multi-account round-robin will **not** lose context — every request repackages the full history and sends it to Cascade. The real reason is usually a relay layer (like new-api) not passing the full `messages[]` array. Check `turns=N` in the Dashboard logs: if it's a multi-turn conversation but `turns=1`, then a layer before you has already dropped the history.
 
 **Q: Long prompts are timing out**
-A: This has been fixed. Cold stall detection is now adaptive to input length, with a max timeout of 90s for long inputs.
+A: This has been fixed. Cold stall detection is adaptive to input length (30s base, +5s per 1500 characters) and is capped by `CASCADE_MAX_WAIT_MS` (default 600s) — the old fixed 90s cap was removed on 2026-04-20.
 
 **Q: Can I use Claude Code?**
 A: Yes. `export ANTHROPIC_BASE_URL=http://YOUR_API` + `export ANTHROPIC_API_KEY=YOUR_KEY`. `/v1/messages` supports the full suite: system, tools, tool_use, tool_result, stream, and multi-turn, all tested and working.
 
 **Q: What models can free accounts use?**
-A: Mostly `gemini-2.5-flash`, `glm-4.7` / `5` / `5.1`, `kimi-k2` / `k2.5` / `k2-6`, `qwen-3` (open-source series). Claude family, GPT family, and Opus / Max / -thinking variants need Pro entitlement. The dashboard shows each account's entitled list, and `model_not_entitled` error responses include an `available_in_pool` field with the names you can switch to.
+A: Mostly `gemini-2.5-flash`, `glm-4.7` / `5` / `5.1`, `kimi-k2` / `k2.5` / `k2-6`, `qwen-3` (open-source series). Claude family, GPT family, and Opus / Max / -thinking variants need Pro entitlement. The dashboard shows each account's entitled list, and `model_not_entitled` error responses include an `available_in_pool` field with the names you can switch to. The static cold-start floor is `gemini-2.5-flash` only; everything else is discovered per account (GetUserStatus allowlist + a successful call), so a fresh account showing one model is expected — run Probe in the dashboard to fill it in.
 
 **Q: Are tool calls reliable on free accounts?**
 A: Depends on the model. Claude family is rock-solid (also free-account-entitled when available). GLM-4.7 / Kimi-K2.5 work in most cases via NLU recovery + `WINDSURFAPI_NLU_RETRY=1` retry-with-correction. GLM-5.1 is unreliable on the cascade backend (frequent empty responses) — proxy can't fix this. GPT family is similarly limited by the cascade protocol layer not passing `tools[]` schema. **For Claude Code / Cline / Codex doing local file/shell ops prefer `claude-haiku-4.5` or `claude-sonnet-4.6`.**
@@ -554,7 +643,7 @@ A: Depends on the model. Claude family is rock-solid (also free-account-entitled
 A: First look for `ToolRoute[...]` in the logs. It lists the tools your client declared, the effective tools after `tool_choice` filtering, mapped/unmapped tools for the native bridge, the preamble downgrade tier, and the reason (`tool_choice_none` / `forced_tool_not_declared` / `preamble_compacted` / `native_bridge_*`). Server-side tools on `/v1/messages` and `/v1/responses` (Anthropic advisor/code_execution, OpenAI file_search/mcp/computer_use) are dropped at the translation layer when the proxy doesn't implement them; those aren't ordinary function tools, and their absence doesn't mean WindsurfAPI can execute them on the client's behalf. The native bridge is also not a "local IDE tool fix" switch: the default safe path is prompt/tool emulation with local client-side execution; the native bridge makes the remote Windsurf workspace execute Cascade built-in tools and is only meant for low-traffic experiments behind a model/account/API-key gate.
 
 **Q: 31 trial accounts go unavailable after a few hundred calls**
-A: Likely the model is a weekly-quota variant — `claude-opus-4-7-max` / `gpt-5.5-xhigh` / `claude-sonnet-4-7-thinking` etc. cap at 5 calls per week per account, so 31 accounts × 5 ≈ 150 calls hit the wall fast. Switch to `claude-sonnet-4.6` / `claude-haiku-4.5` (daily quotas are much wider). Verify with `docker logs windsurfapi-windsurf-api-1 | grep rate_limit` — the per-account cooldown reason is in the log.
+A: Likely the model is a weekly-quota variant — `claude-opus-4-7-max` / `gpt-5.5-xhigh` / `claude-opus-4-8-xhigh` etc. cap at 5 calls per week per account, so 31 accounts × 5 ≈ 150 calls hit the wall fast. Switch to `claude-sonnet-4.6` / `claude-haiku-4.5` (daily quotas are much wider). Verify with `docker logs windsurfapi-windsurf-api-1 | grep rate_limit` — the per-account cooldown reason is in the log.
 
 **Q: "All accounts temporarily rate-limited" / IP-level cooldown — is the proxy broken?**
 A: Usually not. Windsurf's upstream applies cooldowns to dense bursts from the same egress IP + same model, so accounts sharing one egress IP get limited together. WindsurfAPI stops burning accounts and returns `429 + Retry-After`; since v2.0.140 the wait time reflects the upstream's real value (e.g. `Resets in: 27m12s`) instead of a fixed 30-second hint. The fixes are lowering concurrency, switching to gentler models, binding accounts to different egress IPs, or waiting for the upstream cooldown to expire.
@@ -602,11 +691,11 @@ Huge thanks to the following folks who sent pull requests or systematically audi
 - [@forrinzhao](https://github.com/forrinzhao) — [PR #219](https://github.com/dwgx/WindsurfAPI/pull/219)
   Traced the Devin content-policy block that killed every request from a Feishu codex bot to one sentence in codex's `apply_patch` tool description: `FREEFORM tool, so do not wrap the patch in JSON.` Live-bisected 7/7 deterministic, with the decisive two-fragment A/B — rewriting only one fragment still blocks, both must change. The finding exposed a deeper structural gap: the tool-description preamble is injected *after* `neutralizeClientIdentity`, so any trigger phrase arriving via a tool description bypassed the entire a1-a6 defense line on the native path. The landed fix moves neutralization after preamble injection and adds the two rewrites as rule `(a7)` in the existing sequence (reusing the main switch and test harness), so it now covers every client and every trigger. Also adopted his `responses.js` fix: Codex sends bare `{role, content}` input items without `type:'message'`, which were silently dropped and left upstream with an empty messages array → UPSTREAM_INTERNAL.
 - [@warelik](https://github.com/warelik) — [PR #224](https://github.com/dwgx/WindsurfAPI/pull/224) [#225](https://github.com/dwgx/WindsurfAPI/pull/225) [#226](https://github.com/dwgx/WindsurfAPI/pull/226) [#227](https://github.com/dwgx/WindsurfAPI/pull/227) [#228](https://github.com/dwgx/WindsurfAPI/pull/228) [#229](https://github.com/dwgx/WindsurfAPI/pull/229)
-  Six PRs in one round, across the account pool, rate limiting, identity neutralization, and protocol conformance. The 429 reset-window bug was two links of one chain: the upstream's 3h reset window was dropped in transport (both error paths destructured only `{code, message}`), and a model-scoped cooldown is structurally invisible to pool selection via `getApiKey(modelKey=null)` — fixing either alone has no observable effect, so a just-429'd account got re-picked within seconds and hammered upstream into a hard lockout (#224). Client disconnects are no longer treated as account faults: abort is now recognized uniformly (undici and AbortController disagree on shape), and no exit path penalizes the error budget, burns quota on failover, or writes to a dead socket (#225). Grok CLI's `You are Grok … released by xAI` self-ID trips the content policy — added to the a1-a5 rule family, plus whole-block stripping of `<executing_actions_with_care>` (#227). Thinking blocks now omit `signature` instead of sending `""`, which strict clients reject (#228). Responses usage gained `input/output_tokens_details`, which pairs exactly with the DEVIN_CONNECT cache wire-tag calibration (#229). Also a 600-line zero-dependency pair-chain session-continuity module deriving a stable `session_id` from the conversation's own completed request/response pairs — opt-in, byte-identical when off (#226).
+  Six PRs in one round, across the account pool, rate limiting, identity neutralization, and protocol conformance. The 429 reset-window bug was two links of one chain: the upstream's 3h reset window was dropped in transport (both error paths destructured only `{code, message}`), and a model-scoped cooldown is structurally invisible to pool selection via `getApiKey(modelKey=null)` — fixing either alone has no observable effect, so a just-429'd account got re-picked within seconds and hammered upstream into a hard lockout (#224). Client disconnects are no longer treated as account faults: abort is now recognized uniformly (undici and AbortController disagree on shape), and no exit path penalizes the error budget, burns quota on failover, or writes to a dead socket (#225). Grok CLI's `You are Grok … released by xAI` self-ID trips the content policy — added to the a1-a5 rule family, plus whole-block stripping of `<executing_actions_with_care>` (#227). Thinking blocks now omit `signature` instead of sending `""`, which strict clients reject (#228). Responses usage gained `input/output_tokens_details`, which pairs exactly with the DEVIN_CONNECT cache wire-tag calibration (#229). Also a zero-dependency pair-chain session-continuity module (600 lines when it landed, 858 today) deriving a stable `session_id` from the conversation's own completed request/response pairs — opt-in, byte-identical when off (#226).
 - [@warelik](https://github.com/warelik) — [PR #216](https://github.com/dwgx/WindsurfAPI/pull/216) + [PR #215](https://github.com/dwgx/WindsurfAPI/pull/215)
   Neutralized the upstream MCP-gate: server.codeium.com fingerprints tool descriptions and rejected 8 of Cursor's 21 tools with permission_denied. The fix replaces the native #10 ToolDef top-level description with the tool name and recursively strips `description` annotations from the parameter schema (preserving structure and parameters literally named `description`), then injects a description-only preamble into the system prompt to restore tool-selection context — 21/21 tools pass (#216). Also fixed Node 20+ IPv6 Happy Eyeballs ETIMEDOUT by disabling autoSelectFamily and switching local HTTP/2 to 127.0.0.1 (#215).
 
-Want to be on this list? Open an [issue](https://github.com/dwgx/WindsurfAPI/issues) or a [pull request](https://github.com/dwgx/WindsurfAPI/pulls). The dashboard's Credits panel on the left is the **fuller** list: it renders from `contributors.json` — currently 27 contributors across 53 entries, each with a weight tier and a mechanism note — while the list above is a hand-picked subset of it.
+Want to be on this list? Open an [issue](https://github.com/dwgx/WindsurfAPI/issues) or a [pull request](https://github.com/dwgx/WindsurfAPI/pulls). The dashboard's Credits panel on the left is the **fuller** list: it renders from `contributors.json` — currently 36 contributors across 68 entries, each with a weight tier and a mechanism note — while the list above is a hand-picked subset of it.
 
 ## License
 
@@ -614,7 +703,7 @@ MIT License. See [LICENSE](LICENSE).
 
 ## Release and Secret Boundary
 
-Release automation may publish Docker images and GitHub Releases. Keep tokens, API keys, cookies, and provider credentials out of issues, pull requests, logs, and committed config. If a report needs authentication details, share only redacted metadata and reproduction steps.
+Release automation may publish Docker images and GitHub Releases. The current release is **v3.141.592658**; the repository carries 228 git tags and 218 release-note files (2026-10-30). Every release from v3.10.0 attaches a `SHA256SUMS` manifest covering the four published assets (Windows exe/zip, macOS arm64 binary/zip) and signs the four assets and the manifest with **cosign keyless** signing (GitHub OIDC; no private key or signing secret in the repository). From v3.141.592657 the Docker image digest (`image-digest.txt`) and the source-OTA provenance statement (`release-attestation.json`) are also each signed with a `.sigstore.json` bundle. Each signed blob ships a single `.sigstore.json` bundle (signature, Fulcio certificate and Rekor inclusion proof in one file). The signature proves the bytes were produced by this repository's release workflow for a `v*` tag; it does not prove human review or a reproducible build, and anyone who can rewrite the repository/tag can re-sign. Verify before running a download: `node scripts/verify-release-assets.mjs <download-dir>` (requires cosign), or follow [docs/RELEASE-SIGNING.md](docs/RELEASE-SIGNING.md) to verify `SHA256SUMS.sigstore.json` with `cosign verify-blob` and then run `sha256sum -c SHA256SUMS` (`shasum -a 256 -c` on macOS; `Get-FileHash` on Windows). The manifest uses the flat asset names, so all files can sit in one directory; v3.9.53 recorded `dist-windows/` / `dist-macos/` paths, and releases before v3.10.0 are unsigned. The Docker image is signed by digest and its digest is published as `image-digest.txt`; the dashboard's Docker update resolves the tag through the daemon and refuses to pull or deploy unless it equals that signed digest. The git self-update path does not download binaries, but it verifies the release's `release-attestation.json` (tag→commit/tree and every asset's SHA-256, cosign-signed); `WINDSURFAPI_UPDATE_ATTESTATION=warn` is the default (missing material logs a warning), and `required` refuses. See docs/RELEASE-SIGNING.md for the trust boundary and the OTA checks. Keep tokens, API keys, cookies, and provider credentials out of issues, pull requests, logs, and committed config. If a report needs authentication details, share only redacted metadata and reproduction steps.
 
 ---
 

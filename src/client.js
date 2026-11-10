@@ -13,9 +13,12 @@ import { execSync } from 'child_process';
 import { dirname } from 'node:path';
 import { log } from './config.js';
 import { extractImages } from './image.js';
+import { bumpCascadeImage } from './cascade-image-metrics.js';
 import { closeSessionForPort, grpcFrame, grpcUnary, grpcStream } from './grpc.js';
 import { beginLsUse, endLsUse, getLsEntryByPort } from './langserver.js';
 import { CC_CONTENT_MARKERS } from './handlers/cc-compat.js';
+import { CascadeTurn, CASCADE_STEP_OVERLAP, cascadeTurnEnabled } from './cascade-turn.js';
+import { budgetExceededError, isBudgetExceededError } from './request-budget.js';
 import {
   buildRawGetChatMessageRequest, parseRawResponse,
   buildInitializePanelStateRequest,
@@ -40,7 +43,7 @@ const LS_SERVICE = '/exa.language_server_pb.LanguageServerService';
 // in windsurf-api.js (they were verified identical in the four-proto study).
 const SERVER_JWT_HOST = 'server.codeium.com';
 
-function acquireLsUseOrThrow(port) {
+export function acquireLsUseOrThrow(port) {
   const entry = beginLsUse(port);
   if (entry) return entry;
   if (!getLsEntryByPort(port)) return null;
@@ -52,10 +55,40 @@ function acquireLsUseOrThrow(port) {
   return (() => { throw err; })();
 }
 
+/**
+ * A detached claim that the registry no longer owns (its original request
+ * deadline ended, or a token-conditioned eviction removed it). The producer
+ * raises this after an awaited read and before the prefix replay; the handler
+ * treats it as a resume miss (fall back upstream) rather than a model error.
+ * `type` lets the failure tail classify it as a deadline, not an upstream bug.
+ */
+export function detachedClaimLostError(message = 'Detached claim is no longer owned (request deadline ended)') {
+  const err = new Error(message);
+  err.name = 'DetachedClaimLostError';
+  err.code = 'DETACHED_CLAIM_LOST';
+  err.type = 'upstream_deadline_exceeded';
+  err.detachedClaimLost = true;
+  return err;
+}
+
 export function isCascadeTransportError(err) {
   const msg = String(err?.message || err || '');
   const code = String(err?.code || '');
-  return /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed|panel state/i.test(msg)
+  // The Send retry loop synthesizes "Panel state lost N times after re-warm —
+  // likely an LS-level issue with very large payloads (...)" after
+  // MAX_PANEL_RETRIES. That failure is deterministic for the payload: another
+  // warmup, and another account, hit the same wall — rotating it as a
+  // transport stall burns the whole pool. Genuine panel-state transport errors
+  // come from the LS itself ("panel state not found", InitializeCascadePanelState
+  // failures) and keep matching below.
+  const terminalPanelLoss = /panel state lost .*after re-warm|very large payloads/i.test(msg);
+  const panelStateTransport = !terminalPanelLoss && /panel state/i.test(msg);
+  return /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed/i.test(msg)
+    || panelStateTransport
+    // GAP-3: the local LS's own gRPC timeouts are a transient stall — without
+    // this branch one hiccup surfaced as a hard failure instead of rotating
+    // to the next account like every other transport blip.
+    || /gRPC (?:unary|stream) timeout/i.test(msg)
     || /^(ECONNRESET|ERR_HTTP2)/i.test(code);
 }
 
@@ -255,6 +288,212 @@ function cascadeHistoryBudget(modelUid) {
   return normal;
 }
 
+// ── Replayed-history images (SendUserCascadeMessage field 6) ─────────────
+//
+// WIRE CAPABILITY (read from the builders in src/windsurf.js): the replayed
+// history is ONE text blob — field 2 TextOrScopeItem{text=1} — and images are a
+// FLAT, message-level repeated field: field 6 ImageData{base64_data=1,
+// mime_type=2}. There is no per-history-message image slot, so the wire cannot
+// attribute an image to a turn; what it CAN do is carry every image on the same
+// message. Before this, only the newest turn was extracted, so an image from
+// turn 1..n-1 reached the model as the literal placeholder
+// "[Image omitted from text history]" — silently, with no counter anywhere.
+//
+// Now every replayed turn is extracted with the SAME guards as the current turn
+// (extractImages → SSRF / size / mime / decode gates), its images are appended
+// to field 6 after the current turn's images, and the turn's text carries a
+// numbered marker per attached image so the model can tell them apart. The
+// addition is bounded (count + bytes) and prefers the most recent turns;
+// anything that does not fit is counted and logged as
+// `cascade_image_history_dropped`, never dropped silently.
+const CASCADE_HISTORY_IMAGES_ENV = 'CASCADE_MAX_HISTORY_IMAGES';
+const CASCADE_HISTORY_IMAGE_BYTES_ENV = 'CASCADE_MAX_HISTORY_IMAGE_BYTES';
+// 4 images × the 400 KB re-encode target (image.js IMAGE_MAX_BYTES): the same
+// order of magnitude as the text budget, and small enough that the LS panel
+// payload stays well clear of the ~30 KB ceiling class of failures.
+const DEFAULT_CASCADE_HISTORY_IMAGES = 4;
+const DEFAULT_CASCADE_HISTORY_IMAGE_BYTES = 1_600_000;
+
+// 0 is meaningful here (drop every historical image = the pre-fix behaviour,
+// still counted), so this is NOT positiveIntEnv.
+function nonNegativeIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === '') return fallback;
+  const n = Number(String(raw).trim());
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+function cascadeHistoryImageCaps() {
+  return {
+    maxImages: nonNegativeIntEnv(CASCADE_HISTORY_IMAGES_ENV, DEFAULT_CASCADE_HISTORY_IMAGES),
+    maxBytes: nonNegativeIntEnv(CASCADE_HISTORY_IMAGE_BYTES_ENV, DEFAULT_CASCADE_HISTORY_IMAGE_BYTES),
+  };
+}
+
+function countImageLikeBlocks(content) {
+  if (!Array.isArray(content)) return 0;
+  let n = 0;
+  for (const part of content) if (isImageLikeBlock(part)) n++;
+  return n;
+}
+
+/**
+ * Build the history suffix whose lines plus `openingText` fit `budgetBytes`.
+ *
+ * The budget is measured in the encoder's units: proto.js writes strings as
+ * UTF-8, so a CJK turn costs three bytes per UTF-16 code unit. Counting
+ * `line.length` let a history that "fit" 600 KB reach the wire at ~1.8 MB
+ * (3x). `openingText` is the system prompt prepended to the same prompt,
+ * counted with the same encoder. The guarantee covers the history lines and
+ * the system prompt; wrapper text added by the caller (conversation intro,
+ * latest turn, truncation note, image markers) is outside this budget.
+ *
+ * `bodyForTurn(i)` substitutes an image-aware body for a turn (undefined =
+ * plain `contentToString`). Entries are returned oldest-first so the caller can
+ * render them again with per-turn additions without redoing the truncation.
+ */
+function buildCascadeHistoryEntries(convo, budgetBytes, openingText = '', bodyForTurn = null) {
+  const entries = [];
+  let historyBytes = Buffer.byteLength(String(openingText ?? ''), 'utf8');
+  let firstIncluded = 0;
+  for (let i = convo.length - 2; i >= 0; i--) {
+    const m = convo[i];
+    const tag = m.role === 'user' ? 'human' : 'assistant';
+    const body = (bodyForTurn ? bodyForTurn(i) : undefined) ?? contentToString(m.content);
+    const lineBytes = Buffer.byteLength(`<${tag}>\n${escapeHistoryTag(body, tag)}\n</${tag}>`, 'utf8');
+    if (historyBytes + lineBytes > budgetBytes && entries.length > 0) {
+      log.info(`Cascade: trimmed history at turn ${i}/${convo.length} (${Math.round(historyBytes/1024)}KB kept, ${convo.length - 2 - i} turns dropped)`);
+      firstIncluded = i + 1;
+      break;
+    }
+    entries.unshift({ index: i, tag, body });
+    historyBytes += lineBytes;
+    firstIncluded = i;
+  }
+  return { entries, firstIncluded };
+}
+
+function renderCascadeHistoryLines(entries, bodyForEntry = null) {
+  return entries.map((entry) => {
+    const body = (bodyForEntry ? bodyForEntry(entry) : undefined) ?? entry.body;
+    return `<${entry.tag}>\n${escapeHistoryTag(body, entry.tag)}\n</${entry.tag}>`;
+  });
+}
+
+/**
+ * Emit the structured drop record. One line, stable key first, so an operator
+ * can grep `cascade_image_history_dropped` and see exactly how many attachments
+ * vanished, why, and that the wire (not the caller) is the limit.
+ */
+function reportCascadeImageHistoryDrops(stats, meta) {
+  const dropped = stats.droppedCap + stats.droppedBytes + stats.droppedTruncated + stats.droppedNoVision;
+  if (stats.attached) bumpCascadeImage('cascade_image_history_attached', stats.attached);
+  if (!dropped) return;
+  bumpCascadeImage('cascade_image_history_dropped', dropped);
+  log.warn(
+    `cascade_image_history_dropped count=${dropped}`
+    + ` (cap=${stats.droppedCap} bytes=${stats.droppedBytes} truncated=${stats.droppedTruncated} no_vision=${stats.droppedNoVision})`
+    + ` turns=${meta.turns} attached=${stats.attached}`
+    + ' — SendUserCascadeMessage carries images only as one flat message-level list (field 6),'
+    + ' so these could not be replayed with their turn',
+  );
+}
+
+/**
+ * Assemble the replayed multi-turn prompt AND the flat field-6 image list.
+ *
+ * Shared by the fresh path and the post-resume rebuild so the two cannot
+ * disagree about which images ride the wire (the GPT-08 lesson: two copies of
+ * "which turns fit" drifted and one of them stopped updating coverage).
+ *
+ * `allowHistoryImages` is the vision gate. `buildSendCascadeMessageRequest`
+ * forces DEFAULT planner mode (the mode whose builder comment says vision is
+ * enabled) only when `nativeMode` is on, or when images are attached AND no
+ * emulated tool preamble exists. With a `toolPreamble` present `forceDefault`
+ * is false no matter what `images` holds, so the planner stays NO_TOOL and an
+ * image attached there is not known to be rendered. Shipping bytes the model
+ * may never see is not worth it, so history images are not attached in that
+ * mode; they are counted as `no_vision` drops.
+ */
+async function buildCascadeMultiTurnPrompt(convo, { budgetBytes, openingText = '', allowHistoryImages = true } = {}) {
+  const caps = cascadeHistoryImageCaps();
+  const latest = convo[convo.length - 1];
+  const latestExtracted = await extractImages(latest?.content ?? '');
+  const images = [...latestExtracted.images];
+
+  const stats = { attached: 0, droppedCap: 0, droppedBytes: 0, droppedTruncated: 0, droppedNoVision: 0 };
+  const extractedByTurn = new Map(); // turn index -> { text, kept, omitted }
+  let keptCount = 0;
+  let keptBytes = 0;
+
+  // Pass 1 — newest first: decide which replayed turns contribute images.
+  // Extraction stops as soon as the caps are exhausted, so an old remote
+  // image_url is never fetched just to be thrown away.
+  for (let i = convo.length - 2; i >= 0; i--) {
+    const content = convo[i]?.content;
+    if (!Array.isArray(content) || !content.some(isImageLikeBlock)) continue;
+    if (!allowHistoryImages) {
+      stats.droppedNoVision += countImageLikeBlocks(content);
+      continue;
+    }
+    if (caps.maxImages === 0 || keptCount >= caps.maxImages || keptBytes >= caps.maxBytes) {
+      stats.droppedCap += countImageLikeBlocks(content);
+      continue;
+    }
+    const extracted = await extractImages(content);
+    // A turn whose image blocks produced nothing (guard rejection, failed
+    // fetch, unsupported mime) keeps its plain `contentToString` body: the
+    // placeholder stays in the text, and the guard already logged the reason.
+    if (!extracted.images.length) continue;
+    const kept = [];
+    for (const image of extracted.images) {
+      const bytes = image.base64_data.length;
+      if (kept.length >= caps.maxImages - keptCount || keptBytes + bytes > caps.maxBytes) {
+        stats.droppedBytes += 1;
+        continue;
+      }
+      kept.push(image);
+      keptBytes += bytes;
+    }
+    keptCount += kept.length;
+    extractedByTurn.set(i, { text: extracted.text, kept, omitted: extracted.images.length - kept.length });
+  }
+
+  // Pass 2 — the truncation measurement, unchanged: turn bodies without the
+  // markers (markers are wrapper text, like the intro and the truncation note).
+  const { entries, firstIncluded } = buildCascadeHistoryEntries(
+    convo, budgetBytes, openingText, (i) => extractedByTurn.get(i)?.text,
+  );
+
+  // Pass 3 — number the images that survived truncation, in chronological
+  // order, after the current turn's images (field 6 keeps insertion order, so
+  // marker #k is the k-th image the model sees).
+  const bodies = new Map();
+  for (const entry of entries) {
+    const extracted = extractedByTurn.get(entry.index);
+    if (!extracted) continue;
+    let body = extracted.text;
+    for (const image of extracted.kept) {
+      images.push(image);
+      stats.attached += 1;
+      body += `\n[Image #${images.length} attached to this request — from an earlier turn]`;
+    }
+    for (let n = 0; n < extracted.omitted; n++) body += '\n[Image omitted from text history]';
+    bodies.set(entry.index, body);
+  }
+  // Turns that were extracted but then truncated carry images that never reach
+  // the wire: count them, they are the silent case this whole path exists for.
+  for (const [index, extracted] of extractedByTurn) {
+    if (bodies.has(index)) continue;
+    stats.droppedTruncated += extracted.kept.length + extracted.omitted;
+  }
+
+  const lines = renderCascadeHistoryLines(entries, (entry) => bodies.get(entry.index));
+  const text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${latestExtracted.text}\n</human>`;
+  reportCascadeImageHistoryDrops(stats, { turns: convo.length });
+  return { text, images, firstIncluded };
+}
+
 const CASCADE_TIMEOUTS = {
   // Absolute upper bound. The real "is the cascade alive" gate is
   // warmStallMs (45s of no progress → exit). 180s used to be the cap and
@@ -299,6 +538,97 @@ const CASCADE_TIMEOUTS = {
 
 export function shouldColdStall({ elapsed, coldStallMs, sawActive, sawText, totalThinking, toolCallCount }) {
   return elapsed > coldStallMs && sawActive && !sawText && (totalThinking || 0) === 0 && (toolCallCount || 0) === 0;
+}
+
+// A06/KH-018: Cascade's polling loop has terminal reasons that are NOT a
+// normal completion. Before this, `max_wait` (poll window expired while the
+// model was still generating) and `stall_warm` (the loop gave up on a warm
+// stall and "accepted partial") returned their chunks as if the turn had
+// ended, and `idle_empty` returned an empty turn. Chat then wrote
+// finish_reason:"stop" and Responses stored the half answer as completed —
+// the interruption was invisible to every surface.
+//
+// This classifier is the single source of truth for "did this poll loop
+// actually finish the turn?". `idle_done` and `native_tool_call` are the only
+// successful exits. A non-success exit that still delivered output (a
+// poll-window/stall stop, or an `idle_empty` whose final sweep carried the
+// answer) is a truncation (Chat can report `length`); an exit with no output
+// at all is an upstream error, never a successful empty completion.
+export function classifyCascadeEnd(endReason, { totalYielded = 0, totalThinking = 0, toolCallCount = 0 } = {}) {
+  if (endReason == null) return { ok: true, kind: 'legacy', truncated: false };
+  if (endReason === 'idle_done' || endReason === 'native_tool_call') {
+    return { ok: true, kind: 'done', truncated: false };
+  }
+  const hasOutput = (totalYielded || 0) > 0 || (totalThinking || 0) > 0 || (toolCallCount || 0) > 0;
+  if (endReason === 'idle_empty') {
+    // F2: `idle_empty` means "the loop never observed text", not "nothing was
+    // delivered". The final IDLE sweep can emit the whole answer after the
+    // last poll, and a producer that reports this reason while carrying bytes
+    // must not turn a delivered answer into a 502. Honour `hasOutput` exactly
+    // like the `max_wait` arm: keep the bytes, type the turn as truncated.
+    if (hasOutput) {
+      return {
+        ok: false,
+        kind: 'truncated',
+        truncated: true,
+        status: 200,
+        type: 'upstream_truncated',
+        code: 'CASCADE_TRUNCATED',
+        message: 'Cascade ended without a confirmed text terminal; the answer is truncated',
+      };
+    }
+    return {
+      ok: false,
+      kind: 'empty',
+      truncated: false,
+      status: 502,
+      type: 'upstream_empty_response',
+      code: 'EMPTY_RESPONSE',
+      message: 'Cascade returned no text and no tool call',
+    };
+  }
+  if (endReason === 'max_wait') {
+    if (!hasOutput) {
+      return {
+        ok: false,
+        kind: 'empty',
+        truncated: false,
+        status: 504,
+        type: 'upstream_deadline_exceeded',
+        code: 'windsurf_provider_deadline',
+        message: 'Cascade produced no output before its poll window expired',
+      };
+    }
+    return {
+      ok: false,
+      kind: 'truncated',
+      truncated: true,
+      status: 200,
+      type: 'upstream_truncated',
+      code: 'CASCADE_TRUNCATED',
+      message: 'Cascade exceeded its poll window before completing; the answer is truncated',
+    };
+  }
+  if (endReason === 'stall_warm') {
+    return {
+      ok: false,
+      kind: 'truncated',
+      truncated: true,
+      status: 200,
+      type: 'upstream_truncated',
+      code: 'CASCADE_TRUNCATED',
+      message: 'Cascade stalled after partial output; the answer is truncated',
+    };
+  }
+  return {
+    ok: false,
+    kind: 'incomplete',
+    truncated: false,
+    status: 502,
+    type: 'upstream_error',
+    code: 'CASCADE_INCOMPLETE',
+    message: `Cascade ended without a terminal signal (${endReason})`,
+  };
 }
 
 function isCompletedReadUrlNativeResult(tc) {
@@ -467,12 +797,12 @@ export class WindsurfClient {
    * @param {Array} messages - OpenAI-format messages
    * @param {number} modelEnum - Model enum value
    * @param {string} [modelName] - Optional model name
-   * @param {object} opts - { onChunk, onEnd, onError }
+   * @param {object} opts - { onChunk, onEnd, onError, signal }
    */
   async rawGetChatMessage(messages, modelEnum, modelName, opts = {}) {
     acquireLsUseOrThrow(this.port);
     try {
-      const { onChunk, onEnd, onError } = opts;
+      const { onChunk, onEnd, onError, signal } = opts;
       // Reuse the LS-scoped session_id instead of letting buildMetadata
       // mint a fresh UUID on every call. A stable session per LS matches
       // what a real Windsurf IDE instance sends (one session for the whole
@@ -536,6 +866,9 @@ export class WindsurfClient {
             onError?.(err);
             reject(err);
           },
+          // GAP-2: caller cancellation. grpcStream closes the HTTP/2 stream
+          // with NGHTTP2_CANCEL and rejects with an AbortError.
+          signal,
         });
       }).finally(() => endLsUse(this.port));
     } catch (err) {
@@ -636,8 +969,17 @@ export class WindsurfClient {
    */
   async cascadeChat(messages, modelEnum, modelUid, opts = {}) {
     let onChunk, onEnd, onError, signal, reuseEntry, toolPreamble, displayModel, nativeEnvironment;
-    let nativeMode, nativeAllowlist, additionalSteps;
-    acquireLsUseOrThrow(this.port);
+    let nativeMode, nativeAllowlist, additionalSteps, additionalStepsFrom, requestMaxWaitMs;
+    let resumeTurn, leaseHeld, detach, accountId, modelKey, lsGeneration, completion;
+    // Lease seam. The handler owns the lease for a resumed request (it
+    // acquired it before claim), so the producer must release exactly that
+    // hold and never take a second one. Production defaults are the module
+    // helpers; the injection exists so a test can observe the count.
+    const acquireLease = opts.acquireLease || acquireLsUseOrThrow;
+    const releaseLease = opts.releaseLease || endLsUse;
+    // Assigned inside the poll setup. Declared here so the abort catch can
+    // re-detach when the client dies during the prefix replay (F22).
+    let tryDetach = () => null;
     try {
     ({
       onChunk, onEnd, onError, signal, reuseEntry, toolPreamble, displayModel, nativeEnvironment,
@@ -647,17 +989,103 @@ export class WindsurfClient {
       // carries fake "completed" trajectory steps for the caller's prior
       // tool turns so the planner reasons from post-tool state.
       nativeMode, nativeAllowlist, additionalSteps,
+      // D3/V-13: index of the newest pending tool round inside `additionalSteps`.
+      // Only a trajectory that already holds the earlier rounds may send from
+      // here; a fresh start (including a fresh restart after a dead resume) must
+      // carry the whole list, or the planner loses every earlier observation.
+      additionalStepsFrom,
+      // Route-owned request budget: an upper bound on this turn's poll window.
+      // The caller passes what the request has left; it can only shorten the
+      // configured CASCADE_MAX_WAIT_MS, never extend it.
+      maxWaitMs: requestMaxWaitMs,
+      // Detach P1: resume a frozen turn instead of starting one, and the
+      // handler-supplied admission handle the producer calls on a client-gone
+      // abort. The producer never imports the registry.
+      resumeTurn, leaseHeld, detach,
+      // Billing/pin identity. The producer only forwards these; the handler
+      // owns the account and the registry policy.
+      accountId, modelKey, lsGeneration,
+      // V-14: the caller's completion controls. The Cascade wire exposes one —
+      // max_output_tokens (planner config field 6) — so `maxTokens` is the only
+      // key this producer forwards; the handler has already rejected the rest.
+      completion,
     } = opts);
+    // `leaseHeld` is set by the resume path: the handler already acquired the
+    // LS lease for this request, so the producer must not take a second hold.
+    // Correctness then depends on one owner and one release (the finally
+    // below), not on every handler exit path remembering to end a duplicate.
+    if (!leaseHeld) acquireLease(this.port);
     const aborted = () => signal?.aborted;
     const inputChars = messages.reduce((n, m) => n + contentToString(m?.content).length, 0);
 
-    log.debug(`CascadeChat: uid=${modelUid} enum=${modelEnum} msgs=${messages.length} reuse=${!!reuseEntry}`);
+    log.debug(`CascadeChat: uid=${modelUid} enum=${modelEnum} msgs=${messages.length} reuse=${!!reuseEntry}${resumeTurn ? ' resume=1' : ''}`);
+
+    // F3: ONE absolute turn deadline, captured before any work. Warmup,
+    // StartCascade, every Send (and its re-warm), the poll loop and detach
+    // admission all spend from this clock. Spending the route's remaining
+    // time on the send phase and then giving the poll loop a fresh remainder
+    // made a 100 ms budget take 310 ms behind a 250 ms Send (audit2 F3).
+    const turnStart = Date.now();
+    const turnBudgetMs = Number.isFinite(requestMaxWaitMs) && requestMaxWaitMs >= 0
+      ? Math.min(CASCADE_TIMEOUTS.maxWaitMs, requestMaxWaitMs)
+      : CASCADE_TIMEOUTS.maxWaitMs;
+    const remainingBudgetMs = () => Math.max(0, turnBudgetMs - (Date.now() - turnStart));
+    // A spent deadline is the route's own failure, not an upstream/transport
+    // one: this type maps to 504 on every egress and refuses retry.
+    const turnDeadlineError = (detail, cause) => budgetExceededError(
+      detail || `request budget exhausted (${turnBudgetMs}ms) before the Cascade turn finished`,
+      cause ? { cause } : {},
+    );
+    // Per-RPC bound: the RPC's own ceiling or what the turn has left, never 0.
+    const budgetTimeout = (ceilingMs) => Math.max(1, Math.min(ceilingMs, remainingBudgetMs()));
+    const assertBudget = (label) => {
+      if (remainingBudgetMs() <= 0) {
+        throw turnDeadlineError(`request budget exhausted before ${label} (${turnBudgetMs}ms)`);
+      }
+    };
+    // A budget-bounded phase timer can fire on the last wall-clock millisecond:
+    // Date.now() truncates both endpoints, so `remainingBudgetMs()` may still
+    // read 1-2 ms when the timer that consumed the budget rejects. Treat that
+    // final tick as spent — no retry can fit inside it, and reporting a
+    // transport error would rotate accounts for a deadline this turn caused
+    // itself (B06 CI: a 120 ms StartCascade test ended at 120.24 ms with
+    // "gRPC unary timeout" instead of the budget stop).
+    const DEADLINE_TOLERANCE_MS = 5;
+    // Once the clock is spent, a phase failure is the route deadline, not an
+    // upstream/panel fault: throw the budget stop instead of retrying.
+    const throwIfSpent = (err, phase) => {
+      if (remainingBudgetMs() > DEADLINE_TOLERANCE_MS) return;
+      throw isBudgetExceededError(err) ? err : turnDeadlineError(
+        `request budget exhausted during ${phase} (${turnBudgetMs}ms)`, err,
+      );
+    };
+    // Awaits a shared promise (the per-LS workspace init is shared and cannot
+    // be cancelled) under the turn deadline; the work keeps running for its
+    // owner, this turn stops spending time on it.
+    const awaitWithinBudget = (promise, label) => {
+      const left = remainingBudgetMs();
+      if (left <= 0) return Promise.reject(turnDeadlineError(`request budget exhausted before ${label} (${turnBudgetMs}ms)`));
+      return new Promise((resolve, reject) => {
+        // Deliberately NOT unref'd: while this await is the only pending work,
+        // the timer is what makes the deadline real.
+        const timer = setTimeout(
+          () => reject(turnDeadlineError(`${label} exceeded the ${turnBudgetMs}ms request budget`)),
+          left,
+        );
+        Promise.resolve(promise).then(
+          (value) => { clearTimeout(timer); resolve(value); },
+          (err) => { clearTimeout(timer); reject(err); },
+        );
+      });
+    };
 
     // One-shot per-LS workspace init (idempotent; typically pre-warmed at
     // LS startup). Falls back to a local session id if the LS entry is gone.
+    // A resume never re-runs the handshake: the cascade and its panel already
+    // exist upstream, and a warmup failure must not lose the turn.
     const lsEntry = getLsEntryByPort(this.port);
-    await this.warmupCascade();
-    let sessionId = reuseEntry?.sessionId || lsEntry?.sessionId || randomUUID();
+    if (!resumeTurn) await awaitWithinBudget(this.warmupCascade(), 'Cascade workspace warmup');
+    let sessionId = resumeTurn?.sessionId || reuseEntry?.sessionId || lsEntry?.sessionId || randomUUID();
 
     // "panel state not found" means the LS forgot the panel for our sessionId
     // (LS restarted, TTL expired, etc.). Re-run warmupCascade with a fresh
@@ -676,16 +1104,46 @@ export class WindsurfClient {
     // UpdateWorkspaceTrust) and reopen the cascade.
     const isUntrustedWorkspace = (e) => /untrusted workspace|workspace.*not.*trusted/i.test(e?.message || '');
 
-      // Step 1: Start cascade — with retry on panel-state-not-found
+      // Detach P1 resume: the cascade and its user message already exist
+      // upstream. A resume must NOT call StartCascade or SendUserCascadeMessage
+      // (a second Send would execute the turn twice and double-bill), so the
+      // whole open/send/history block is skipped and the cursors come from the
+      // snapshot. `generatorOffset` is the offset the ORIGINAL turn started
+      // from; the metadata RPC at the end is offset-scoped, and starting it at
+      // 0 would sum every prior turn of this cascade (over-bill).
       let cascadeId;
+      // D3/V-13: true only while THIS send continues an existing upstream
+      // trajectory. A reuse entry without a cascade_id, a panel-state re-warm and
+      // an expired-resume restart all start a NEW trajectory, which therefore
+      // needs the full mapped tool history again.
+      let resumedTrajectory = false;
+      let stepOffset = 0;
+      let generatorOffset = 0;
+      // D5: whether this turn's metadata window start is actually known. A
+      // resume whose stored offset is missing and whose re-read fails must not be
+      // treated as "starts at record 0".
+      let generatorOffsetKnown = true;
+      let text = '';
+      let images = [];
+      let historyCoverage = { droppedTurnCount: 0, firstIncludedTurnIndex: 0, totalTurns: 0 };
+      if (resumeTurn) {
+        cascadeId = resumeTurn.cascadeId;
+        stepOffset = resumeTurn.snapshot.stepOffset;
+        generatorOffset = resumeTurn.snapshot.generatorOffset;
+      } else {
+
+      // Step 1: Start cascade — with retry on panel-state-not-found
       const openCascade = async () => {
         if (reuseEntry?.cascadeId) {
           log.debug(`Cascade resumed: ${reuseEntry.cascadeId}`);
+          resumedTrajectory = true;
           return reuseEntry.cascadeId;
         }
+        assertBudget('Cascade StartCascade');
         const startProto = buildStartCascadeRequest(this.apiKey, sessionId);
         const startResp = await grpcUnary(
-          this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto)
+          this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto),
+          budgetTimeout(30_000)
         );
         const id = parseStartCascadeResponse(startResp);
         if (!id) throw new Error('StartCascade returned empty cascade_id');
@@ -695,9 +1153,11 @@ export class WindsurfClient {
       try {
         cascadeId = await openCascade();
       } catch (e) {
+        // F3: no time left means no recovery attempt either.
+        throwIfSpent(e, 'Cascade StartCascade');
         if (!isPanelMissing(e)) throw e;
         log.warn(`Panel state missing, re-warming LS port=${this.port}`);
-        await this.warmupCascade(true);
+        await awaitWithinBudget(this.warmupCascade(true), 'Cascade re-warm');
         sessionId = getLsEntryByPort(this.port)?.sessionId || randomUUID();
         reuseEntry = null; // cascade expired — treat as fresh
         cascadeId = await openCascade();
@@ -709,38 +1169,55 @@ export class WindsurfClient {
       // across turns (`alpha` -> `alphabeta` -> ...). Store absolute offsets in
       // the conversation pool and reuse them here; fall back to a one-shot
       // snapshot so entries created before this fix still resume safely.
-      let stepOffset = Number.isInteger(reuseEntry?.stepOffset) && reuseEntry.stepOffset >= 0
+      stepOffset = Number.isInteger(reuseEntry?.stepOffset) && reuseEntry.stepOffset >= 0
         ? reuseEntry.stepOffset
         : 0;
-      let generatorOffset = Number.isInteger(reuseEntry?.generatorOffset) && reuseEntry.generatorOffset >= 0
+      // D5/F6: a resumed turn's metadata window start must be KNOWN before it is
+      // used. A missing (or null, "unknown") stored offset is re-read from the
+      // cascade below; if that read fails, the window stays unknown and this turn
+      // abstains from aggregate usage instead of asking from record 0 and
+      // re-billing every earlier turn.
+      generatorOffset = Number.isInteger(reuseEntry?.generatorOffset) && reuseEntry.generatorOffset >= 0
         ? reuseEntry.generatorOffset
         : 0;
-      if (reuseEntry?.cascadeId && (!Number.isInteger(reuseEntry?.stepOffset) || !Number.isInteger(reuseEntry?.generatorOffset))) {
+      generatorOffsetKnown = !reuseEntry?.cascadeId
+        || (Number.isInteger(reuseEntry?.generatorOffset) && reuseEntry.generatorOffset >= 0);
+      if (reuseEntry?.cascadeId && (!Number.isInteger(reuseEntry?.stepOffset) || !generatorOffsetKnown)) {
         try {
           if (!Number.isInteger(reuseEntry?.stepOffset)) {
             const resumeStepsResp = await grpcUnary(
               this.port, this.csrfToken,
               `${LS_SERVICE}/GetCascadeTrajectorySteps`,
-              grpcFrame(buildGetTrajectoryStepsRequest(cascadeId, 0))
+              grpcFrame(buildGetTrajectoryStepsRequest(cascadeId, 0)),
+              budgetTimeout(30_000)
             );
             stepOffset = parseTrajectorySteps(resumeStepsResp).length;
           }
-          if (!Number.isInteger(reuseEntry?.generatorOffset)) {
+          if (!generatorOffsetKnown) {
             const resumeMetaResp = await grpcUnary(
               this.port, this.csrfToken,
               `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
               grpcFrame(buildGetGeneratorMetadataRequest(cascadeId, 0)),
-              5000
+              budgetTimeout(5_000)
             );
-            generatorOffset = parseGeneratorMetadata(resumeMetaResp)?.entryCount || 0;
+            // Only a real record count may seed the window. `?.entryCount || 0`
+            // turned "the RPC said nothing" into "start at record 0".
+            const resumeMeta = parseGeneratorMetadata(resumeMetaResp);
+            if (Number.isInteger(resumeMeta?.entryCount)) {
+              generatorOffset = resumeMeta.entryCount;
+              generatorOffsetKnown = true;
+            }
           }
         } catch (e) {
           log.warn(`Cascade resume snapshot failed: ${e.message}`);
         }
       }
+      if (reuseEntry?.cascadeId && !generatorOffsetKnown) {
+        log.warn('Cascade resume: generator-metadata window start unknown — this turn will report no aggregate usage instead of re-summing from record 0');
+      }
 
-      let text;
-      let images = [];
+      text = '';
+      images = [];
       const systemMsgs = messages.filter(m => m.role === 'system');
       const convo = messages.filter(m => m.role === 'user' || m.role === 'assistant');
       let sysText = systemMsgs.map(m => contentToString(m.content)).join('\n').trim();
@@ -774,31 +1251,13 @@ export class WindsurfClient {
       // expose how much of the trajectory it really represents. Resume
       // path doesn't replay history (cascade still has it), so coverage =
       // full input; fresh path may truncate large histories.
-      let historyCoverage = { droppedTurnCount: 0, firstIncludedTurnIndex: 0, totalTurns: convo.length };
+      historyCoverage = { droppedTurnCount: 0, firstIncludedTurnIndex: 0, totalTurns: convo.length };
       // GPT-08: one computation for "which turns fit the prompt", shared by the fresh
       // path and the post-resume-rebuild path. They used to disagree — the rebuild
       // truncated the same history without updating historyCoverage, so a request that
       // started as a resume reported full coverage while the wire carried a truncated
       // history. The prompt text is unchanged; only the bookkeeping is now common.
-      const buildHistoryLines = (budgetBytes, openingBytes) => {
-        const lines = [];
-        let historyBytes = openingBytes;
-        let firstIncluded = 0;
-        for (let i = convo.length - 2; i >= 0; i--) {
-          const m = convo[i];
-          const tag = m.role === 'user' ? 'human' : 'assistant';
-          const line = `<${tag}>\n${escapeHistoryTag(contentToString(m.content), tag)}\n</${tag}>`;
-          if (historyBytes + line.length > budgetBytes && lines.length > 0) {
-            log.info(`Cascade: trimmed history at turn ${i}/${convo.length} (${Math.round(historyBytes/1024)}KB kept, ${convo.length - 2 - i} turns dropped)`);
-            firstIncluded = i + 1;
-            break;
-          }
-          lines.unshift(line);
-          historyBytes += line.length;
-          firstIncluded = i;
-        }
-        return { lines, firstIncluded };
-      };
+      // Budget is UTF-8 bytes (what the wire encoder writes), not UTF-16 units.
       if (isResume || convo.length <= 1) {
         const last = convo[convo.length - 1];
         const extracted = await extractImages(last?.content ?? '');
@@ -807,19 +1266,28 @@ export class WindsurfClient {
         if (!isResume && sysText) text = sysText + '\n\n' + text;
       } else {
         const maxHistoryBytes = cascadeHistoryBudget(modelUid);
-        const { lines, firstIncluded } = buildHistoryLines(maxHistoryBytes, sysText ? sysText.length : 0);
+        // Vision gate: Cascade only renders field 6 in DEFAULT planner mode,
+        // which buildSendCascadeMessageRequest picks for native mode or for
+        // "images and no emulated tool preamble". In NO_TOOL mode (toolPreamble
+        // present, no native bridge) the historical images would be bytes the
+        // model never sees, so they are counted as no_vision drops instead.
+        const allowHistoryImages = !!nativeMode || !toolPreamble;
+        const built = await buildCascadeMultiTurnPrompt(convo, {
+          budgetBytes: maxHistoryBytes,
+          openingText: sysText,
+          allowHistoryImages,
+        });
+        const { firstIncluded } = built;
         historyCoverage = {
           droppedTurnCount: firstIncluded,
           firstIncludedTurnIndex: firstIncluded,
           totalTurns: convo.length,
         };
-        const latest = convo[convo.length - 1];
-        const extracted = await extractImages(latest?.content ?? '');
-        text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${extracted.text}\n</human>`;
+        text = built.text;
         if (firstIncluded > 0) {
           text = `<truncation_note>The conversation above is truncated — ${firstIncluded} earlier turns were dropped due to length limits. The user's original task and the most recent tool results are preserved. Do NOT ask the user to repeat their task; continue from the latest context.</truncation_note>\n\n` + text;
         }
-        images = extracted.images;
+        images = built.images;
         if (sysText) text = sysText + '\n\n' + text;
       }
       if (images.length) log.info(`Cascade: attaching ${images.length} image(s) to field 6`);
@@ -831,6 +1299,20 @@ export class WindsurfClient {
       // single retry isn't enough there. Each retry does a full warmup
       // (fresh sessionId + panel init) + fresh StartCascade, with a
       // small backoff to let the LS settle.
+      // D3/V-13: the delta is a property of the SEND, not of the request. A
+      // resumed trajectory already holds the earlier rounds, so only the newest
+      // pending round may ride; a fresh one (first turn, or the restart after a
+      // dead resume) must carry every observed round or the planner reasons from
+      // tool results it cannot see. Evaluated on each attempt so the recovery
+      // retry sends the full list.
+      const effectiveAdditionalSteps = () => {
+        if (!Array.isArray(additionalSteps) || additionalSteps.length === 0) return null;
+        if (!resumedTrajectory) return additionalSteps;
+        const from = Number.isInteger(additionalStepsFrom) && additionalStepsFrom >= 0
+          ? additionalStepsFrom
+          : 0;
+        return additionalSteps.slice(from);
+      };
       const sendMessage = async () => {
         // Same best-effort JWT as the legacy channel (env-gated, default OFF);
         // a mint failure must not fail the cascade message.
@@ -840,10 +1322,12 @@ export class WindsurfClient {
           nativeMode: !!nativeMode,
           nativeAllowlist: nativeAllowlist || null,
           nativeEnvironment: nativeEnvironment || '',
-          additionalSteps: additionalSteps || null,
+          additionalSteps: effectiveAdditionalSteps(),
+          maxOutputTokens: completion?.maxTokens,
         }, userJwt);
         await grpcUnary(
-          this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, grpcFrame(sendProto)
+          this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, grpcFrame(sendProto),
+          budgetTimeout(30_000)
         );
       };
       const MAX_PANEL_RETRIES = 3;
@@ -853,15 +1337,21 @@ export class WindsurfClient {
         // number. Fresh includes system-prompt overhead while this historical rebuild
         // path starts at zero; preserve those existing budgets and report each
         // actual suffix rather than promising identical counts for every input.
-        const { lines, firstIncluded } = buildHistoryLines(cascadeHistoryBudget(modelUid), 0);
+        // Images go through the SAME builder as the fresh path — a rebuilt
+        // history must carry exactly what a fresh one would (the GPT-08 lesson).
+        const allowHistoryImages = !!nativeMode || !toolPreamble;
+        const built = await buildCascadeMultiTurnPrompt(convo, {
+          budgetBytes: cascadeHistoryBudget(modelUid),
+          allowHistoryImages,
+        });
+        const { firstIncluded } = built;
         historyCoverage = {
           droppedTurnCount: firstIncluded,
           firstIncludedTurnIndex: firstIncluded,
           totalTurns: convo.length,
         };
-        const latest = convo[convo.length - 1];
-        const extracted = await extractImages(latest?.content ?? '');
-        text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${extracted.text}\n</human>`;
+        text = built.text;
+        images = built.images;
         if (sysText) text = sysText + '\n\n' + text;
         log.info('Cascade: rebuilt full history after resume failure');
       };
@@ -869,10 +1359,16 @@ export class WindsurfClient {
       let historyRebuilt = false;
       let cascadeExpiredOnce = false;
       while (true) {
+        // F3: no Send attempt starts on a spent budget — including a recovery
+        // retry that would re-open a cascade the route cannot wait for.
+        assertBudget('Cascade SendUserCascadeMessage');
         try {
           await sendMessage();
           break;
         } catch (e) {
+          // The Send was bounded by what the turn had left: once that is gone
+          // the failure is the route deadline, not a panel/transport fault.
+          throwIfSpent(e, 'Cascade SendUserCascadeMessage');
           const expired = isExpiredCascade(e);
           const untrusted = isUntrustedWorkspace(e);
           if (!isPanelMissing(e) && !expired && !untrusted) throw e;
@@ -903,23 +1399,35 @@ export class WindsurfClient {
             historyRebuilt = true;
           }
           try {
-            await this.warmupCascade(true);
+            await awaitWithinBudget(this.warmupCascade(true), 'Cascade re-warm');
           } catch (err) {
             if (isCascadeTransportError(err)) throw err;
             log.warn(`warmupCascade failed: ${err.message}`);
           }
-          // Small backoff — LS panel state sometimes needs a moment after Init
-          if (panelRetry > 1) await new Promise(r => setTimeout(r, 250 * panelRetry));
+          // Small backoff — LS panel state sometimes needs a moment after Init.
+          // Never sleep past the deadline: the retry would be refused anyway.
+          if (panelRetry > 1) {
+            await new Promise(r => setTimeout(r, Math.max(0, Math.min(250 * panelRetry, remainingBudgetMs()))));
+          }
+          assertBudget('Cascade recovery StartCascade');
           sessionId = getLsEntryByPort(this.port)?.sessionId || randomUUID();
           const startProto = buildStartCascadeRequest(this.apiKey, sessionId);
-          const startResp = await grpcUnary(
-            this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto)
-          );
+          let startResp;
+          try {
+            startResp = await grpcUnary(
+              this.port, this.csrfToken, `${LS_SERVICE}/StartCascade`, grpcFrame(startProto),
+              budgetTimeout(30_000)
+            );
+          } catch (e) {
+            throwIfSpent(e, 'Cascade recovery StartCascade');
+            throw e;
+          }
           cascadeId = parseStartCascadeResponse(startResp);
           if (!cascadeId) throw new Error('StartCascade returned empty cascade_id after re-warm');
           // This is now a fresh cascade carrying full rebuilt history, not a
           // continuation of the expired trajectory. Poll from the beginning.
           reuseEntry = null;
+          resumedTrajectory = false;
           stepOffset = 0;
           generatorOffset = 0;
         }
@@ -927,6 +1435,7 @@ export class WindsurfClient {
       // Surface the recovery to the caller so chat.js can skip restoring the
       // dead reuse entry to the pool on later success/failure paths.
       if (cascadeExpiredOnce) this._lastReuseInvalidated = true;
+      } // end !resumeTurn
 
       // Step 3: Poll for response.
       // Track per-step text cursors instead of a single global `lastYielded`.
@@ -942,43 +1451,241 @@ export class WindsurfClient {
       // Each value is the latest {inputTokens, outputTokens, cacheReadTokens,
       // cacheWriteTokens} observed on that step's CortexStepMetadata.model_usage.
       // Summed across all steps at return time → the response's real usage.
-      const usageByStep = new Map();
+      // On a resume the restored turn owns the map (snapshot.usageByStep), so
+      // the fallback keeps the pre-detach usage instead of starting empty.
+      let usageByStep;
       const seenToolCallIds = new Set();
       const toolCalls = [];
       const approvedReadUrlInteractions = new Set();
       let cascadeTrajectoryId = '';
-      let totalYielded = 0;
-      let totalThinking = 0;
+      let totalYielded = resumeTurn ? (Number(resumeTurn.snapshot.totalYielded) || 0) : 0;
+      let totalThinking = resumeTurn ? (Number(resumeTurn.snapshot.totalThinking) || 0) : 0;
       let idleCount = 0;
       let pollCount = 0;
-      let sawActive = false;   // true once we've seen a non-IDLE status
-      let sawText = false;     // true once at least one PLANNER_RESPONSE with text arrived
+      // A resumed turn that was already ACTIVE must not spend another
+      // IDLE_GRACE_MS waiting: the grace only applies before the trajectory
+      // was ever non-IDLE.
+      let sawActive = resumeTurn ? !!resumeTurn.snapshot.sawActive : false;
+      let sawText = resumeTurn ? !!resumeTurn.snapshot.sawText : false;
       let lastStatus = -1;
       // "Progress" is ANY forward motion on the trajectory — text, thinking,
       // new tool call, or a new step appearing. Using this (instead of text
       // alone) for stall detection fixes the false-positive warm stalls where
       // Cascade is legitimately mid-thinking but `responseText` hasn't moved.
       let lastGrowthAt = Date.now();
-      let lastStepCount = 0;
-      const { maxWaitMs: maxWait, pollIntervalMs: pollInterval, idleGraceMs: IDLE_GRACE_MS, warmStallMs: NO_GROWTH_STALL_MS, stallRetryMinText: STALL_RETRY_MIN_TEXT } = CASCADE_TIMEOUTS;
+      const { pollIntervalMs: pollInterval, idleGraceMs: IDLE_GRACE_MS, warmStallMs: NO_GROWTH_STALL_MS, stallRetryMinText: STALL_RETRY_MIN_TEXT } = CASCADE_TIMEOUTS;
+      // F3: the poll window is what is LEFT of the one turn deadline — not a
+      // fresh copy of the route budget. Warmup + StartCascade + Send already
+      // spent part of it, so a 100 ms route that took 90 ms to send polls for
+      // 10 ms, not another 100 ms. `startTime` stays the poll-phase start
+      // because the idle grace and the cold-stall clock are measured from the
+      // moment polling began.
       const startTime = Date.now();
+      const maxWait = Math.max(0, turnStart + turnBudgetMs - startTime);
       let endReason = 'unknown';
       const nativeBridgePollAfterTool = nativeMode && process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_POLL_AFTER_TOOL === '1';
       let nativeBridgePollAfterToolLogged = false;
       let approvalError = null;
+      // Absolute offset this turn started polling from: the overlap window
+      // never reaches behind it, so a resumed cascade cannot replay pre-turn
+      // steps as fresh output. On a resume this is the ORIGINAL turn's floor
+      // (snapshot.pollFloor), not the unread offset: clamping to stepOffset
+      // would hide growth inside already-counted steps (Q10 E2b).
+      const pollFloor = resumeTurn ? resumeTurn.snapshot.pollFloor : stepOffset;
+      let lastStepCount = stepOffset;
+      // Window start of the most recent poll. The final IDLE sweep re-reads
+      // the same bounded window for modifiedText polish.
+      let lastWindowStart = stepOffset;
+      // Q10 P1: the producer-level turn is opt-in. When the flag is off the
+      // loop below is the pre-existing inline implementation, byte-for-byte;
+      // when it is on, the same window/cursor work runs through CascadeTurn
+      // so a detach can snapshot one object instead of scavenging locals.
+      // A resume ALWAYS restores the turn (that is the snapshot), regardless
+      // of the producer flag: the flag gates producing new snapshots, not
+      // consuming one that was admitted under it.
+      let turn = null;
+      if (resumeTurn) {
+        turn = CascadeTurn.fromSnapshot(resumeTurn.snapshot, { emit: chunk => onChunk?.(chunk) });
+        usageByStep = turn.usageByStep;
+        lastWindowStart = Number.isInteger(turn.lastWindowStart) ? turn.lastWindowStart : lastWindowStart;
+        sawActive = !!turn.sawActive;
+        sawText = !!turn.sawText;
+      } else if (cascadeTurnEnabled()) {
+        usageByStep = new Map();
+        turn = new CascadeTurn({
+          cascadeId,
+          stepOffset,
+          pollFloor,
+          chunks,
+          emit: chunk => onChunk?.(chunk),
+          generatorOffset,
+          usageByStep,
+        });
+      } else {
+        usageByStep = new Map();
+      }
+      let resumeFirstReadPending = !!resumeTurn;
+      // Detach is a producer decision, but the handler owns the key, tenancy,
+      // cause, and the delivered-tool-call ledger. `admit` is called at most
+      // once per turn, only while the client is gone, and only for a turn P1
+      // can serve: buffered output, no tool/native chunk, every counted step
+      // consumed, and no tool call delivered as native bridge OR emulated
+      // <tool_call> markup (the latter is parsed downstream and is invisible
+      // to this raw chunk scan).
+      let detachAttempted = false;
+      tryDetach = () => {
+        if (detachAttempted || !detach || !turn) return null;
+        if (!(aborted() || detach.forcedCause)) return null;
+        if (!turn.chunks.length) return null;
+        if (turn.chunks.some(chunk => chunk?.nativeToolCall || chunk?.nativeToolResult)) return null;
+        if (toolCalls.length) return null;
+        if (detach.hasToolCalls?.()) return null;
+        let snapshot;
+        try {
+          snapshot = turn.snapshot();
+        } catch {
+          return null;
+        }
+        detachAttempted = true;
+        try {
+          detach.admit(snapshot, {
+            cascadeId,
+            sessionId,
+            lsPort: this.port,
+            lsGeneration: lsGeneration ?? lsEntry?.generation ?? null,
+            accountId: accountId ?? null,
+            modelKey: modelKey ?? null,
+            generatorOffset: snapshot.generatorOffset,
+            // F3: the claim owns this turn until the ONE absolute deadline.
+            // Pinning it to the poll-window start shifted the claim later by
+            // the whole send phase.
+            deadline: turnStart + turnBudgetMs,
+            startedAt: turnStart,
+          });
+        } catch (e) {
+          log.warn(`Cascade detach admission failed: ${e.message}`);
+        }
+        return snapshot;
+      };
+      // Tool calls that were ACTIVE when last seen and have not reported a
+      // result since, keyed by name+arguments. Persisted across polls because
+      // a step can fall out of the overlap window while its tool is still
+      // running, and completion can arrive either in place (status DONE) or
+      // as a later step carrying the result.
+      const pendingToolCalls = new Map();
 
-      while (Date.now() - startTime < maxWait) {
+      // A trajectory read is part of the request's budget: bound every RPC by
+      // what the ONE turn deadline has left. A read that cannot finish before
+      // the deadline must not complete the turn after it. Without a route
+      // budget the turn deadline is CASCADE_MAX_WAIT_MS, so this still caps at
+      // grpcUnary's own 30 s default instead of turning the poll window into a
+      // per-read timeout.
+      const readTimeoutMs = () => budgetTimeout(30_000);
+      // A read that fails because the turn's OWN deadline elapsed is the poll
+      // window ending, not an upstream transport fault. Without this a
+      // deadline-bounded read reports "gRPC unary timeout" and the handler
+      // rotates accounts over a timeout this turn caused itself.
+      // The tolerance covers wall-clock vs monotonic timer ticks: a read whose
+      // timeout WAS the remaining budget can report its failure with a
+      // millisecond or two of budget still reading as "left". Once that little
+      // is left no retry is possible, so the window verdict is the honest one.
+      const WINDOW_END_TOLERANCE_MS = 25;
+      const readFailedAtDeadline = (e) => {
+        if (remainingBudgetMs() > WINDOW_END_TOLERANCE_MS) return false;
+        if (e?.detachedClaimLost) return false;
+        if (e?.name === 'AbortError' || e?.code === 'ABORT_ERR') return false;
+        endReason = 'max_wait';
+        return true;
+      };
+
+      pollLoop: while (Date.now() - startTime < maxWait) {
         if (aborted()) { endReason = 'aborted'; break; }
-        await new Promise(r => setTimeout(r, pollInterval));
+        // The inter-poll sleep is a wait too: never sleep past the budget only
+        // to start a read that has no time left.
+        const sleepMs = Math.max(0, Math.min(pollInterval, maxWait - (Date.now() - startTime)));
+        await new Promise(r => setTimeout(r, sleepMs));
         if (aborted()) { endReason = 'aborted'; break; }
+        if (Date.now() - startTime >= maxWait) { endReason = 'max_wait'; break; }
         pollCount++;
 
-        // Get steps
-        const stepsProto = buildGetTrajectoryStepsRequest(cascadeId, stepOffset);
-        const stepsResp = await grpcUnary(
-          this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
-        );
-        const steps = parseTrajectorySteps(stepsResp);
+        // Get steps. `stepOffset` is the absolute index of the next unread
+        // step. Poll from a bounded overlap window so a step that arrived
+        // partial keeps growing: re-reading the last CASCADE_STEP_OVERLAP
+        // steps is O(overlap + new), never O(trajectory), and never reaches
+        // behind pollFloor. Per-step cursors below are keyed by ABSOLUTE
+        // index (`windowStart + i`), so re-reads only emit real deltas.
+        let windowStart;
+        let steps;
+        if (turn) {
+          let read;
+          try {
+            read = await turn.readWindow(async (start) => {
+              const stepsResp = await grpcUnary(
+                this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`,
+                grpcFrame(buildGetTrajectoryStepsRequest(cascadeId, start)),
+                readTimeoutMs()
+              );
+              return parseTrajectorySteps(stepsResp);
+            });
+          } catch (e) {
+            if (!readFailedAtDeadline(e)) throw e;
+            break pollLoop;
+          }
+          // Ownership is a LIVE predicate: the registry's deadline timer (or
+          // a sweep from another request) may have ended the claim while this
+          // read was in flight. Check after EVERY await before touching the
+          // cursors or replaying a single byte; the handler checks again at
+          // the replay write boundary.
+          if (resumeTurn && typeof resumeTurn.ownsClaim === 'function' && !resumeTurn.ownsClaim()) {
+            throw detachedClaimLostError();
+          }
+          ({ windowStart, steps } = read);
+          lastWindowStart = read.windowStart;
+          stepOffset = turn.stepOffset;
+          if (turn.stepOffset > lastStepCount) {
+            lastStepCount = turn.stepOffset;
+            lastGrowthAt = Date.now();
+          }
+          // The first successful read is the proof that the cascade survived
+          // the detach. Only now may the buffered prefix go on the wire: a
+          // not_found/expired read must fall back to a fresh upstream turn
+          // with ZERO bytes written (the 200 is not committed until the first
+          // write). The replay goes through onChunk — never a direct buffer
+          // write — so path scrubbing, stop gating, think reroute and
+          // reasoning dedup run exactly as they did on the live prefix.
+          if (resumeFirstReadPending) {
+            resumeFirstReadPending = false;
+            try {
+              await resumeTurn.onFirstRead?.();
+            } catch (e) {
+              if (aborted() || e?.isClientAbort || e?.name === 'AbortError' || e?.code === 'ABORT_ERR') {
+                tryDetach();
+              }
+              throw e;
+            }
+          }
+        } else {
+          windowStart = Math.max(pollFloor, stepOffset - CASCADE_STEP_OVERLAP);
+          const stepsProto = buildGetTrajectoryStepsRequest(cascadeId, windowStart);
+          let stepsResp;
+          try {
+            stepsResp = await grpcUnary(
+              this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto),
+              readTimeoutMs()
+            );
+          } catch (e) {
+            if (!readFailedAtDeadline(e)) throw e;
+            break pollLoop;
+          }
+          steps = parseTrajectorySteps(stepsResp);
+          lastWindowStart = windowStart;
+          const totalSteps = windowStart + steps.length;
+          stepOffset = Math.max(stepOffset, totalSteps);
+          if (totalSteps > lastStepCount) {
+            lastStepCount = totalSteps;
+            lastGrowthAt = Date.now();
+          }
+        }
         const hasNativeProposalInBatch = nativeMode && !nativeBridgePollAfterTool
           && steps.some(step => Array.isArray(step?.toolCalls)
             && step.toolCalls.some(tc => tc?.cascade_native && !isCompletedReadUrlNativeResult(tc)));
@@ -992,11 +1699,18 @@ export class WindsurfClient {
             const origin = pending.origin || '';
             if (!isReadUrlAutoApproveAllowed(url, origin)) continue;
             if (!cascadeTrajectoryId) {
-              const statusResp = await grpcUnary(
-                this.port, this.csrfToken,
-                `${LS_SERVICE}/GetCascadeTrajectory`,
-                grpcFrame(buildGetTrajectoryRequest(cascadeId))
-              );
+              let statusResp;
+              try {
+                statusResp = await grpcUnary(
+                  this.port, this.csrfToken,
+                  `${LS_SERVICE}/GetCascadeTrajectory`,
+                  grpcFrame(buildGetTrajectoryRequest(cascadeId)),
+                  readTimeoutMs()
+                );
+              } catch (e) {
+                if (!readFailedAtDeadline(e)) throw e;
+                break pollLoop;
+              }
               const info = parseTrajectoryInfo(statusResp);
               cascadeTrajectoryId = info.trajectoryId || '';
               lastStatus = info.status;
@@ -1005,12 +1719,11 @@ export class WindsurfClient {
               log.warn('WebFetch auto-approve skipped: missing trajectory_id');
               continue;
             }
-            const approvalKey = `${cascadeTrajectoryId}:${stepOffset + i}:${url}:${origin}`;
+            const approvalKey = `${cascadeTrajectoryId}:${windowStart + i}:${url}:${origin}`;
             if (approvedReadUrlInteractions.has(approvalKey)) continue;
-            approvedReadUrlInteractions.add(approvalKey);
             const req = buildHandleReadUrlContentInteractionRequest(cascadeId, {
               trajectoryId: cascadeTrajectoryId,
-              stepIndex: stepOffset + i,
+              stepIndex: windowStart + i,
               action: 1, // READ_URL_CONTENT_ACTION_ALLOW_ONCE
               url,
               origin,
@@ -1020,18 +1733,23 @@ export class WindsurfClient {
                 this.port, this.csrfToken,
                 `${LS_SERVICE}/HandleCascadeUserInteraction`,
                 grpcFrame(req),
-                10000
+                budgetTimeout(10_000)
               );
+              // R-3 (RATE-RETRY audit): record the approval only AFTER the RPC
+              // succeeded. Recording before meant one failed approval made the
+              // has() guard above skip this interaction forever — the cascade
+              // sat unapproved until the warm-stall ceiling.
+              approvedReadUrlInteractions.add(approvalKey);
               lastGrowthAt = Date.now();
               log.warn('WebFetch auto-approved read_url_content', {
                 cascadeIdHash: shortHash(cascadeId),
-                stepIndex: stepOffset + i,
+                stepIndex: windowStart + i,
                 originHash: origin ? shortHash(origin) : null,
               });
             } catch (e) {
               approvalError = {
                 cascadeIdHash: shortHash(cascadeId),
-                stepIndex: stepOffset + i,
+                stepIndex: windowStart + i,
                 message: String(e?.message || e),
               };
               log.warn('WebFetch auto-approve RPC failed', approvalError);
@@ -1082,22 +1800,30 @@ export class WindsurfClient {
         // NOTE: warm stall check moved AFTER step loop (below) so
         // lastGrowthAt reflects data read in this poll, not the previous one.
 
-        // Any trajectory change counts as forward progress. A new step, a new
-        // tool call proposal, or thinking growth all reset the stall timer so
-        // Cascade's slow silent planning phases don't get cut off mid-think.
-        if (steps.length > lastStepCount) {
-          lastStepCount = steps.length;
-          lastGrowthAt = Date.now();
-        }
-
         for (let i = 0; i < steps.length; i++) {
           const step = steps[i];
+          const stepIndex = windowStart + i;
 
-          // Per-step token usage. Overwrite on every poll so the map always
-          // holds the latest reported numbers (they grow monotonically as
-          // the generator emits more output). We sum across steps at the
-          // end to compute the response's total usage.
-          if (step.usage) usageByStep.set(i, step.usage);
+          // Track ACTIVE tool calls across polls. A step can leave the
+          // overlap window while its tool is still executing; forgetting it
+          // would drop the warm-stall ceiling from the tool-active tier back
+          // to the text tier and kill a slow clone/shell. Clear a call only
+          // when it reports DONE or carries a non-empty result.
+          if (Array.isArray(step.toolCalls) && step.toolCalls.length) {
+            for (const tc of step.toolCalls) {
+              const signature = `${tc?.name || ''}:${tc?.argumentsJson || ''}`;
+              const completed = step.status === 3
+                || (typeof tc?.result === 'string' && tc.result.length > 0)
+                || isCompletedReadUrlNativeResult(tc);
+              if (completed) pendingToolCalls.delete(signature);
+              else if (step.status === 1) pendingToolCalls.set(signature, stepIndex);
+            }
+          }
+
+          // Per-step token usage. Re-reads overwrite with the latest reported
+          // numbers (they grow monotonically as the generator emits more
+          // output). We sum across steps at the end to compute total usage.
+          if (step.usage) usageByStep.set(stepIndex, step.usage);
 
           // Collect tool calls — dedupe by id so the same step seen across
           // polls only emits once. A tool call with an existing `result`
@@ -1126,7 +1852,13 @@ export class WindsurfClient {
                   ? { text: '', thinking: '', isError: false, nativeToolResult: tc }
                   : { text: '', thinking: '', isError: false, nativeToolCall: tc };
                 chunks.push(chunk);
-                onChunk?.(chunk);
+                // C2: await the consumer. A slow downstream write must hold this
+                // poll loop (and the next trajectory RPC) instead of piling
+                // frames into a socket that already reported backpressure. A
+                // synchronous consumer returns undefined, so the await is a
+                // no-op for it — and a rejection is the real callback failure,
+                // never a parsing error.
+                await onChunk?.(chunk);
               }
             }
             // Native bridge is a proposal bridge for OpenAI clients. Once a
@@ -1146,6 +1878,23 @@ export class WindsurfClient {
             }
           }
 
+          if (turn) {
+            // Same per-step order as the inline path: tool calls above, then
+            // thinking, then text. The turn owns the cursors and the producer
+            // buffer; the loop mirrors its counters for stall/summary logic.
+            const consumed = await turn.consumeStep(step, stepIndex);
+            if (consumed.thinkingDelta) {
+              totalThinking += consumed.thinkingDelta.length;
+              lastGrowthAt = Date.now();
+            }
+            if (consumed.textDelta) {
+              totalYielded += consumed.textDelta.length;
+              lastGrowthAt = Date.now();
+              sawText = true;
+            }
+            continue;
+          }
+
           // Thinking delta: the LS keeps `thinking` as the cumulative
           // reasoning text for the step. Track a per-step cursor and emit
           // only the tail as reasoning_content. Crucially, thinking growth
@@ -1155,15 +1904,15 @@ export class WindsurfClient {
           // preambles (`/tmp/...` style "let me analyze" stubs).
           const liveThink = step.thinking || '';
           if (liveThink) {
-            const prevThink = thinkingByStep.get(i) || 0;
+            const prevThink = thinkingByStep.get(stepIndex) || 0;
             if (liveThink.length > prevThink) {
               const thinkDelta = liveThink.slice(prevThink);
-              thinkingByStep.set(i, liveThink.length);
+              thinkingByStep.set(stepIndex, liveThink.length);
               totalThinking += thinkDelta.length;
               lastGrowthAt = Date.now();
               const tchunk = { text: '', thinking: thinkDelta, isError: false };
               chunks.push(tchunk);
-              onChunk?.(tchunk);
+              await onChunk?.(tchunk);   // C2: same backpressure contract as the text delta below
             }
           }
 
@@ -1179,16 +1928,16 @@ export class WindsurfClient {
           // version when one exists.
           const liveText = step.responseText || step.text || '';
           if (!liveText) continue;
-          const prev = yieldedByStep.get(i) || 0;
+          const prev = yieldedByStep.get(stepIndex) || 0;
           if (liveText.length > prev) {
             const delta = liveText.slice(prev);
-            yieldedByStep.set(i, liveText.length);
+            yieldedByStep.set(stepIndex, liveText.length);
             totalYielded += delta.length;
             lastGrowthAt = Date.now();
             sawText = true;
             const chunk = { text: delta, thinking: '', isError: false };
             chunks.push(chunk);
-            onChunk?.(chunk);
+            await onChunk?.(chunk);
           }
         }
         if (endReason === 'native_tool_call') break;
@@ -1214,7 +1963,8 @@ export class WindsurfClient {
         // shorter ceiling so a stuck cascade with a completed tool
         // doesn't burn 180s of account quota per attempt.
         const msSinceGrowth = Date.now() - lastGrowthAt;
-        const hasActiveStep = Array.isArray(steps) && steps.some((s) => s && s.status === 1);
+        const hasActiveStep = pendingToolCalls.size > 0
+          || (Array.isArray(steps) && steps.some((s) => s && s.status === 1));
         const effectiveWarmStallMs = pickWarmStallCeiling({
           totalThinking,
           toolCallCount: seenToolCallIds.size,
@@ -1222,7 +1972,7 @@ export class WindsurfClient {
           hasActiveStep,
         });
         if (sawText && lastStatus !== 1 && msSinceGrowth > effectiveWarmStallMs) {
-          const diag = { msSinceGrowth, textLen: totalYielded, thinkingLen: totalThinking, stepCount: yieldedByStep.size, toolCalls: seenToolCallIds.size, lastStatus, ceilingMs: effectiveWarmStallMs, hasActiveStep };
+          const diag = { msSinceGrowth, textLen: totalYielded, thinkingLen: totalThinking, stepCount: turn ? turn.yieldedByStep.size : yieldedByStep.size, toolCalls: seenToolCallIds.size, lastStatus, ceilingMs: effectiveWarmStallMs, hasActiveStep };
           if (totalYielded < STALL_RETRY_MIN_TEXT) {
             log.warn('Cascade warm stall (short, retrying on next account)', diag);
             endReason = 'stall_warm_retry';
@@ -1238,15 +1988,25 @@ export class WindsurfClient {
 
         // Check status
         const statusProto = buildGetTrajectoryRequest(cascadeId);
-        const statusResp = await grpcUnary(
-          this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectory`, grpcFrame(statusProto)
-        );
+        let statusResp;
+        try {
+          statusResp = await grpcUnary(
+            this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectory`, grpcFrame(statusProto),
+            readTimeoutMs()
+          );
+        } catch (e) {
+          if (!readFailedAtDeadline(e)) throw e;
+          break pollLoop;
+        }
         const statusInfo = parseTrajectoryInfo(statusResp);
         const status = statusInfo.status;
         if (statusInfo.trajectoryId) cascadeTrajectoryId = statusInfo.trajectoryId;
         lastStatus = status;
 
-        if (status !== 1) sawActive = true;
+        if (status !== 1) {
+          sawActive = true;
+          if (turn) turn.sawActive = true;
+        }
 
         if (status === 1) { // IDLE
           // Don't allow idle-break during the warmup window unless we've
@@ -1265,42 +2025,84 @@ export class WindsurfClient {
           const growthSettled = (Date.now() - lastGrowthAt) > pollInterval * 2;
           const canBreak = sawText ? (idleCount >= 2 && growthSettled) : idleCount >= 4;
           if (canBreak) {
-            // Final sweep
-            const finalResp = await grpcUnary(
-              this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
-            );
+            // Final sweep. Re-read the same bounded overlap window as the
+            // last poll so the newest steps still get the modifiedText polish
+            // pass. Using the advanced `stepOffset` would miss steps the next
+            // poll had not fetched yet; the window never reaches behind
+            // pollFloor, so pre-turn steps on a resume are not replayed.
+            let finalResp;
+            try {
+              finalResp = await grpcUnary(
+                this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`,
+                grpcFrame(buildGetTrajectoryStepsRequest(cascadeId, lastWindowStart)),
+                readTimeoutMs()
+              );
+            } catch (e) {
+              if (!readFailedAtDeadline(e)) throw e;
+              break pollLoop;
+            }
+            // The final sweep is an awaited trajectory read like any other:
+            // a claim that ended while it was in flight must not emit the
+            // top-up content or reach the success tail.
+            if (resumeTurn && typeof resumeTurn.ownsClaim === 'function' && !resumeTurn.ownsClaim()) {
+              throw detachedClaimLostError();
+            }
             const finalSteps = parseTrajectorySteps(finalResp);
-            lastStepCount = finalSteps.length;
-            for (let i = 0; i < finalSteps.length; i++) {
-              const step = finalSteps[i];
-              const responseText = step.responseText || '';
-              const modifiedText = step.modifiedText || '';
-              const prev = yieldedByStep.get(i) || 0;
-
-              // Normal top-up: responseText grew past what we streamed.
-              if (responseText.length > prev) {
-                const delta = responseText.slice(prev);
-                yieldedByStep.set(i, responseText.length);
-                totalYielded += delta.length;
-                chunks.push({ text: delta, thinking: '', isError: false });
-                onChunk?.({ text: delta, thinking: '', isError: false });
+            if (turn) {
+              turn.advanceTo(lastWindowStart + finalSteps.length);
+              stepOffset = turn.stepOffset;
+              for (let i = 0; i < finalSteps.length; i++) {
+                const consumed = await turn.consumeFinalStep(finalSteps[i], lastWindowStart + i);
+                if (consumed.textDelta) {
+                  totalYielded += consumed.textDelta.length;
+                  sawText = true;
+                  lastGrowthAt = Date.now();
+                }
               }
+            } else {
+              stepOffset = Math.max(stepOffset, lastWindowStart + finalSteps.length);
+              for (let i = 0; i < finalSteps.length; i++) {
+                const step = finalSteps[i];
+                const stepIndex = lastWindowStart + i;
+                const responseText = step.responseText || '';
+                const modifiedText = step.modifiedText || '';
+                const prev = yieldedByStep.get(stepIndex) || 0;
 
-              // Modified-response top-up: only if it's a strict extension of
-              // what we already emitted. If modifiedText rewrites the prefix
-              // (common when LS polishes), emitting the tail would splice
-              // wrong content onto the stream, so we skip it and keep the
-              // raw responseText we already showed.
-              const cursor = yieldedByStep.get(i) || 0;
-              if (modifiedText.length > cursor && modifiedText.startsWith(responseText)) {
-                const delta = modifiedText.slice(cursor);
-                yieldedByStep.set(i, modifiedText.length);
-                totalYielded += delta.length;
-                chunks.push({ text: delta, thinking: '', isError: false });
-                onChunk?.({ text: delta, thinking: '', isError: false });
+                // Normal top-up: responseText grew past what we streamed.
+                if (responseText.length > prev) {
+                  const delta = responseText.slice(prev);
+                  yieldedByStep.set(stepIndex, responseText.length);
+                  totalYielded += delta.length;
+                  sawText = true;
+                  lastGrowthAt = Date.now();
+                  chunks.push({ text: delta, thinking: '', isError: false });
+                  // C2: the end-of-turn top-ups are producer frames like any
+                  // other; a pressured writer must hold them (and the terminal
+                  // DONE that follows this loop) rather than let them overtake.
+                  await onChunk?.({ text: delta, thinking: '', isError: false });
+                }
+
+                // Modified-response top-up: only if it's a strict extension of
+                // what we already emitted. If modifiedText rewrites the prefix
+                // (common when LS polishes), emitting the tail would splice
+                // wrong content onto the stream, so we skip it and keep the
+                // raw responseText we already showed.
+                const cursor = yieldedByStep.get(stepIndex) || 0;
+                if (modifiedText.length > cursor && modifiedText.startsWith(responseText)) {
+                  const delta = modifiedText.slice(cursor);
+                  yieldedByStep.set(stepIndex, modifiedText.length);
+                  totalYielded += delta.length;
+                  sawText = true;
+                  lastGrowthAt = Date.now();
+                  chunks.push({ text: delta, thinking: '', isError: false });
+                  await onChunk?.({ text: delta, thinking: '', isError: false });
+                }
               }
             }
-            endReason = sawText ? 'idle_done' : 'idle_empty';
+            // F2: the sweep is part of this turn. Any text it emitted (or that
+            // an earlier poll already emitted) means the turn is done, never
+            // empty — `idle_empty` is reserved for a turn with zero output.
+            endReason = (sawText || totalYielded > 0) ? 'idle_done' : 'idle_empty';
             break;
           }
         } else {
@@ -1308,6 +2110,33 @@ export class WindsurfClient {
         }
       }
       if (endReason === 'unknown') endReason = 'max_wait';
+
+      // A client abort is not a completed turn. Before this check the loop
+      // fell through to the normal return below, so chat.js treated the
+      // partial chunks as a finished answer: it cached them, checked the
+      // cascade into the reuse pool, recorded spend, and wrote
+      // finish_reason:"stop" + [DONE] to a socket the client had already
+      // closed. The upstream turn cannot be cancelled (the LS exposes no
+      // cancel-cascade RPC), but the LOCAL turn must be observably
+      // incomplete. Throw the same AbortError shape the legacy
+      // RawGetChatMessage stream produces, and skip the completion-only work
+      // below (onEnd, generator-metadata RPC, chunk metadata, return).
+      // `aborted()` is checked in addition to the loop's endReason so an
+      // abort that lands after idle_done/max_wait is still surfaced.
+      if (endReason === 'aborted' || aborted()) {
+        // Detach P1: the turn object is still alive here and the last window
+        // was fully consumed, which is the only safe snapshot seam. The
+        // producer calls the handler-supplied handle; it never imports the
+        // registry. A refused admission changes nothing below.
+        tryDetach();
+        // Mirror the normal return's reset so a reused client instance never
+        // carries this turn's recovery flag into the next call.
+        this._lastReuseInvalidated = false;
+        const err = new Error('Cascade aborted by client');
+        err.name = 'AbortError';
+        err.code = 'ABORT_ERR';
+        throw err;
+      }
 
       // Structured summary so we can diagnose short/empty completions after
       // the fact. sawActive=false + sawText=false + idle_empty = the planner
@@ -1318,13 +2147,15 @@ export class WindsurfClient {
         polls: pollCount,
         textLen: totalYielded,
         thinkingLen: totalThinking,
-        stepCount: stepOffset + Math.max(yieldedByStep.size, thinkingByStep.size, lastStepCount),
+        stepCount: stepOffset,
         toolCalls: seenToolCallIds.size,
         sawActive,
         sawText,
         lastStatus,
         approvalError,
-        ms: Date.now() - startTime,
+        // Whole-turn duration (send phase included), matching the deadline the
+        // turn was actually held to.
+        ms: Date.now() - turnStart,
       };
       const shortNormalDone = (endReason === 'idle_done' || endReason === 'native_tool_call')
         && (sawText || seenToolCallIds.size > 0);
@@ -1347,6 +2178,23 @@ export class WindsurfClient {
         log.warn(`Cascade max_wait dump: head="${head}"${tail ? ` ... tail="${tail}"` : ''}`);
       }
 
+      // A06/KH-018: expose the poll loop's terminal state on the returned
+      // array. Callers must not have to infer "the turn finished" from the
+      // presence of text: max_wait/stall_warm return partial chunks and
+      // idle_empty returns none, and all three used to look like a clean
+      // completion to both Chat response builders.
+      const terminal = classifyCascadeEnd(endReason, {
+        totalYielded,
+        totalThinking,
+        toolCallCount: toolCalls.length,
+      });
+      chunks.endReason = endReason;
+      chunks.truncated = terminal.truncated === true;
+      chunks.incomplete = terminal.ok !== true;
+      chunks.terminal = terminal;
+      chunks.totalYielded = totalYielded;
+      chunks.totalThinking = totalThinking;
+      chunks.sawText = sawText;
       onEnd?.(chunks);
 
       // ── Real token usage via GetCascadeTrajectoryGeneratorMetadata ──
@@ -1357,14 +2205,29 @@ export class WindsurfClient {
       // here just drops usage back to the chars/4 estimator, the response
       // itself is already formed.
       let serverUsage = null;
+      // D5/F6: `metaResult` carries the record count even when no record has a
+      // usage block; `serverUsage` only exists when the token figures are real.
+      let metaResult = null;
       try {
-        const metaReq = buildGetGeneratorMetadataRequest(cascadeId, generatorOffset);
-        const metaResp = await grpcUnary(
-          this.port, this.csrfToken,
-          `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
-          grpcFrame(metaReq), 5000
-        );
-        serverUsage = parseGeneratorMetadata(metaResp);
+        if (!generatorOffsetKnown) {
+          // Asking from 0 here would report every earlier turn of this cascade
+          // as this turn's usage. Abstain instead: the step-level usage below is
+          // turn-scoped, so it stays honest.
+          log.warn('Cascade: generator-metadata window start unknown — skipping the aggregate usage read instead of re-summing from record 0');
+        } else {
+          const metaReq = buildGetGeneratorMetadataRequest(cascadeId, generatorOffset);
+          // Post-turn accounting keeps its own 5 s bound, NOT the turn
+          // deadline: the turn already completed upstream, and dropping this
+          // read would lose the real token settlement of a billed turn
+          // (test/cascade-detach-lazy-resume.test.js T28).
+          const metaResp = await grpcUnary(
+            this.port, this.csrfToken,
+            `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
+            grpcFrame(metaReq), 5000
+          );
+          metaResult = parseGeneratorMetadata(metaResp);
+          if (metaResult?.hasUsage) serverUsage = metaResult;
+        }
       } catch (e) {
         log.debug(`GetCascadeTrajectoryGeneratorMetadata failed: ${e.message}`);
       }
@@ -1394,9 +2257,23 @@ export class WindsurfClient {
       // that iterate over it keep working.
       chunks.cascadeId = cascadeId;
       chunks.sessionId = sessionId;
-      chunks.stepOffset = stepOffset + Math.max(yieldedByStep.size, thinkingByStep.size, lastStepCount);
-      chunks.generatorOffset = serverUsage?.entryCount != null
-        ? generatorOffset + serverUsage.entryCount
+      chunks.stepOffset = turn ? turn.stepOffset : stepOffset;
+      // Q10 P1: the producer state a detach would store. Only present when
+      // the flag is on; the default return shape is unchanged. A completed
+      // turn's snapshot is not a resume point (the registry serves its
+      // chunks); a mid-turn detach calls turn.snapshot() at the same seam.
+      // A tool/native break can leave consumedThrough < stepOffset; that turn
+      // is not resumable by construction, so omit the snapshot instead of
+      // failing a completed turn.
+      if (turn) {
+        try { chunks.turnSnapshot = turn.snapshot(); } catch { /* not resumable */ }
+      }
+      // D5/F6: the next window starts after every record this turn consumed,
+      // whether or not those records carried usage. Only a known start may be
+      // advanced; an unknown one stays null so the pool stores "unknown" and the
+      // next resume re-reads the count instead of re-summing from 0.
+      chunks.generatorOffset = generatorOffsetKnown && Number.isInteger(metaResult?.entryCount)
+        ? generatorOffset + metaResult.entryCount
         : null;
       chunks.toolCalls = toolCalls;
       chunks.usage = serverUsage;
@@ -1410,7 +2287,7 @@ export class WindsurfClient {
       // v2.0.25 LOW-1: stamp the LS generation onto the cascade meta so the
       // pool entry can be invalidated cleanly if this LS restarts and a
       // different LS later lands on the same port.
-      chunks.lsGeneration = lsEntry?.generation || null;
+      chunks.lsGeneration = lsGeneration ?? lsEntry?.generation ?? null;
       // v2.0.25 LOW-2: surface history coverage so the pool entry can
       // record whether truncation happened on the fresh-cascade path.
       chunks.historyCoverage = historyCoverage;
@@ -1421,6 +2298,12 @@ export class WindsurfClient {
       return chunks;
 
     } catch (err) {
+      // A client that vanished during the prefix replay (F22) or anywhere
+      // after the poll loop must re-detach the resumed turn before the error
+      // escapes; the handler's abort branch then returns without a bill.
+      if (signal?.aborted || err?.isClientAbort || err?.name === 'AbortError' || err?.code === 'ABORT_ERR') {
+        try { tryDetach(); } catch { /* detach is best-effort */ }
+      }
       if (isCascadeTransportError(err)) {
         resetCascadeTransportState(this.port);
         markCascadeTransportError(err);
@@ -1428,7 +2311,7 @@ export class WindsurfClient {
       onError?.(err);
       throw err;
     } finally {
-      endLsUse(this.port);
+      releaseLease(this.port);
     }
   }
 

@@ -11,6 +11,7 @@ function fixture() {
   fs.mkdirSync(join(root, 'scripts'), { recursive: true });
   fs.mkdirSync(away);
   fs.copyFileSync(new URL('../scripts/secret-scan.mjs', import.meta.url), join(root, 'scripts/secret-scan.mjs'));
+  fs.copyFileSync(new URL('../scripts/secret-rules.mjs', import.meta.url), join(root, 'scripts/secret-rules.mjs'));
   const env = { ...process.env }; delete env.NODE_OPTIONS; delete env.NODE_TEST_CONTEXT;
   const scan = (arg, cwd) => {
     const r = spawnSync(process.execPath, [join(root, 'scripts/secret-scan.mjs'), arg],

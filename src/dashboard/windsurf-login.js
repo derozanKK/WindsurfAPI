@@ -5,11 +5,16 @@
 
 import http from 'http';
 import https from 'https';
+import { randomBytes } from 'crypto';
 import { config, log } from '../config.js';
 import { resolveProxyConnectHost } from '../net-safety.js';
 import { safeEmailRef, safeKeyRef, logHash, sliceRedactedJson } from '../log-safety.js';
 import { isSocks, createSocksTunnel } from '../socks.js';
 import { getEmailLockThreshold, getEmailLockMs, getBackendSwitch } from '../runtime-config.js';
+import { parseFields, getField, getAllFields } from '../proto.js';
+// R-1 (RATE-RETRY audit): bounded response-body reads, shared with the
+// devin-connect readers — one ceiling, one truncation contract.
+import { createBoundedBodyAccumulator, MAX_ERROR_BODY_BYTES } from '../devin-connect.js';
 
 const FIREBASE_API_KEY = 'AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY';
 const FIREBASE_AUTH_URL = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`;
@@ -17,13 +22,16 @@ const FIREBASE_REFRESH_URL = `https://securetoken.googleapis.com/v1/token?key=${
 const CODEIUM_REGISTER_URL = 'https://api.codeium.com/register_user/';
 const AUTH1_CONNECTIONS_URL = 'https://windsurf.com/_devin-auth/connections';
 const AUTH1_PASSWORD_LOGIN_URL = 'https://windsurf.com/_devin-auth/password/login';
-// 2026-04-26: Windsurf moved the primary email-method probe to a Connect-RPC
-// path under `_backend/...SeatManagementService/CheckUserLoginMethod`. The
-// response is fast and clean (`{userExists,hasPassword}`); the old
-// `/_devin-auth/connections` path is still wired in their bundle but
-// runs on Vercel functions that 504 every few seconds. We use the new
-// endpoint as the primary probe and fall back to the old one only if
-// the new one is unreachable.
+const AUTH1_EMAIL_START_URL = 'https://windsurf.com/_devin-auth/email/start';
+const AUTH1_EMAIL_COMPLETE_URL = 'https://windsurf.com/_devin-auth/email/complete';
+// 2026-04-26: Windsurf added a Connect-RPC email-method probe under
+// `_backend/...SeatManagementService/CheckUserLoginMethod` (`{userExists,
+// hasPassword}`). It is NOT reliable: for a real, existing account it returns
+// an EMPTY `{}` (live recon 2026-10-22), and treating that as "no password"
+// or as "password-capable" both misclassify the account. `/_devin-auth/
+// connections` is the authoritative probe — its `auth_method.has_password` is
+// what windsurf.com's own login page reads. CheckUserLoginMethod is kept only
+// as enrichment for the case where connections is unreachable.
 const WINDSURF_CHECK_LOGIN_METHOD_URL = 'https://windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/CheckUserLoginMethod';
 const WINDSURF_SEAT_SERVICE_BASE = 'https://server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService';
 const WINDSURF_POST_AUTH_URL = `${WINDSURF_SEAT_SERVICE_BASE}/WindsurfPostAuth`;
@@ -53,6 +61,10 @@ const WINDSURF_ONE_TIME_TOKEN_URL_NEW = `${WINDSURF_BACKEND_SEAT_BASE}/GetOneTim
 const DEVIN_HOST_BASE = 'https://app.devin.ai';
 const DEVIN_AUTH1_CONNECTIONS_URL = `${DEVIN_HOST_BASE}/api/auth1/connections`;
 const DEVIN_AUTH1_PASSWORD_LOGIN_URL = `${DEVIN_HOST_BASE}/api/auth1/password/login`;
+// Same Auth1 email-code flow, same two payloads — only the host and the
+// optional `product` field differ (Devin's own bundle sends `{email, mode}`).
+const DEVIN_AUTH1_EMAIL_START_URL = `${DEVIN_HOST_BASE}/api/auth1/email/start`;
+const DEVIN_AUTH1_EMAIL_COMPLETE_URL = `${DEVIN_HOST_BASE}/api/auth1/email/complete`;
 
 function isLoginHostFallbackEnabled() {
   return getBackendSwitch('loginHostFallback');
@@ -67,17 +79,52 @@ function isLoginHostFallbackEnabled() {
 let _transportOverride = null;
 export function __setLoginTransportForTests(fn) { _transportOverride = fn; }
 
-function parsePostAuthResponseData(payload) {
+export function parsePostAuthResponseData(payload) {
   const raw = Buffer.isBuffer(payload) ? payload.toString('utf8') : String(payload || '');
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object') return parsed;
   } catch {}
+  // The wire response is application/proto — decode it directly (binary-safe)
+  // instead of scanning the bytes as text: session_token = #1, orgs = #2,
+  // auth1_token = #3 (optional, possibly ROTATED by this exchange),
+  // account_id = #4, primary_org_id = #5.
+  if (Buffer.isBuffer(payload)) {
+    try {
+      const fields = parseFields(payload);
+      const sessionToken = getField(fields, 1, 2)?.value?.toString('utf8');
+      if (sessionToken) {
+        return {
+          sessionToken,
+          accountId: getField(fields, 4, 2)?.value?.toString('utf8'),
+          primaryOrgId: getField(fields, 5, 2)?.value?.toString('utf8'),
+          // Field #3 exists in WindsurfPostAuthResponse and the decoder used to
+          // skip it. Absent → undefined (no behaviour change); present → the
+          // token that can mint the NEXT session, so callers can re-store it.
+          auth1Token: getField(fields, 3, 2)?.value?.toString('utf8'),
+          orgs: getAllFields(fields, 2).filter(f => f.wireType === 2).map(f => decodePostAuthOrg(f.value)),
+        };
+      }
+    } catch {}
+  }
+  // Regex fallback for non-protobuf responses (plain-text bodies etc.).
   const sessionToken = raw.match(/devin-session-token\$[a-zA-Z0-9._-]+/)?.[0];
   const accountId = raw.match(/account-[a-f0-9]+/)?.[0];
   const primaryOrgId = raw.match(/org-[a-f0-9]+/)?.[0];
   if (sessionToken) return { sessionToken, accountId, primaryOrgId };
   return { error: raw.slice(0, 200) || 'empty response' };
+}
+
+/** Decode one WindsurfPostAuthOrg sub-message (#2 of WindsurfPostAuthResponse). */
+function decodePostAuthOrg(buf) {
+  const f = parseFields(buf);
+  const str = (n) => getField(f, n, 2)?.value?.toString('utf8');
+  const bool = (n) => { const v = getField(f, n, 0); return v ? v.value !== 0 : undefined; };
+  return {
+    id: str(1), name: str(2), isAdmin: bool(3), canUseCli: bool(4),
+    canUseCascade: bool(5), planSlug: str(6), subscriptionStatus: str(7),
+    webappHost: str(8), ssoLoginRequired: bool(9),
+  };
 }
 
 async function postAuthDualPath(auth1Token, fingerprint, proxy, preferredHost = null) {
@@ -294,10 +341,16 @@ function httpsRequest(url, opts, postData, proxy) {
     };
 
     const handleResponse = (res) => {
-      const bufs = [];
-      res.on('data', d => bufs.push(d));
+      // R-1 (RATE-RETRY audit): bounded read — see createBoundedBodyAccumulator
+      // (shared ceiling). Over the cap → reject; never parse a truncated prefix.
+      const buffer = createBoundedBodyAccumulator();
+      res.on('data', buffer.onData);
       res.on('end', () => {
-        const rawBuffer = Buffer.concat(bufs);
+        const { raw: rawBuffer, truncated } = buffer.finish();
+        if (truncated) {
+          reject(new Error(`Response body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated`));
+          return;
+        }
         if (opts.raw) {
           resolve({ status: res.statusCode, data: rawBuffer });
           return;
@@ -393,44 +446,138 @@ async function httpsRequestRetrying(url, opts, postData, proxy, label = 'request
   throw lastErr || new Error(`${label} failed after retries`);
 }
 
-// Windsurf 在 2026-04-26 把 /_devin-auth/connections 的响应从
-//   { auth_method: { method: 'auth1', has_password: bool } }
-// 换成
-//   { connections: [{ id, type, enabled, client_id }, ...] }
-// 其中 type:'email' + enabled:true = 该账号支持邮箱密码登录。
-// 这个函数兼容新旧两种形态，返回统一的 { method, hasPassword, raw }。
+// Windsurf serves two shapes on /_devin-auth/connections:
+//   { auth_method: { method, has_password, enterprise_sso_domain }, connections: [...] }
+//   { auth_method: { method: 'auth1', has_password: bool } }            (older)
+//
+// `auth_method.has_password` is the ONLY authoritative password signal — it is
+// what windsurf.com's own login page branches on (`if (has_password) password
+// step; else send email code`).
+//
+// `connections[type=email].enabled` does NOT mean "has a password": the live
+// OAuth-only account returns `email.enabled:true` alongside
+// `has_password:false`, because the email connection is what carries the
+// email CODE. Reading `enabled` as "password-capable" (what this function used
+// to do) sent that account to password/login, and the resulting 401 was
+// reported as ERR_INVALID_CREDENTIALS instead of "no password". Never infer a
+// password from the connection list; when `auth_method` is absent the answer
+// is `null` (unknown), not `true`.
 function interpretConnections(data) {
-  if (data && Array.isArray(data.connections)) {
-    const email = data.connections.find(c => c && c.type === 'email');
-    return {
-      method: 'auth1',
-      hasPassword: !!(email && email.enabled),
-      raw: data,
-    };
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { method: null, hasPassword: null, userExists: null, emailCode: false, oauth: [], raw: {} };
   }
-  if (data && data.auth_method) {
-    return {
-      method: data.auth_method.method || null,
-      hasPassword: data.auth_method.has_password !== false,
-      raw: data,
-    };
-  }
-  return { method: null, hasPassword: false, raw: data || {} };
+  const authMethod = data.auth_method && typeof data.auth_method === 'object' ? data.auth_method : null;
+  const conns = Array.isArray(data.connections)
+    ? data.connections.filter(c => c && typeof c === 'object')
+    : null;
+  const emailConn = conns ? conns.find(c => c.type === 'email') : null;
+  const emailOffered = !!(emailConn && emailConn.enabled !== false);
+  const oauth = conns
+    ? conns.filter(c => c.enabled !== false && (c.type === 'google' || c.type === 'github')).map(c => c.type)
+    : [];
+  const hasPassword = authMethod && typeof authMethod.has_password === 'boolean'
+    ? authMethod.has_password
+    : null;
+  // `method:null` on a present auth_method is upstream's "no such account", and
+  // so is the LITERAL string "not_found": measured live 2026-10-22, an unknown
+  // address returns
+  //   auth_method: { method: "not_found", has_password: false, enterprise_sso_domain: false }
+  // and windsurf.com's own login bundle branches on exactly that value
+  // (`method === 'not_found'` → "No account found. Sign up?"). Reading it as a
+  // method made `userExists` true and offered an email code for a typo (F1).
+  // It is a sentinel, never a login method — do not return it to callers.
+  const rawMethod = authMethod && typeof authMethod.method === 'string'
+    ? authMethod.method.trim()
+    : '';
+  const method = rawMethod && rawMethod !== 'not_found' ? rawMethod : null;
+  // With `auth_method` present, `method:null`/`not_found` is upstream's "no
+  // such account". WITHOUT it, an empty `connections: []` is not evidence of
+  // anything — the body may simply be partial — so the answer is "unknown"
+  // (null), never "no account". Returning false there made a probe reply of
+  // `{"connections":[]}` (a real shape from app.devin.ai) abort the login as
+  // ERR_EMAIL_NOT_FOUND.
+  const userExists = authMethod
+    ? method !== null
+    : (conns && conns.length > 0 ? true : null);
+  // Email-code login is the alternative whenever there is no password. With
+  // `hasPassword:true` the email connection is the password form, not a code.
+  // A missing account gets neither: upstream's has_password:false describes a
+  // method with no account behind it, so it must not become an offer to send
+  // mail (F1).
+  const emailCode = userExists === false
+    ? false
+    : hasPassword === false
+      ? (conns ? emailOffered : true)
+      : (hasPassword === null ? emailOffered : false);
+  // The connection list is global, not account-scoped: upstream returns the
+  // same email/google/github entries for an address that does not exist. Do
+  // not hand a caller a provider list for a missing account.
+  return { method, hasPassword, userExists, emailCode, oauth: userExists === false ? [] : oauth, raw: data };
 }
 
-async function fetchAuth1Connections(email, fingerprint, proxy) {
+// Which host answered the method probe for an address. The email-code flow
+// starts on the SAME host: a probe that only app.devin.ai could answer is
+// evidence that windsurf.com is not reachable from this deployment, and
+// guessing again would send the operator's code request into the outage.
+const PROBE_HOST_TTL_MS = 5 * 60 * 1000;
+const _probeHost = new Map();
+export function _resetProbeHostForTests() { _probeHost.clear(); }
+
+function rememberProbeHost(email, host) {
+  const key = String(email || '').toLowerCase();
+  if (!key || (host !== 'windsurf' && host !== 'devin')) return;
+  _probeHost.set(key, { host, at: Date.now() });
+  if (_probeHost.size <= 200) return;
+  const oldest = [..._probeHost.entries()].sort((a, b) => a[1].at - b[1].at)
+    .slice(0, _probeHost.size - 200);
+  for (const [k] of oldest) _probeHost.delete(k);
+}
+
+function preferredEmailHost(email) {
+  const key = String(email || '').toLowerCase();
+  const entry = _probeHost.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > PROBE_HOST_TTL_MS) {
+    _probeHost.delete(key);
+    return null;
+  }
+  return entry.host;
+}
+
+async function fetchAuth1Connections(email, fingerprint, proxy, host = 'windsurf') {
   const body = JSON.stringify({ product: 'windsurf', email });
   const headers = buildJsonHeaders(fingerprint, body);
+  const url = host === 'devin' ? DEVIN_AUTH1_CONNECTIONS_URL : AUTH1_CONNECTIONS_URL;
   const res = await httpsRequestRetrying(
-    AUTH1_CONNECTIONS_URL, { method: 'POST', headers }, body, proxy, 'Auth1 connections'
+    url, { method: 'POST', headers }, body, proxy, `Auth1 connections (${host})`
   );
+  // 400/422 is upstream answering about the REQUEST (measured: a malformed
+  // address returns `value is not a valid email address`). Retrying it on the
+  // other host or on the secondary probe cannot change that answer, so it is
+  // terminal instead of "unknown".
+  if (res.status === 400 || res.status === 422) {
+    const detail = upstreamDetail(res.data);
+    const invalidEmail = /email/i.test(detail);
+    const err = new Error(invalidEmail ? 'ERR_INVALID_EMAIL' : 'ERR_LOGIN_PROBE_FAILED');
+    err.code = err.message;
+    err.statusCode = 400;
+    err.detail = detail || `upstream ${res.status}`;
+    throw err;
+  }
+  if (res.status >= 400) {
+    const err = new Error(`connections ${res.status}`);
+    err.statusCode = res.status;
+    throw err;
+  }
   return res.data || {};
 }
 
-// New primary email-method probe (Windsurf 2026-04-26 migration).
-// Returns the same { method, hasPassword, raw } shape as
-// interpretConnections so call sites are uniform. On reachability failure
-// returns null (caller falls back to /_devin-auth/connections).
+// Secondary probe (Windsurf 2026-04-26 Connect-RPC surface). Only consulted
+// when /_devin-auth/connections is unreachable — it returns `{}` for real
+// accounts, so an empty body is "unknown" (null), never "no password" and
+// never "password-capable".
+// Returns the uniform { method, hasPassword, userExists, emailCode, oauth, raw }
+// shape, or null when it learned nothing.
 async function fetchCheckUserLoginMethod(email, fingerprint, proxy) {
   const body = JSON.stringify({ email });
   const headers = buildJsonHeaders(fingerprint, body, { 'Connect-Protocol-Version': '1' });
@@ -447,27 +594,82 @@ async function fetchCheckUserLoginMethod(email, fingerprint, proxy) {
     // edge or geo-routing fallback. Treating `userExists`/`hasPassword`
     // as false in that case wrongly funnels every account into the
     // "no password set" branch and aborts before any login attempt.
-    // When neither field is present, defer to the legacy connections
-    // endpoint instead of guessing.
+    // When neither field is present, the answer is "unknown".
     const hasUserField = Object.prototype.hasOwnProperty.call(res.data, 'userExists');
     const hasPwField = Object.prototype.hasOwnProperty.call(res.data, 'hasPassword');
     if (!hasUserField && !hasPwField) {
-      log.warn(`CheckUserLoginMethod empty body for ${safeEmailRef(email)}, falling back to /_devin-auth/connections`);
+      log.warn(`CheckUserLoginMethod empty body for ${safeEmailRef(email)}; login method unknown`);
       return null;
     }
     if (res.data.userExists === false) {
-      // Caller maps this to "user not found" via interpretConnections{method:null}.
-      return { method: null, hasPassword: false, raw: res.data };
+      return { method: null, hasPassword: null, userExists: false, emailCode: false, oauth: [], raw: res.data };
     }
+    const hasPassword = hasPwField ? !!res.data.hasPassword : null;
     return {
       method: 'auth1',
-      hasPassword: !!res.data.hasPassword,
+      hasPassword,
+      userExists: true,
+      // This endpoint says nothing about connections, so email-code availability
+      // is only implied when it positively reports "no password".
+      emailCode: hasPassword === false,
+      oauth: [],
       raw: res.data,
     };
   } catch (e) {
     log.warn(`CheckUserLoginMethod unreachable: ${e.message}`);
     return null;
   }
+}
+
+// Authoritative login-method probe.
+//
+// Order matters: /_devin-auth/connections FIRST (its auth_method.has_password
+// is what the website itself branches on), CheckUserLoginMethod only as
+// enrichment when connections cannot answer. A probe that learns nothing
+// yields hasPassword:null — callers must treat that as "unknown", not as
+// either "password-capable" or "no password".
+//
+// When the login-host fallback is enabled, the SAME read-only probe is asked
+// on app.devin.ai before giving up: both hosts were measured to return the
+// identical shape (2026-10-22), and a probe outage on the Vercel host is the
+// one input that used to turn "this account has no password" into
+// "wrong password" (see the recheck in windsurfLoginPrimaryHost). With the
+// fallback off, only windsurf.com is contacted — the default contract.
+export async function probeLoginMethod(email, proxy = null, fingerprint = null) {
+  const fp = fingerprint || generateFingerprint();
+  const hosts = isLoginHostFallbackEnabled() ? ['windsurf', 'devin'] : ['windsurf'];
+  let lastRaw = null;
+  for (const host of hosts) {
+    try {
+      const connections = await fetchAuth1Connections(email, fp, proxy, host);
+      lastRaw = connections;
+      const interpreted = interpretConnections(connections);
+      // A known non-auth1 method (firebase/oauth) is a routing answer, not noise:
+      // returning it lets windsurfLoginPrimaryHost reach the legacy Firebase path
+      // instead of guessing Auth1. Only a bare/empty body stays "unknown".
+      if (interpreted.hasPassword !== null || interpreted.userExists === false
+          || (interpreted.method && interpreted.method !== 'auth1')) {
+        rememberProbeHost(email, host);
+        return { ...interpreted, source: 'connections', host };
+      }
+    } catch (err) {
+      // A definitive answer about the address is not an availability failure.
+      if (err?.code === 'ERR_INVALID_EMAIL') throw err;
+      log.warn(`Auth1 connections probe failed on ${host} for ${safeEmailRef(email)}: ${err.message}`);
+    }
+  }
+  const check = await fetchCheckUserLoginMethod(email, fp, proxy);
+  if (check) return { ...check, source: 'check_user_login_method', host: null };
+  return {
+    method: null,
+    hasPassword: null,
+    userExists: null,
+    emailCode: false,
+    oauth: [],
+    raw: lastRaw || {},
+    source: 'unknown',
+    host: null,
+  };
 }
 
 async function registerWithCodeium(token, fingerprint, proxy) {
@@ -567,6 +769,9 @@ async function windsurfLoginViaAuth1(email, password, fingerprint, proxy) {
     apiKey: sessionToken,
     name: email,
     email,
+    // V-24: the address upstream just authenticated. A bound re-auth compares
+    // this with the account row before the token may replace anything.
+    identityEmail: normalizeLoginIdentity(email),
     apiServerUrl: '',
     sessionToken,
     auth1Token,
@@ -595,16 +800,30 @@ async function windsurfLoginViaAuth1(email, password, fingerprint, proxy) {
 // confirmed with a real account before relying on the fallback as live-effective.
 async function windsurfLoginViaDevinHost(email, password, fingerprint, proxy) {
   // Step 1 — connections probe (app.devin.ai uses product:"devin").
-  // Best-effort: a probe failure must NOT abort — we still try the login,
+  // Best-effort: a probe FAILURE must NOT abort — we still try the login,
   // exactly like the primary path tolerates a flaky connections endpoint.
+  // A probe that SUCCEEDS and reports `has_password:false` is different: that
+  // is the same terminal wrong-method answer as on windsurf.com, so the
+  // password login is skipped instead of burning a guaranteed 401.
   try {
     const connBody = JSON.stringify({ product: 'devin', email });
     const connHeaders = buildJsonHeaders(fingerprint, connBody);
-    await httpsRequestRetrying(
+    const connRes = await httpsRequestRetrying(
       DEVIN_AUTH1_CONNECTIONS_URL, { method: 'POST', headers: connHeaders }, connBody, proxy,
       'Devin-host Auth1 connections'
     );
+    const probed = interpretConnections(connRes.data);
+    if (probed.hasPassword === false) {
+      const err = new Error('ERR_NO_PASSWORD_OAUTH_ACCOUNT');
+      err.code = 'ERR_NO_PASSWORD_OAUTH_ACCOUNT';
+      err.method = probed.emailCode ? 'email_code' : 'oauth';
+      err.oauthProviders = probed.oauth || [];
+      err.detail = 'app.devin.ai reports this account has no password.';
+      err.isAuthFail = false;
+      throw err;
+    }
   } catch (err) {
+    if (err?.code === 'ERR_NO_PASSWORD_OAUTH_ACCOUNT') throw err;
     log.warn(`Devin-host connections probe failed for ${safeEmailRef(email)}: ${err.message}`);
   }
 
@@ -645,6 +864,7 @@ async function windsurfLoginViaDevinHost(email, password, fingerprint, proxy) {
     apiKey: sessionToken,
     name: email,
     email,
+    identityEmail: normalizeLoginIdentity(email),
     apiServerUrl: '',
     sessionToken,
     auth1Token,
@@ -696,6 +916,7 @@ async function windsurfLoginViaFirebase(email, password, fingerprint, proxy) {
     apiKey: reg.api_key,
     name: reg.name || email,
     email,
+    identityEmail: normalizeLoginIdentity(email),
     idToken,
     refreshToken: fbRes.data.refreshToken || '',
     apiServerUrl: reg.api_server_url || '',
@@ -792,6 +1013,12 @@ export async function windsurfLogin(email, password, proxy = null) {
   try {
     return await windsurfLoginPrimaryHost(email, password, fingerprint, proxy);
   } catch (primaryErr) {
+    // A terminal login-method answer is not an availability failure: the
+    // account has no password, so the second host would be asked to run the
+    // exact same impossible password login. Never fall back for these.
+    if (primaryErr?.code === 'ERR_NO_PASSWORD_OAUTH_ACCOUNT' || primaryErr?.code === 'ERR_EMAIL_NOT_FOUND') {
+      throw primaryErr;
+    }
     // Default (flag unset): preserve the exact pre-existing behavior — only
     // windsurf.com runs, so re-throw and never touch app.devin.ai.
     if (!isLoginHostFallbackEnabled()) throw primaryErr;
@@ -821,39 +1048,50 @@ export async function windsurfLogin(email, password, proxy = null) {
   }
 }
 
-// The original windsurf.com login path (CheckUserLoginMethod probe →
-// Auth1 password/login → PostAuth, or legacy Firebase). Extracted verbatim
-// from windsurfLogin so the public entry can wrap it with the opt-in
+// One terminal "no password" answer, used both by the probe's first pass and
+// by the post-rejection recheck. `method` lets the dashboard switch the form
+// (email code vs OAuth-only) without a second probe, and `isAuthFail:false`
+// keeps a wrong-method answer out of the per-email lockout.
+function noPasswordError(probe) {
+  const err = new Error('ERR_NO_PASSWORD_OAUTH_ACCOUNT');
+  err.code = 'ERR_NO_PASSWORD_OAUTH_ACCOUNT';
+  err.method = probe.emailCode ? 'email_code' : 'oauth';
+  err.oauthProviders = probe.oauth || [];
+  err.detail = probe.emailCode
+    ? 'This account has no password. Log in with the emailed verification code, or with Google/GitHub, or paste an Auth Token from windsurf.com/show-auth-token.'
+    : 'This account has no password and email-code login is disabled. Log in with Google/GitHub, or paste an Auth Token from windsurf.com/show-auth-token.';
+  err.isAuthFail = false;
+  err.statusCode = 400;
+  return err;
+}
+
+// The original windsurf.com login path (login-method probe →
+// Auth1 password/login → PostAuth, or legacy Firebase). Extracted from
+// windsurfLogin so the public entry can wrap it with the opt-in
 // app.devin.ai host fallback without altering this logic.
 async function windsurfLoginPrimaryHost(email, password, fingerprint, proxy) {
-  // Probe sequence (per Windsurf 2026-04-26 half-migration):
-  //   1. CheckUserLoginMethod (new Connect-RPC, fast + clean shape)
-  //   2. _devin-auth/connections (old path, slow/flaky but still wired)
-  //   3. fall through to Firebase legacy path
-  let conn = await fetchCheckUserLoginMethod(email, fingerprint, proxy);
-  if (!conn || conn.method === null) {
-    let auth1Connections = null;
-    try {
-      auth1Connections = await fetchAuth1Connections(email, fingerprint, proxy);
-    } catch (err) {
-      log.warn(`Auth1 connections probe failed for ${safeEmailRef(email)}: ${err.message}`);
-    }
-    // interpretConnections handles BOTH the old `{auth_method:{...}}`
-    // and the post-2026-04-26 `{connections:[...]}` shape — Windsurf is
-    // currently serving both depending on which CDN edge you hit.
-    conn = interpretConnections(auth1Connections);
+  // Probe: /_devin-auth/connections is authoritative; CheckUserLoginMethod
+  // only enriches when connections is unreachable. `hasPassword:null` means
+  // both probes were silent — NOT "password-capable".
+  const probe = await probeLoginMethod(email, proxy, fingerprint);
+
+  if (probe.userExists === false) {
+    const err = createFriendlyAuthError('Auth1', 'EMAIL_NOT_FOUND');
+    // A nonexistent address is not a wrong credential; locking it would let a
+    // typo (or an enumeration probe) ban a real operator for 15 minutes.
+    throw err;
   }
 
-  if (conn.method === 'auth1') {
-    if (!conn.hasPassword) {
-      // This account has no email/password set — it registered via Google/GitHub
-      // OAuth. That's a WRONG-METHOD signal, not a brute-force guess, so it must
-      // NOT count toward the email lockout (otherwise using the wrong login tab
-      // 3x locks the user out for 15min). Just return a clear, actionable error.
-      const err = createFriendlyAuthError('Auth1', 'This account has no password (registered via Google/GitHub). Use the OAuth login, or paste an Auth Token from windsurf.com/show-auth-token.');
-      err.code = 'ERR_NO_PASSWORD_OAUTH_ACCOUNT';
-      throw err;
-    }
+  if (probe.hasPassword === false) {
+    // Terminal wrong-method signal: this account has no password (registered
+    // via Google/GitHub OAuth, or email-code only). It is NOT a brute-force
+    // guess, so it must not count toward the email lockout, and it must never
+    // reach password/login — the upstream 401 for such an account is not
+    // evidence of a wrong password, only of a wrong method.
+    throw noPasswordError(probe);
+  }
+
+  if (probe.hasPassword === true) {
     try {
       const result = await windsurfLoginViaAuth1(email, password, fingerprint, proxy);
       recordEmailSuccess(email);
@@ -864,33 +1102,608 @@ async function windsurfLoginPrimaryHost(email, password, fingerprint, proxy) {
       if (e?.isAuthFail || /ERR_LOGIN_FAILED|ERR_AUTH1|EMAIL|PASSWORD/i.test(e?.message || '')) {
         recordEmailFailure(email, e?.message);
       }
+      // The method WAS confirmed here, so the caller must not offer the
+      // "this account may have no password" alternatives.
+      if (e && typeof e === 'object') e.probeUnknown = false;
       throw e;
     }
   }
 
-  try {
+  // A known non-auth1 method (legacy firebase/oauth) is an explicit routing
+  // answer: go straight to the legacy path instead of guessing Auth1.
+  if (probe.method && probe.method !== 'auth1') {
     const result = await windsurfLoginViaFirebase(email, password, fingerprint, proxy);
     recordEmailSuccess(email);
     return result;
-  } catch (firebaseErr) {
-    if (!firebaseErr?.isAuthFail) {
-      // Network / Firebase 5xx — don't count, just bubble up.
-      throw firebaseErr;
+  }
+
+  // Probe unknown (both hosts and the secondary probe silent): we have no
+  // evidence the account lacks a password, so the operator-supplied password
+  // still gets one attempt. Auth1 FIRST — the legacy Firebase
+  // signInWithPassword endpoint is App-Check-gated upstream (measured
+  // 2026-10-22: 401 "Firebase App Check token is invalid" for every
+  // server-side caller), so leading with it only delays the real attempt.
+  // Firebase stays as the last resort when Auth1 itself is unavailable.
+  try {
+    const result = await windsurfLoginViaAuth1(email, password, fingerprint, proxy);
+    recordEmailSuccess(email);
+    return result;
+  } catch (auth1Err) {
+    if (!auth1Err?.isAuthFail) {
+      // Auth1 never judged the credential (network / 5xx / PostAuth). Try the
+      // legacy path once; if it also fails, surface the Auth1 error, which is
+      // the meaningful one.
+      try {
+        const result = await windsurfLoginViaFirebase(email, password, fingerprint, proxy);
+        recordEmailSuccess(email);
+        return result;
+      } catch {
+        throw auth1Err;
+      }
     }
 
+    // Auth1 positively rejected the credential. Before reporting "wrong
+    // password", re-ask the method ONCE: a probe outage on the first call is
+    // exactly how an email-code-only account was reported as
+    // ERR_INVALID_CREDENTIALS (live 2026-10-21, 3.9.42). This recheck only
+    // runs after a rejected password, so it costs nothing on the happy path.
+    let recheck = null;
     try {
-      const result = await windsurfLoginViaAuth1(email, password, fingerprint, proxy);
-      recordEmailSuccess(email);
-      return result;
-    } catch (auth1Err) {
-      if (auth1Err?.isAuthFail) {
-        // Both paths confirmed the credential is wrong — count as one
-        // failure (not two) so 3 distinct attempts truly = ban.
-        recordEmailFailure(email, firebaseErr?.message || auth1Err?.message);
-        throw firebaseErr;
-      }
-      throw auth1Err;
+      recheck = await probeLoginMethod(email, proxy, fingerprint);
+    } catch { /* stays unknown */ }
+    if (recheck && recheck.hasPassword === false) {
+      throw noPasswordError(recheck);
     }
+
+    // One credential guess, counted once (the old Firebase→Auth1 chain could
+    // have counted two).
+    recordEmailFailure(email, auth1Err?.message);
+    // Tell the caller the method was never confirmed: the password really was
+    // rejected, but if the address is OAuth/email-code-only the operator
+    // needs the alternative offered, not "wrong password" alone.
+    auth1Err.probeUnknown = recheck ? recheck.hasPassword === null : true;
+    auth1Err.alternatives = ['email_code', 'oauth', 'token'];
+    throw auth1Err;
+  }
+}
+
+// ─── Email-code login (accounts without a password) ───────────────────────
+//
+// For accounts whose probe says `has_password:false`, the only non-OAuth path
+// is the emailed 6-digit code (recon .agent/loginrecon-20261022/LoginRecon.md §4.3):
+//
+//   POST /_devin-auth/email/start    {email, mode:'login', product:'Windsurf'}
+//     → {email_verification_token}
+//   POST /_devin-auth/email/complete {email_verification_token, code, mode:'login'}
+//     → {token}                      (an Auth1 token, same kind password/login mints)
+//   → postAuthDualPath(token) → session_token, used as the pool API key.
+//
+// The verification token is a bearer secret for one account. It stays in this
+// module's memory keyed by an opaque flowId, never travels to the browser, and
+// never appears in a log line. The code is equally secret: it is forwarded
+// upstream and dropped.
+//
+// DESIGN GAP (Q2 F2, deliberately NOT implemented here): the resulting
+// `devin-session-token$…` has no refresh path. refreshAllFirebaseTokens skips
+// accounts without a refreshToken, reLoginAccount needs a stored password this
+// flow never has (storeCredential:false), and the Auth1 token's TTL is
+// unmeasured — so a retired session is only recoverable by re-adding the
+// account. The design work that remains is an explicit "needs reauth" account
+// state (or encrypted Auth1 storage once its TTL is known), not a retry here.
+const EMAIL_FLOW_TTL_MS = 10 * 60 * 1000;
+const EMAIL_FLOW_MAX_ATTEMPTS = 5;
+const EMAIL_FLOW_MAX_ENTRIES = 200;
+// Devin's own UI enforces a 30s resend cooldown; mirror it so a double-click
+// loop cannot burn the upstream send quota (and the account's sender
+// reputation) without an operator decision.
+const EMAIL_CODE_RESEND_COOLDOWN_MS = 30 * 1000;
+// A successful email/complete mints an Auth1 token that is single-use upstream,
+// so it is the only thing that can be replayed when the PostAuth exchange
+// fails. Keep it briefly: long enough to ride out a PostAuth blip, short enough
+// that a forgotten flow cannot be used as a session minter (F6).
+const EMAIL_FLOW_POSTAUTH_RETRY_MS = 2 * 60 * 1000;
+const EMAIL_FLOW_POSTAUTH_MAX_ATTEMPTS = 3;
+
+// Upstream `email/complete` failures are NOT all credential guesses (F5).
+// Only a positive "the code is wrong" detail may feed the per-email lockout:
+//   - an expired/consumed verification token (measured: 401
+//     {"detail":"Invalid verification token"}, 6/6) says nothing about the
+//     digits the user typed, and the token cannot be retried anyway;
+//   - a 5xx / transport failure says nothing at all.
+// Counting either as a wrong code locked PASSWORD login for 15 minutes after a
+// code simply expired.
+const EMAIL_CODE_MISMATCH_RE = /invalid verification code|invalid code|incorrect code|wrong code/i;
+const EMAIL_FLOW_DEAD_RE = /invalid verification token|verification token|expired|already used|already consumed/i;
+
+// 'expired'   → the verification token is dead upstream: drop the flow, retry
+//               is impossible, no lockout.
+// 'code'      → upstream positively says the digits are wrong: count the flow
+//               attempt AND the email lockout.
+// 'rejected'  → upstream 400/422 without a reason: count the flow attempt
+//               (one flow must not be an unlimited oracle) but not the lockout.
+// 'unavailable' → 403/404/405/429/5xx: availability, retry the same code.
+function classifyEmailCompleteFailure(res, detail) {
+  const text = String(detail || '');
+  if (res.status === 401 || res.status === 410 || EMAIL_FLOW_DEAD_RE.test(text)) return 'expired';
+  if (EMAIL_CODE_MISMATCH_RE.test(text)) return 'code';
+  if (res.status === 400 || res.status === 422) return 'rejected';
+  return 'unavailable';
+}
+
+const _emailFlows = new Map();
+const _emailCodeSentAt = new Map();
+
+export function _resetEmailFlowsForTests() {
+  _emailFlows.clear();
+  _emailCodeSentAt.clear();
+}
+
+function emailFlowError(code, detail, statusCode, extra = null) {
+  const err = new Error(code);
+  err.code = code;
+  err.detail = detail;
+  err.statusCode = statusCode;
+  err.isAuthFail = false;
+  if (extra) Object.assign(err, extra);
+  return err;
+}
+
+// Same per-email lockout the password path uses, so a code-guessing loop is
+// bounded by the operator's configured strike count. 400, not 429: the
+// dashboard UI renders a 429 as an IP-wide ban overlay, and this lock is
+// per-email.
+function emailLockedError(lockMs) {
+  return emailFlowError(
+    'ERR_EMAIL_LOCKED',
+    `Email temporarily locked after repeated failed logins; retry in ${Math.ceil(lockMs / 60000)} min.`,
+    400,
+    { retryAfterMs: lockMs },
+  );
+}
+
+// ─── Login identity (V-24 / audit A23) ────────────────────────────────────
+//
+// A login result proves ONE thing about identity: the address that upstream
+// authenticated. A bound re-auth (`accountId`) replaces the token on an
+// existing row, so a result for a different address would install person B's
+// session on person A's row and clear A's error/ban state on the way. The
+// identity is therefore part of the login result and is compared before any
+// token/status mutation; case and surrounding whitespace are not identity.
+//
+// Upstream reports `accountId` too, but the pool rows do not carry it, so it
+// is not a comparable key here — the authenticated address is.
+
+/** Case/whitespace-insensitive identity key. '' means "no identity proof". */
+function normalizeLoginIdentity(email) {
+  return String(email ?? '').trim().toLowerCase();
+}
+
+/** The identity a login result proves, or '' when it proves none. */
+function loginResultIdentity(result) {
+  return normalizeLoginIdentity(result?.identityEmail || result?.email);
+}
+
+/** Operator-facing masked address; never echoes the full identity. */
+function maskIdentityEmail(email) {
+  const s = String(email ?? '').trim();
+  const at = s.indexOf('@');
+  if (at <= 0) return s ? `${s[0]}***` : '';
+  return `${s[0]}***${s.slice(at)}`;
+}
+
+/**
+ * Throw unless `result` proves it belongs to `expectedEmail`.
+ *
+ * Called with the bound account's address BEFORE markAccountReauthenticated()
+ * (api.js) and, for the email-code flow, before the single-use code is spent.
+ * A result that carries no identity at all is refused on a bound path: the
+ * token would replace a live credential on nothing but hope.
+ */
+export function assertLoginIdentity(result, expectedEmail) {
+  const expected = normalizeLoginIdentity(expectedEmail);
+  if (!expected) return;
+  const actual = loginResultIdentity(result);
+  if (actual && actual === expected) return;
+  const err = new Error('ERR_LOGIN_IDENTITY_MISMATCH');
+  err.code = 'ERR_LOGIN_IDENTITY_MISMATCH';
+  err.statusCode = 409;
+  err.detail = actual
+    ? `This login belongs to ${maskIdentityEmail(actual)}, not to the selected account (${maskIdentityEmail(expected)}).`
+    : `The login did not report which account it belongs to, so it cannot be bound to ${maskIdentityEmail(expected)}.`;
+  throw err;
+}
+
+function pruneEmailFlows(now) {
+  for (const [id, flow] of _emailFlows) {
+    if (now > flow.expiresAt) _emailFlows.delete(id);
+  }
+  // The resend-cooldown map is keyed by email and would otherwise keep one
+  // entry per address forever on a long-lived process.
+  for (const [email, sentAt] of _emailCodeSentAt) {
+    if (now - sentAt > EMAIL_FLOW_TTL_MS) _emailCodeSentAt.delete(email);
+  }
+  if (_emailFlows.size < EMAIL_FLOW_MAX_ENTRIES) return;
+  const oldest = [..._emailFlows.entries()]
+    .sort((a, b) => a[1].createdAt - b[1].createdAt)
+    .slice(0, _emailFlows.size - EMAIL_FLOW_MAX_ENTRIES + 1);
+  for (const [id] of oldest) _emailFlows.delete(id);
+}
+
+setInterval(() => pruneEmailFlows(Date.now()), 10 * 60 * 1000).unref?.();
+
+function emailEndpointUrl(kind, host) {
+  if (kind === 'start') return host === 'devin' ? DEVIN_AUTH1_EMAIL_START_URL : AUTH1_EMAIL_START_URL;
+  return host === 'devin' ? DEVIN_AUTH1_EMAIL_COMPLETE_URL : AUTH1_EMAIL_COMPLETE_URL;
+}
+
+function emailEndpointBody(kind, host, { email, token, code }) {
+  if (kind === 'start') {
+    // Devin's bundle sends `{email, mode}`; windsurf.com adds `product`.
+    return host === 'devin' ? { email, mode: 'login' } : { email, mode: 'login', product: 'Windsurf' };
+  }
+  return { email_verification_token: token, code, mode: 'login' };
+}
+
+function upstreamDetail(data) {
+  const raw = data?.detail ?? data?.error ?? data?.message;
+  if (Array.isArray(raw)) return raw.map(d => d?.msg || d?.type || JSON.stringify(d)).join('; ');
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw === 'object') return String(raw.message || raw.code || '');
+  return '';
+}
+
+// POST one email endpoint, moving to the other login host only on an
+// AVAILABILITY failure (network / 5xx / endpoint gone) and only when the
+// existing DEVIN_CONNECT_LOGIN_HOST_FALLBACK switch is on. A 4xx is upstream
+// answering (wrong code, expired token, rate limit) — retrying it on a second
+// host would just double-spend the attempt, so it is returned as-is.
+//
+// `kind === 'start'` sends mail, so it is EXACTLY ONCE (F8): no 5xx backoff and
+// no second host after a transport error. A 504 can arrive after the message
+// was queued and a transport error leaves delivery unknown, so either retry
+// sends a second code (measured: 3 sends / 7.0 s for one request). Only an
+// explicit 404/405 — proof that host has no such endpoint — falls through.
+async function requestEmailEndpoint(kind, preferredHost, payload, fingerprint, proxy) {
+  const first = preferredHost || 'windsurf';
+  const second = first === 'windsurf' ? 'devin' : 'windsurf';
+  const hosts = isLoginHostFallbackEnabled() ? [first, second] : [first];
+  const exactlyOnce = kind === 'start';
+  let lastErr = null;
+  for (let i = 0; i < hosts.length; i++) {
+    const host = hosts[i];
+    const url = emailEndpointUrl(kind, host);
+    const body = JSON.stringify(emailEndpointBody(kind, host, payload));
+    const headers = buildJsonHeaders(fingerprint, body);
+    const label = `Auth1 email/${kind} (${host})`;
+    try {
+      const res = exactlyOnce
+        ? await httpsRequest(url, { method: 'POST', headers }, body, proxy)
+        : await httpsRequestRetrying(url, { method: 'POST', headers }, body, proxy, label);
+      const endpointGone = res.status === 404 || res.status === 405;
+      if (endpointGone && i < hosts.length - 1) {
+        log.warn(`${label} unavailable (${res.status}); trying the other login host`);
+        lastErr = new Error(`${label} upstream ${res.status}`);
+        continue;
+      }
+      return { res, host };
+    } catch (err) {
+      lastErr = err;
+      if (exactlyOnce || i === hosts.length - 1) throw err;
+      log.warn(`${label} failed (${err.message}); trying the other login host`);
+      continue;
+    }
+  }
+  throw lastErr || new Error('ERR_EMAIL_ENDPOINT_UNREACHABLE');
+}
+
+/**
+ * Ask Windsurf to email a login code.
+ *
+ * The upstream `email_verification_token` is stored server-side under a fresh
+ * opaque flowId (TTL 10 min, single successful use) and is NOT part of the
+ * returned object — only `{ flowId, sent: true }` reaches the browser.
+ *
+ * @param {string} email
+ * @param {object} [proxy]
+ * @returns {Promise<{flowId: string, sent: true, expiresInMs: number}>}
+ */
+export async function emailLoginStart(email, proxy = null, opts = {}) {
+  const normalizedEmail = String(email || '').trim();
+  if (!normalizedEmail) throw emailFlowError('ERR_EMAIL_REQUIRED', 'email is required', 400);
+
+  const lockMs = checkEmailLocked(normalizedEmail);
+  if (lockMs != null) throw emailLockedError(lockMs);
+
+  // Send the code on the host that answered the method probe (or the one the
+  // operator explicitly picked). A probe that only app.devin.ai could answer
+  // is evidence windsurf.com is unreachable from this deployment; re-guessing
+  // would push the request straight back into the outage. `opts.host` is an
+  // explicit operator choice from the dashboard, not a blind fallback.
+  const explicitHost = opts?.host === 'devin' ? 'devin' : (opts?.host === 'windsurf' ? 'windsurf' : null);
+  const preferredHost = explicitHost || preferredEmailHost(normalizedEmail) || 'windsurf';
+
+  const now = Date.now();
+  const sendKey = normalizedEmail.toLowerCase();
+  const sentAt = _emailCodeSentAt.get(sendKey);
+  if (sentAt != null && now - sentAt < EMAIL_CODE_RESEND_COOLDOWN_MS) {
+    throw emailFlowError(
+      'ERR_EMAIL_CODE_COOLDOWN',
+      'A verification code was just sent; wait before requesting another.',
+      400,
+      { retryAfterMs: EMAIL_CODE_RESEND_COOLDOWN_MS - (now - sentAt) },
+    );
+  }
+
+  // Stamp the ATTEMPT, before the upstream call. A send that fails upstream
+  // (throw / 4xx / 5xx) must not reset the window, otherwise a failing sender
+  // can be hammered in a loop — every retry would reach an upstream that is
+  // already refusing. The success path re-stamps on completion so the 30 s
+  // window still measures from the send that actually went out.
+  _emailCodeSentAt.set(sendKey, now);
+
+  const fingerprint = generateFingerprint();
+  let started;
+  try {
+    started = await requestEmailEndpoint('start', preferredHost, { email: normalizedEmail }, fingerprint, proxy);
+  } catch (err) {
+    // The transport layer rejects with a bare Error (no code), which used to
+    // reach the route as HTTP 400 + a raw English message, breaking the
+    // stable-code contract (F8). One send was attempted; whether the mail went
+    // out is unknowable, so say so instead of inviting an immediate resend.
+    if (err && typeof err.code === 'string' && err.code.startsWith('ERR_EMAIL_') && err.statusCode) throw err;
+    log.warn(`Auth1 email/start transport failure: ${err?.message || err}`);
+    throw emailFlowError(
+      'ERR_EMAIL_START_FAILED',
+      'The email endpoint failed before confirming the send — check the inbox before retrying.',
+      502,
+    );
+  }
+  const { res, host } = started;
+  const detail = upstreamDetail(res.data);
+  if (res.status >= 400 || detail) {
+    throw emailFlowError(
+      'ERR_EMAIL_START_FAILED',
+      detail || `upstream ${res.status}`,
+      res.status >= 500 ? 502 : 400,
+    );
+  }
+  const token = res.data?.email_verification_token;
+  if (typeof token !== 'string' || !token) {
+    throw emailFlowError('ERR_EMAIL_START_NO_TOKEN', 'upstream did not return a verification token', 502);
+  }
+
+  pruneEmailFlows(now);
+  const flowId = randomBytes(16).toString('hex');
+  _emailFlows.set(flowId, {
+    email: normalizedEmail,
+    // V-24: the identity the code was sent to, bound at start so the exchange
+    // can be refused before the single-use code is spent.
+    identityEmail: normalizeLoginIdentity(normalizedEmail),
+    token,
+    host,
+    createdAt: now,
+    expiresAt: now + EMAIL_FLOW_TTL_MS,
+    attempts: 0,
+    used: false,
+    inFlight: false,
+    // Set only after upstream accepts the code; the sole retryable state when
+    // the PostAuth exchange fails (F6). Never the verification token.
+    auth1Token: null,
+    verifiedAt: 0,
+    postAuthAttempts: 0,
+  });
+  _emailCodeSentAt.set(sendKey, Date.now());
+  log.info(`Email login code requested: ${safeEmailRef(normalizedEmail)} host=${host} flowHash=${logHash(flowId)}`);
+  return { flowId, sent: true, expiresInMs: EMAIL_FLOW_TTL_MS, host };
+}
+
+/**
+ * Verify the emailed code and finish the login.
+ *
+ * The code is single-use upstream, but the *exchange* is not the code: a
+ * successful email/complete mints an Auth1 token that is kept on the flow for
+ * EMAIL_FLOW_POSTAUTH_RETRY_MS, so a PostAuth failure can be retried without
+ * asking the user for another email (F6). The flow is marked used only once the
+ * session token exists.
+ *
+ * @param {string} flowId - opaque id returned by emailLoginStart
+ * @param {string} code - the 6-digit code from the inbox
+ * @param {object} [proxy]
+ * @param {object} [opts]
+ * @param {string} [opts.expectedIdentityEmail] - address of the account the
+ *   caller is about to install this session on. A mismatch is refused HERE,
+ *   before the upstream exchange, because the code cannot be replayed.
+ */
+export async function emailLoginComplete(flowId, code, proxy = null, opts = {}) {
+  const id = String(flowId || '');
+  const flow = _emailFlows.get(id);
+  if (!flow) {
+    throw emailFlowError('ERR_EMAIL_FLOW_NOT_FOUND', 'Verification flow not found — request a new code.', 404);
+  }
+  if (flow.used) {
+    throw emailFlowError('ERR_EMAIL_FLOW_USED', 'This verification code was already used — request a new one.', 409);
+  }
+  const now = Date.now();
+  if (now > flow.expiresAt) {
+    _emailFlows.delete(id);
+    throw emailFlowError('ERR_EMAIL_FLOW_EXPIRED', 'The verification code expired — request a new one.', 410);
+  }
+  if (flow.inFlight) {
+    throw emailFlowError('ERR_EMAIL_FLOW_IN_USE', 'This verification code is already being checked.', 409);
+  }
+  // V-24: the flow's identity was bound at start. A caller binding the
+  // exchange to a different account is refused before the code is spent —
+  // after the exchange the code is gone, so a late check would cost the
+  // operator another email for nothing.
+  const expectedIdentity = normalizeLoginIdentity(opts?.expectedIdentityEmail);
+  if (expectedIdentity && expectedIdentity !== (flow.identityEmail || normalizeLoginIdentity(flow.email))) {
+    throw emailFlowError(
+      'ERR_LOGIN_IDENTITY_MISMATCH',
+      `This verification code was sent to ${maskIdentityEmail(flow.email)}, not to the selected account (${maskIdentityEmail(expectedIdentity)}). Request a code for the account you are re-authenticating.`,
+      409,
+    );
+  }
+  const normalizedCode = String(code ?? '').replace(/\s+/g, '');
+  // 6 digits upstream; the bounds are wide on purpose so an upstream policy
+  // change does not reject a valid code here.
+  if (!/^\d{4,10}$/.test(normalizedCode)) {
+    throw emailFlowError('ERR_EMAIL_CODE_INVALID', 'Enter the numeric verification code from the email.', 400);
+  }
+  const lockMs = checkEmailLocked(flow.email);
+  if (lockMs != null) throw emailLockedError(lockMs);
+
+  const fingerprint = generateFingerprint();
+  let auth1Token = null;
+  let completedHost = flow.host;
+  flow.inFlight = true;
+  try {
+    // A code that upstream already accepted is spent: replaying its verification
+    // token would only earn a 401. Retry the exchange with the stored Auth1
+    // token instead, and only inside the short window.
+    const reusable = typeof flow.auth1Token === 'string' && flow.auth1Token
+      && flow.verifiedAt && now - flow.verifiedAt <= EMAIL_FLOW_POSTAUTH_RETRY_MS;
+    if (reusable) {
+      auth1Token = flow.auth1Token;
+      log.info(`Email code already verified; retrying the session exchange: ${safeEmailRef(flow.email)} flowHash=${logHash(id)}`);
+    } else {
+      if (!flow.token) {
+        // Spent verification token, retry window closed: nothing left to send.
+        _emailFlows.delete(id);
+        throw emailFlowError('ERR_EMAIL_FLOW_EXPIRED', 'The verification code was already used — request a new one.', 410);
+      }
+      let exchange;
+      try {
+        exchange = await requestEmailEndpoint(
+          'complete', flow.host, { email: flow.email, token: flow.token, code: normalizedCode }, fingerprint, proxy,
+        );
+      } catch (err) {
+        // Transport layer gave up (plain Error, no code). Upstream never judged
+        // the digits: keep the flow and its attempt count, and say so with a
+        // stable code (F5) instead of leaking a raw message as HTTP 400.
+        if (err && typeof err.code === 'string' && err.code.startsWith('ERR_EMAIL_') && err.statusCode) throw err;
+        log.warn(`Auth1 email/complete transport failure for ${safeEmailRef(flow.email)}: ${err?.message || err}`);
+        throw emailFlowError(
+          'ERR_EMAIL_VERIFY_UNAVAILABLE',
+          'The verification service did not answer — the code was not checked. Try again.',
+          502,
+          { retryable: true },
+        );
+      }
+      const { res, host } = exchange;
+      completedHost = host;
+      const detail = upstreamDetail(res.data);
+      if (res.status >= 400 || detail) {
+        const kind = classifyEmailCompleteFailure(res, detail);
+        if (kind === 'expired') {
+          // The verification token is dead upstream — a retry can only 401
+          // again. Drop the flow and count NOTHING: this is not a code guess
+          // and must never feed the 900 s lockout (F5).
+          _emailFlows.delete(id);
+          throw emailFlowError(
+            'ERR_EMAIL_FLOW_EXPIRED',
+            'The verification code expired or was already used — request a new one.',
+            410,
+          );
+        }
+        if (kind === 'unavailable') {
+          // 5xx / transport / 429 / 403: upstream never judged the digits.
+          // Keep the flow and its attempt count exactly as they were.
+          log.warn(`Auth1 email/complete unavailable (${res.status}) for ${safeEmailRef(flow.email)}`);
+          throw emailFlowError(
+            'ERR_EMAIL_VERIFY_UNAVAILABLE',
+            'The verification service did not answer — the code was not checked. Try again.',
+            502,
+            { retryable: true },
+          );
+        }
+        flow.attempts += 1;
+        // Only a positive "wrong code" answer is a credential guess and feeds
+        // the per-email lockout the password path uses. An ambiguous 400/422
+        // still burns a flow attempt so one flow cannot be an unlimited oracle.
+        if (kind === 'code') recordEmailFailure(flow.email, 'email_code_rejected');
+        if (flow.attempts >= EMAIL_FLOW_MAX_ATTEMPTS) {
+          flow.used = true;
+          flow.token = null;
+        }
+        throw emailFlowError(
+          'ERR_EMAIL_CODE_REJECTED',
+          detail || `upstream ${res.status}`,
+          400,
+          { isAuthFail: kind === 'code', attemptsRemaining: Math.max(0, EMAIL_FLOW_MAX_ATTEMPTS - flow.attempts) },
+        );
+      }
+      auth1Token = res.data?.token;
+      if (typeof auth1Token !== 'string' || !auth1Token) {
+        throw emailFlowError(
+          'ERR_EMAIL_VERIFY_UNAVAILABLE',
+          'The verification service accepted the code but returned no session token. Try again.',
+          502,
+          { retryable: true },
+        );
+      }
+      // The verification token is spent; the Auth1 token is the only thing a
+      // retry may replay, and only for the exchange window.
+      flow.token = null;
+      flow.auth1Token = auth1Token;
+      flow.verifiedAt = Date.now();
+      flow.host = host;
+      log.info(`Email code accepted: ${safeEmailRef(flow.email)} host=${host} flowHash=${logHash(id)}`);
+    }
+
+    flow.postAuthAttempts += 1;
+    const postAuthAttempt = flow.postAuthAttempts;
+    const remaining = Math.max(0, EMAIL_FLOW_POSTAUTH_MAX_ATTEMPTS - postAuthAttempt);
+    const giveUp = () => {
+      flow.used = true;
+      flow.auth1Token = null;
+    };
+    let br;
+    let label;
+    try {
+      ({ res: br, label } = await postAuthDualPath(auth1Token, fingerprint, proxy));
+    } catch (e) {
+      // Both PostAuth hosts failed at the transport/5xx layer. The code stays
+      // valid for the retry window (F6).
+      log.warn(`PostAuth unavailable after an accepted code (${safeEmailRef(flow.email)}): ${e.message}`);
+      if (remaining === 0) giveUp();
+      throw emailFlowError(
+        'ERR_POSTAUTH_FAILED',
+        'Windsurf accepted the code but the session exchange did not answer — retry the same code.',
+        502,
+        { retryable: remaining > 0, attemptsRemaining: remaining },
+      );
+    }
+    if (br.status >= 400 || !br.data?.sessionToken) {
+      log.warn(`PostAuth refused after an accepted code (${safeEmailRef(flow.email)}): HTTP ${br.status}`);
+      if (remaining === 0) giveUp();
+      throw emailFlowError(
+        'ERR_POSTAUTH_FAILED',
+        'Windsurf accepted the code but the session exchange was refused — retry the same code.',
+        502,
+        { retryable: remaining > 0, attemptsRemaining: remaining },
+      );
+    }
+    // Only a real session token consumes the flow.
+    flow.used = true;
+    flow.auth1Token = null;
+    recordEmailSuccess(flow.email);
+    const accountId = br.data.accountId || 'unknown';
+    log.info(`Email-code login OK (${label}): ${safeEmailRef(flow.email)} accountHash=${logHash(accountId)} → using sessionToken as apiKey`);
+    return {
+      apiKey: br.data.sessionToken,
+      name: flow.email,
+      email: flow.email,
+      // V-24: the identity bound to this flow at start — the address the code
+      // was mailed to, not whatever the caller claims at completion.
+      identityEmail: flow.identityEmail || normalizeLoginIdentity(flow.email),
+      apiServerUrl: '',
+      sessionToken: br.data.sessionToken,
+      auth1Token,
+      viaEmailCode: true,
+      ...(completedHost === 'devin' ? { viaHost: 'app.devin.ai' } : {}),
+    };
+  } finally {
+    flow.inFlight = false;
   }
 }
 

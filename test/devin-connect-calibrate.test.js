@@ -18,6 +18,8 @@ import {
   classifyTag, aggregateDumps, findCandidates, runCalibration, statusTable,
   FREE_BASELINE, TARGETS,
 } from '../scripts/devin-connect-calibrate.mjs';
+import { decodeFrame } from '../src/devin-connect.js';
+import { writeStringField, writeFixed64Field } from '../src/proto.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = dirname(__dirname);
@@ -79,6 +81,19 @@ describe('classifyTag — wire-shape → target bucket', () => {
     assert.equal(r.bucket, 'unknown');
     assert.equal(r.targets.length, 0);
   });
+
+  it('routes a top-level numeric to billing/cache — #22 is a descriptor-verified double', () => {
+    const r = classifyTag({ scope: 'top', tag: 22, kind: 'fixed64', preview: 0.0006735000060871243 });
+    assert.equal(r.bucket, 'billing/cache');
+    assert.equal(r.task, '#46');
+    assert.deepEqual(r.targets, ['billing']);
+  });
+
+  it('routes a top-level varint to billing/cache too', () => {
+    const r = classifyTag({ scope: 'top', tag: 26, kind: 'varint', preview: 1200 });
+    assert.equal(r.bucket, 'billing/cache');
+    assert.equal(r.task, '#46');
+  });
 });
 
 describe('aggregateDumps — per-frame dumps → tag inventory', () => {
@@ -92,6 +107,15 @@ describe('aggregateDumps — per-frame dumps → tag inventory', () => {
     assert.equal(inv.top[3].kind, 'string');
     assert.equal(inv.meta[14].kind, 'varint');
     assert.equal(inv.meta[14].preview, 1500);
+  });
+
+  it('keeps a fixed64 dump entry as fixed64 — never mangled to "[object Object]"', () => {
+    const acu = 0.0006735000060871243;
+    const raw = Buffer.alloc(8);
+    raw.writeDoubleLE(acu, 0);
+    const inv = aggregateDumps([{ 22: { kind: 'fixed64', preview: acu, raw: raw.toString('hex') } }], [], []);
+    assert.equal(inv.top[22].kind, 'fixed64');
+    assert.equal(inv.top[22].preview, acu);
   });
 });
 
@@ -133,6 +157,7 @@ describe('runCalibration — env-line generation', () => {
     assert.ok(report.envLines.some((l) => l === 'DEVIN_CONNECT_ACTUAL_MODEL_TAG=8'));
     assert.ok(report.envLines.some((l) => /outer=12/.test(l)));
     assert.ok(report.envLines.some((l) => /14,15/.test(l)));
+    assert.ok(report.envLines.some((l) => /^# meta varint candidates at tags \[14,15\] —/.test(l)));
   });
 
   it('surfaces a probe error without throwing', async () => {
@@ -140,6 +165,53 @@ describe('runCalibration — env-line generation', () => {
     const report = await runCalibration({ real: false, deps: {} });
     assert.equal(report.candidates.length, 0);
     assert.equal(report.error, null);
+  });
+});
+
+describe('#22 top-level double (committed_acu_cost) — production dump shape', () => {
+  it('classifies a real decodeFrame dump as a billing candidate, never actual_model_uid', async () => {
+    // committed_acu_cost is a descriptor-verified top-level double field 22
+    // (docs/DEVIN-CONNECT-CUTOVER.md §7); the frame below is the shape a paid
+    // turn would carry, decoded by the production dump path (dumpMeta).
+    const acu = 0.0006735000060871243;
+    const raw = Buffer.alloc(8);
+    raw.writeDoubleLE(acu, 0);
+    const payload = Buffer.concat([
+      writeStringField(1, 'bot-enterprise'),
+      writeFixed64Field(22, raw),
+    ]);
+    const frame = decodeFrame(payload, { dumpMeta: true });
+    assert.equal(frame.frameDump[22].kind, 'fixed64', 'decoder dump entry is fixed64');
+
+    const report = await runCalibration({ real: false, deps: { frameDumps: [frame.frameDump], metaDumps: [] } });
+    const c22 = report.candidates.find((c) => c.scope === 'top' && c.tag === 22);
+    assert.equal(c22.bucket, 'billing/cache');
+    assert.equal(c22.task, '#46');
+    // The misclassification emitted DEVIN_CONNECT_ACTUAL_MODEL_TAG=22 — a cost
+    // double wired as the model-uid tag. That line must never come back.
+    assert.ok(!report.envLines.some((l) => /DEVIN_CONNECT_ACTUAL_MODEL_TAG=22/.test(l)));
+    // ...and the top-level candidate is surfaced with the ^N pin form instead.
+    assert.ok(report.envLines.some((l) => /\^22/.test(l)));
+  });
+
+  it('a multi-candidate top frame keeps the ^N example generic — never pairs a key with the wrong tag', async () => {
+    // The descriptor puts credit_cost #14 and committed_acu_cost #22 both at the
+    // top level; a hint saying `committed_acu_cost=^14` would wire credit as ACU.
+    const raw14 = Buffer.alloc(8);
+    raw14.writeDoubleLE(1.25, 0);
+    const raw22 = Buffer.alloc(8);
+    raw22.writeDoubleLE(0.0006735000060871243, 0);
+    const payload = Buffer.concat([
+      writeStringField(1, 'bot-enterprise'),
+      writeFixed64Field(14, raw14),
+      writeFixed64Field(22, raw22),
+    ]);
+    const frame = decodeFrame(payload, { dumpMeta: true });
+    const report = await runCalibration({ real: false, deps: { frameDumps: [frame.frameDump], metaDumps: [] } });
+    const line = report.envLines.find((l) => /top-level numeric candidates/.test(l));
+    assert.ok(line, 'top-level hint present');
+    assert.ok(!/committed_acu_cost=\^14/.test(line));
+    assert.ok(/<field>=\^14/.test(line));
   });
 });
 

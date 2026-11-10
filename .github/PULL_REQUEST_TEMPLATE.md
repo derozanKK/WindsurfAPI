@@ -19,12 +19,17 @@
 <!-- 项目有完整测试套件（当前 3900+ 断言）。请贴实际跑过的命令和结果。
      The project HAS a full suite (3900+ assertions today). Paste what you actually ran.
 
-     export PATH=~/.local/share/mise/installs/node/24/bin:$PATH   # Node 24 必需 / required
+     export PATH=~/.local/share/mise/installs/node/24/bin:$PATH   # 发布门禁 / release gate
      npm run test:release          # 权威口径 / the authoritative gate
      node --import ./test/setup-env.mjs --test test/你的.test.js
 
-     Node 22 会让一条 absolute-deadline 测试挂起并连带取消约 80 个 —— 那不是你的 bug。
-     Node 22 hangs one deadline test and cancels ~80 others; not your bug. -->
+     支持下限是 Node 22.13+（`test:summary` 自 22.10、免 flag 的 `node:sqlite` 自 22.13）。
+     Node 20 已 EOL 且不再支持：它的 runner 不发 `test:summary`，两个 harness 自测会失败；
+     `node:sqlite` 也不存在，4 条本地导入测试不会被收集。22.13+ 与 24.x 应全绿。
+     Supported floor is Node 22.13+ (`test:summary` since 22.10, unflagged `node:sqlite` since 22.13).
+     Node 20 is EOL and unsupported: its runner emits no `test:summary`, so the two harness
+     self-tests fail, and `node:sqlite` is absent, so 4 import tests are not collected.
+     On 22.13+ and 24.x the suite should be green. -->
 
 ## Checklist
 

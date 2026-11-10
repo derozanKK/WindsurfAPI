@@ -9,9 +9,9 @@ Object.assign(process.env, { CASCADE_POLL_INTERVAL_MS: '5', CASCADE_IDLE_GRACE_M
   GRPC_PROTOCOL: 'connect', WINDSURFAPI_USER_JWT: '0', CASCADE_MAX_HISTORY_BYTES: '1024' });
 const { WindsurfClient } = await import('../src/client.js');
 
-async function exercise({ recovered, system = '', size = 170, intact = false }) {
-  const history = Array.from({ length: 5 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user',
-    content: `TURN_${i}_MARKER` + (i < 4 ? 'x'.repeat(size) : '') }));
+async function exercise({ recovered, system = '', size = 170, intact = false, turns = 5, model = 'audit-neutral-model' }) {
+  const history = Array.from({ length: turns }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user',
+    content: `TURN_${i}_MARKER` + (i < turns - 1 ? 'x'.repeat(size) : '') }));
   const messages = system ? [{ role: 'system', content: system }, ...history] : history;
   const before = JSON.stringify(messages), prompts = [], sessions = new Set();
   const server = http2.createServer();
@@ -32,9 +32,14 @@ async function exercise({ recovered, system = '', size = 170, intact = false }) 
           stream.respond({ ':status': 200, 'content-type': headers['content-type'] }); stream.end(frame); return;
         }
       }
-      if (method === 'GetCascadeTrajectorySteps') body = writeMessageField(1, Buffer.concat([
-        writeVarintField(1, 15), writeVarintField(4, 3), writeMessageField(20, writeStringField(1, 'answer')),
-      ]));
+      if (method === 'GetCascadeTrajectorySteps') {
+        const stepOffset = getField(parseFields(payload), 2, 0);
+        if (!stepOffset) {
+          body = writeMessageField(1, Buffer.concat([
+            writeVarintField(1, 15), writeVarintField(4, 3), writeMessageField(20, writeStringField(1, 'answer')),
+          ]));
+        }
+      }
       if (method === 'GetCascadeTrajectory') body = writeVarintField(2, 1);
       stream.respond({ ':status': 200, 'content-type': headers['content-type'] || 'application/connect+proto' });
       stream.end(Buffer.concat([wrapEnvelope(body, { compress: false }), endOfStreamEnvelope()]));
@@ -44,7 +49,7 @@ async function exercise({ recovered, system = '', size = 170, intact = false }) 
   try {
     const port = server.address().port;
     const client = new WindsurfClient('fixture-only-api-key', port, 'fixture-csrf');
-    const chunks = await client.cascadeChat(messages, 0, 'audit-neutral-model', {
+    const chunks = await client.cascadeChat(messages, 0, model, {
       reuseEntry: recovered ? { cascadeId: 'synthetic-existing', sessionId: 'fixture-session', stepOffset: 5, generatorOffset: 5 } : null,
     });
     assert.equal(JSON.stringify(messages), before, 'caller history is not mutated');
@@ -54,14 +59,14 @@ async function exercise({ recovered, system = '', size = 170, intact = false }) 
       const included = history.map((m, i) => wire.includes(`TURN_${i}_MARKER`) ? i : -1).filter(i => i >= 0);
       assert.ok(included.length > 0);
       const first = included[0];
-      assert.deepEqual(included, Array.from({ length: 5 - first }, (_, i) => first + i), 'wire carries a contiguous history suffix');
+      assert.deepEqual(included, Array.from({ length: turns - first }, (_, i) => first + i), 'wire carries a contiguous history suffix');
       // Order, not just presence: the wire must carry the history oldest-first. Turning
       // the builder's `lines.unshift(...)` into a push reverses it while every
       // presence/contiguity assertion above still passes, and turn order is
       // semantically load-bearing for the model.
       const positions = included.map(i => wire.indexOf(`TURN_${i}_MARKER`));
       assert.deepEqual(positions, [...positions].sort((a, b) => a - b), 'history turns appear in chronological order on the wire');
-      assert.deepEqual(chunks.historyCoverage, { droppedTurnCount: first, firstIncludedTurnIndex: first, totalTurns: 5 }, 'metadata equals decoded prompt contents, not another return value');
+      assert.deepEqual(chunks.historyCoverage, { droppedTurnCount: first, firstIncludedTurnIndex: first, totalTurns: turns }, 'metadata equals decoded prompt contents, not another return value');
     }
     return { coverage: chunks.historyCoverage, wire };
   } finally {
@@ -89,4 +94,14 @@ it('an intact resume retains upstream coverage while sending only the new turn',
   const r = await exercise({ recovered: true, intact: true });
   assert.deepEqual(r.coverage, { droppedTurnCount: 0, firstIncludedTurnIndex: 0, totalTurns: 5 });
   assert.ok(r.wire.includes('TURN_4_MARKER')); assert.ok(!r.wire.includes('TURN_0_MARKER'));
+});
+
+it('uses the 900 KB branch for a 1M model and the 600 KB branch otherwise', async () => {
+  const oneM = await exercise({ recovered: false, size: 140000, turns: 6, model: 'claude-sonnet-4-6-1m' });
+  assert.equal(oneM.coverage.totalTurns, 6);
+  assert.equal(oneM.coverage.droppedTurnCount, 0, '840 KB history fits the 900 KB 1M branch');
+  const normal = await exercise({ recovered: false, size: 140000, turns: 6, model: 'claude-sonnet-4-6' });
+  assert.equal(normal.coverage.totalTurns, 6);
+  assert.ok(normal.coverage.droppedTurnCount > 0, '840 KB history exceeds the 600 KB normal branch');
+  assert.ok(normal.wire.includes('TURN_5_MARKER'));
 });

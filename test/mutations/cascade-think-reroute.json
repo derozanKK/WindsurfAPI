@@ -21,8 +21,8 @@
     {
       "name": "the classifier is never flushed at the stream tail, so an unterminated span is silently swallowed instead of delivered as text. flush() is the caller-side invariant of ThinkTextClassifier and forgetting it loses content, which is exactly what the reroute must never do",
       "file": "src/handlers/chat.js",
-      "anchor": "              const tail = thinkClassifier.flush();\n              if (tail) emitContent(tail);",
-      "replacement": "              const tail = thinkClassifier.flush();\n              if (false) emitContent(tail);"
+      "anchor": "              const tail = thinkClassifier.flush();\n              if (tail) await emitContent(tail);",
+      "replacement": "              const tail = thinkClassifier.flush();\n              if (false) await emitContent(tail);"
     },
     {
       "name": "MAX_LEAD overflow is checked BEFORE the marker scan again (the pre-hardening ordering in response-classifier.js): once enough undecided bytes are held, a leading think block is dumped to the text channel unscanned. The reroute silently stops working on whole-body or whitespace-heavy deltas — the leak it exists to break",

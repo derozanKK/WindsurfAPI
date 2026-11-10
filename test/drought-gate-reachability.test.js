@@ -55,6 +55,7 @@ async function chat(model) {
     status: res?.status ?? null,
     type: res?.body?.error?.type ?? null,
     code: res?.body?.error?.code ?? null,
+    message: res?.body?.error?.message ?? null,
     allowed: res?.body?.error?.drought?.allowedModels ?? null,
   };
 }
@@ -96,6 +97,24 @@ describe('drought gate reachability on DEVIN_CONNECT (#234)', () => {
       'the fallback offered to the client must be routable on this backend');
     assert.ok(!res.allowed.includes('gemini-2.5-flash'),
       'connect cannot route to the Cascade free model, so it must not be advertised');
+  });
+
+  it('names the #258 drought-safe selectors in the 503 suggestion list', async () => {
+    // The gate admits DROUGHT_SAFE_SELECTORS (weekly-quota-exempt paid selectors)
+    // on top of the free-reachable one. A suggestion list that omits them points
+    // clients at the single model the drought pool may not be able to serve —
+    // the exact wording-vs-gate gap the maintainer flagged on #258.
+    connectDroughtEnv();
+    pool(1);
+
+    const res = await chat('claude-opus-4-8-medium');
+    assert.equal(res.status, 503);
+    for (const sel of ['swe-1-7', 'swe-1-7-medium', 'glm-5-2']) {
+      assert.ok(res.allowed.includes(sel), `503 allowedModels must offer ${sel}`);
+      assert.ok(res.message.includes(sel), `503 message must name ${sel}`);
+    }
+    assert.ok(res.allowed.includes('swe-1-6-slow'),
+      'the free-reachable selector stays offered alongside them');
   });
 
   it('does NOT block the free-reachable selector during a drought', async () => {
@@ -192,9 +211,17 @@ describe('drought gate structure — escape points (#234)', () => {
     //                                selector predicate would be wrong.
     //   - strict-model 400        -> the model does not resolve at all; a precise
     //                                model_not_found beats a misleading 503.
+    //
+    // (`parallel_tool_calls:false` used to be a third escape — a permanent 400 that
+    // had to answer before any account was touched. It is served now, with the drop
+    // warned once and counted, so no return exists above the gate for it.)
     const ACCEPTED_ESCAPES = [
       { match: /handleSpecialAgentChatCompletion/, why: 'ACP vision reroute → special_agent namespace' },
       { match: /code: 'model_not_found'/, why: 'unresolvable model name → precise 400' },
+      // P-03: the Connect ChatMessage wire has no attachment field. A
+      // file/document part is a request-shape error, not a pool-state question,
+      // so its stable 400 must answer before the drought 503.
+      { match: /unsupportedFilePartError/, why: 'file/document content cannot ride the Connect wire → stable 400' },
     ];
 
     const escapes = [];

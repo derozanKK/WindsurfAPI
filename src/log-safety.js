@@ -15,6 +15,10 @@ export function safeAccountRef(accountOrId, label = '') {
   return rawLabel ? `${out} labelHash=${logHash(rawLabel)}` : out;
 }
 
+export function accountRef(id) {
+  return `acct-${logHash(id, 8)}`;
+}
+
 export function safeEmailRef(email) {
   return `emailHash=${logHash(email)}`;
 }

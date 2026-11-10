@@ -3,17 +3,15 @@ import assert from 'node:assert/strict';
 import { buildGetChatMessageRequest, __testing } from '../src/devin-connect.js';
 import { parseFields, getField } from '../src/proto.js';
 
-// CompletionConfiguration #2/#3 tag swap.
+// CompletionConfiguration — #2 = max_tokens, #3 = max_newlines.
 //
-// The encoder had max_tokens and max_newlines transposed: #2 received the 128000
-// context window and #3 received the caller's output cap. Four independent .proto
-// definitions agree the schema is #2 = max_tokens, #3 = max_newlines.
-//
-// The defect was invisible on the wire (both fields are plausible varints, and a
-// large max_newlines is a no-op), so the request kept succeeding — while max_tokens
-// sat pinned at the context window, i.e. effectively uncapped. The free-tier probe
-// that varied maxTokens 16 → 1000 and saw identical output was reading exactly
-// this: the cap never reached the field that enforces it.
+// History: the encoder once had max_tokens and max_newlines transposed — #2
+// received the 128000 context window and #3 received the caller's output cap, so
+// the cap never reached the field that enforces it. The swap was fixed; the
+// follow-up cleanup removed the context-window input from this builder entirely:
+// #3 carries max_newlines (an explicit value, else the calibrated default), and a
+// context window is never written to it. The default stays on the wire — the
+// request layout is wire-compared.
 //
 // These assertions are byte-level on purpose. A test that reads the same struct
 // the encoder writes cannot distinguish a swap; the tag byte is the thing at stake.
@@ -30,17 +28,23 @@ function completionConfigOf(proto) {
 }
 
 describe('CompletionConfiguration tag map — #2 = max_tokens, #3 = max_newlines', () => {
-  it('places maxTokens at #2 and contextWindow at #3', () => {
-    const buf = buildCompletionConfig({ maxTokens: 777, contextWindow: 64000 });
+  it('places maxTokens at #2 and max_newlines at #3 — the context window never rides #3', () => {
+    const buf = buildCompletionConfig({ maxTokens: 777, maxNewlines: 64000 });
     const fields = parseFields(buf);
     assert.equal(getField(fields, 2, 0).value, 777, '#2 must carry the output cap');
-    assert.equal(getField(fields, 3, 0).value, 64000, '#3 must carry max_newlines');
+    assert.equal(getField(fields, 3, 0).value, 64000, '#3 must carry the explicit max_newlines');
+
+    // The context window is not a CompletionConfiguration member: a caller-supplied
+    // value must not surface at #3 (only the calibrated max_newlines default does).
+    const ctx = parseFields(buildCompletionConfig({ maxTokens: 777, contextWindow: 64000 }));
+    assert.equal(getField(ctx, 3, 0).value, 128000, 'contextWindow must not reach #3');
+    assert.notEqual(getField(ctx, 3, 0).value, 64000);
   });
 
   it('emits the literal tag bytes 0x10 (#2) then 0x18 (#3), in that order', () => {
     // Values chosen to be single-byte varints so the tag/value pairs are exact:
     // 0x10 0x07 = #2 varint 7, 0x18 0x09 = #3 varint 9.
-    const buf = buildCompletionConfig({ maxTokens: 7, contextWindow: 9 });
+    const buf = buildCompletionConfig({ maxTokens: 7, maxNewlines: 9 });
     const i2 = buf.indexOf(Buffer.from([TAG_MAX_TOKENS, 7]));
     const i3 = buf.indexOf(Buffer.from([TAG_MAX_NEWLINES, 9]));
     assert.ok(i2 >= 0, `expected tag 0x10 + value 7 in ${buf.toString('hex')}`);
@@ -53,7 +57,7 @@ describe('CompletionConfiguration tag map — #2 = max_tokens, #3 = max_newlines
       'max_newlines must not ride max_tokens (#2)');
   });
 
-  it('a defaulted call does NOT get capped below the repo output convention', () => {
+  it('a defaulted call does NOT get capped below the repo output convention, and #3 keeps the calibrated default', () => {
     // The regression this pins: once #2 became the ENFORCED cap, the old 4096 default
     // would silently truncate every caller that names no max_tokens — and there are
     // real ones (/v1/responses without max_output_tokens; chat callers passing only
@@ -62,7 +66,7 @@ describe('CompletionConfiguration tag map — #2 = max_tokens, #3 = max_newlines
     // `|| 8192` in handlers/messages.js and handlers/gemini.js).
     const fields = parseFields(buildCompletionConfig({}));
     assert.equal(getField(fields, 2, 0).value, 8192, 'wire default cap on #2');
-    assert.equal(getField(fields, 3, 0).value, 128000, 'DEFAULT_CONTEXT_WINDOW on #3');
+    assert.equal(getField(fields, 3, 0).value, 128000, 'calibrated max_newlines default on #3');
     assert.notEqual(getField(fields, 2, 0).value, 4096,
       'a defaulted call must not ship the old dead-constant cap as a real limit');
   });
@@ -83,7 +87,14 @@ describe('CompletionConfiguration tag map — #2 = max_tokens, #3 = max_newlines
     });
     const comp = completionConfigOf(proto);
     assert.equal(getField(comp, 2, 0).value, 1024);
-    assert.equal(getField(comp, 3, 0).value, 128000);
+    assert.equal(getField(comp, 3, 0).value, 128000, 'a defaulted completion keeps the calibrated #3');
+
+    const explicit = completionConfigOf(buildGetChatMessageRequest({
+      token: TOKEN, model: 'm',
+      messages: [{ role: 'user', content: 'x' }],
+      completion: { maxNewlines: 3 },
+    }));
+    assert.equal(getField(explicit, 3, 0).value, 3, 'an explicit max_newlines is honoured end-to-end');
   });
 
   it('the swap does not disturb the neighbouring calibrated fields', () => {

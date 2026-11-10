@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="#最近的版本">最近的版本</a> ·
-  <a href="docs/releases/">全部 189 份发布说明</a> ·
+  <a href="docs/releases/">全部 218 份发布说明</a> ·
   <a href="README.md">← 主 README</a>
 </p>
 
@@ -19,9 +19,9 @@
 
 | | |
 |---|---|
-| 发布说明 | **189** 份,v2.0.6 → v3.9.38 |
-| git tag | 200 个 |
-| 当前 | **v3.9.38**(2026-09-23) |
+| 发布说明 | **218** 份,v2.0.6 → v3.141.592658（生成：`node scripts/sync-changelog-counts.mjs`；口径 `ls docs/releases/RELEASE_NOTES_*.md \| wc -l`） |
+| git tag | 228 个（生成：`node scripts/sync-changelog-counts.mjs`；口径 `git tag \| wc -l`） |
+| 当前 | **v3.141.592658**(2026-10-30) |
 | 运行时依赖 | **0** —— 从第一个版本保持到现在 |
 
 ```mermaid
@@ -41,6 +41,188 @@ flowchart LR
 ## 最近的版本
 
 下面是 3.9.x 全系。更早的版本请直接翻 [`docs/releases/`](docs/releases/)。
+
+### [v3.141.592658](docs/releases/RELEASE_NOTES_3.141.592658.md) · 2026-10-30
+
+Gemini 原生 ToolDefs 的 JSON Schema `type` 数组不再被上游 400：`type: [a,b]` 无损降为 `anyOf`（`omp` 的 `grep` 带 `"type": ["number","null"]` 的 `skip` 参数此前会让整条请求 `invalid_argument`）。新增**默认关闭**的签名 thinking 回放（`DEVIN_CONNECT_REPLAY_SIGNED_THINKING=1`，需 `DEVIN_CONNECT_SIGNATURE_TAG=10`）：`/v1/messages` 历史里带签名的 Claude thinking 以 `#11` thinking + `#12` signature 回放到 assistant 帧，工具循环、rescue 重试与后续用户轮都覆盖，只限 Claude 且失败关闭（provider 门、E/R/C/Q 信封门、强制 emulation 400、签名字节预算、多段抑制、`claude-*`/`anthropic/` 别名兜底）。同时修掉签名被静默丢掉的四处（M1 流式覆盖、M2 builder、M3 `/v1/messages` 入口、M4 rescue）。live 实测：1440 字符 CAIS `C` 签名、回放臂 2/3 召回 vs 对照 0/3、改一个字节即上游 `invalid_argument`、Claude Code 2.1.306 wire `#11` 72 B + `#12` 936 B（关闭时 0/0）。wire 对 v3.141.592657 **270/270 逐字节一致、0 差异**；release gate **7,312 pass / 0 fail / 4 skip**（1 个声明 inert）；mutation 沿用 `15dd8904` 的全量 sweep（**97/97 spec、863 条 = 846 捕获 + 17 声明**，发布提交 `src/` 未变）。逐项计数见发布附录。M4 rescue 与多段签名未在线上观察，仍 `[UNVERIFIED]`。
+
+### [v3.141.592657](docs/releases/RELEASE_NOTES_3.141.592657.md) · 2026-10-26
+
+D9 供应链控制落地:banner 生成器改为 commit + 逐文件 sha256 锁定、45 个 `uses:` 钉 SHA;Docker 镜像按 digest 用 cosign keyless 签名并发布 `image-digest.txt` + bundle,dashboard Docker OTA 解析 tag→digest、要求相等、按 digest pull 并校验 `RepoDigests`,deployer 镜像 digest 固定、所有 compose `up` 加 `--no-build`;源码 OTA 在改 Git 前校验签名的 `release-attestation.json`(默认 `warn`、`required` 可强开,`WINDSURFAPI_ATTESTATION_DIR` 支持预置)。同时修复 F3 截止边界最后一毫秒的 phase timeout 误分类(5 ms 容差,504 deadline 而非传输错误)。wire 对 v3.141.592656 **270/270 逐字节一致、0 差异**;mutation 语料 **97 份 spec / 863 条突变**（B03 按 Owner 指示走缩减路径：`spec-baseline-check --all` 97 specs / 0 drift；全量 sweep 发布后补跑：**97/97 spec、863 条 = 846 捕获 + 17 声明**），逐项计数见发布附录。D9 的 Owner 信任边界、真实 Docker/部署与 live 矩阵仍 `[UNVERIFIED]`。
+
+### [v3.141.592656](docs/releases/RELEASE_NOTES_3.141.592656.md) · 2026-10-26
+
+审计收口版:27 行 V 台账全部关闭(**4 P0 + 18 P1 + 5 P2**,修正旧版的 19-P1 算术;V-27 由 D4 关闭)、D 波 D1–D8/D10 落地(D9 仅设计)、F2 final-sweep 文本不再被误判为空轮、F3 路由预算从 producer 入口起算。wire 对 v3.141.592655 **270/270 逐字节一致、0 差异**;全量 mutation 覆盖 **97 份 spec / 862 条突变**(17 条声明 survivor),逐项计数见发布附录。真实上游/Docker/部署与 D9 仍 `[UNVERIFIED]`。
+
+### [v3.141.592655](docs/releases/RELEASE_NOTES_3.141.592655.md) · 2026-10-25
+
+wave-4–7 七条修复与三份基础设施:`supports_images` 从广告变成门(显式 false 才剥离并计数,按服务账号取能力位,终端空图片轮 400)、#273 乱序 `tool_result` 移到调用之后(本版唯一有意 wire 变化,270 个比较中 12 个,允许列表逐条声明)、#159 `success` 作为可用信号并按 GetUserStatus 新鲜度设界、失败尝试历史与 billed 窗口保护、上游显式 4xx 校验拒绝从 503 改为 400 `REQUEST_REJECTED`、support bundle 解析并脱敏请求凭据/省略不可证明的二进制 leg、未验证登记册与 §0 src-lag 守卫。wire 对 v3.141.592654 **258 相同 + 12 声明 = 270/270**;全量 mutation **96/96 spec / 855 条**（841 捕获 + 14 条声明,0 drift）。
+
+### [v3.141.592654](docs/releases/RELEASE_NOTES_3.141.592654.md) · 2026-10-25
+
+wave-3 七条修复:Cascade 重放历史图片不再静默丢弃、Codex `parallel_tool_calls:false` 从 400 改为服务并计数、chat 面对 server-executed 工具类型显式 400、Claude Code 2.1.306 的 `context_management`/`defer_loading`、usage 把 cache-write 计入输入、别名与方言整类修复、Responses/Gemini 参数保真与 `metadata` 回声。mutation 基线门默认改为按变更域测量。wire 对 v3.10.1 **270/270**、全量 mutation **92/92 spec**(822 条 = 808 捕获 + 14 条声明,0 drift)。
+
+### [v3.10.1](docs/releases/RELEASE_NOTES_3.10.1.md) · 2026-10-24
+
+三个硬化修复:明文 `http:` 图片默认拒(`WINDSURFAPI_ALLOW_HTTP_IMAGES=1` 逃生)、`/v1/responses` 对 8 种 server-executed 工具类型显式 400(不再静默丢弃)、`glm-5-1` 破折号拼写的路由与工具方言(此前静默降级免费档 + 错方言卡死)。wire 270/270 vs v3.10.0。
+
+### [v3.10.0](docs/releases/RELEASE_NOTES_3.10.0.md) · 2026-10-23
+
+大版本：detached cache P1（默认关）+ 四个 P2 修复、账号页 P2（调色板/尺度/排序/改名）、
+SEC 四项（空白密码、runtime-config/proxy ACL、nginx Referer、cosign keyless 发布签名）、#245 `teams_tier` 行、
+smoke 137 flows / 24 families、真实 Docker one-click E2E 4/4。
+### [v3.9.60](docs/releases/RELEASE_NOTES_3.9.60.md) · 2026-10-23（已发布）
+
+detached cache P1（惰性恢复，默认关）：快照 v2 四字段、可声明 registry、请求级租约、两个计费陷阱；
+#245 `teams_tier` 日志行（raw + mapped）。新增 48 条测试，flag-off 与既有 cascade 套件 150/150 一致。
+### [v3.9.59](docs/releases/RELEASE_NOTES_3.9.59.md) · 2026-10-23（已发布）
+
+发布工作流 Test job 超时 10 → 20 分钟：506 文件 / ~6,250 测试在托管 runner 上已超过 10 分钟，
+v3.9.58 的 Release 因此被取消。产品代码零改动。
+### [v3.9.58](docs/releases/RELEASE_NOTES_3.9.58.md) · 2026-10-23（已发布）
+
+修复重试预算竞态：`budgetedSleep` 不再“睡剩余时间后报告成功”，两条重试循环在退避后重新检查预算；
+四个确定性测试（无墙钟）在修复前全红。这是 v3.9.57 CI 唯一的失败点。
+### [v3.9.57](docs/releases/RELEASE_NOTES_3.9.57.md) · 2026-10-23（已发布）
+
+修复发布门：GitHub Actions 的 `actions/checkout` 把 `refs/tags/vX` 强制指向提交，守卫却要求它是
+annotated 对象，导致 v3.9.54/55/56 的 Release 全部在 Test 失败。现在两种 ref 形态都能通过，本地
+annotated 检查不放宽；非祖先/伪造 SHA 仍红。
+### [v3.9.56](docs/releases/RELEASE_NOTES_3.9.56.md) · 2026-10-23（已发布）
+
+ACU 按量余额改为有符号美元（负数 = 已透支，不 clamp，亚分显示 6 位）；`?key=` 弃用与发布签名文档；
+**修复 SHA256SUMS 平铺名**（3.9.53 清单用 `dist-windows/…`，3/4 资产 `sha256sum -c` 失败）。
+### [v3.9.55](docs/releases/RELEASE_NOTES_3.9.55.md) · 2026-10-23（已发布）
+
+账号页 P0-4/P1：动词与落点一致（添加→登录/导入/粘贴凭证）、状态筛选 4 组（原始 10 态折叠）、
+抽屉 4 主卡 + 6 技术卡折叠、行内上次检查 + 车队结果面板（含被排除账号）、用量页人话、登录分步。
+### [v3.9.54](docs/releases/RELEASE_NOTES_3.9.54.md) · 2026-10-23（已发布）
+
+账号页 P0（KPI 划分、共享余额去重、人话、可取消的车队任务 + 结果面板）；文档漂移守卫（版本/tag/
+banner/notes 链接）；3.9.53 审查修正（#236 检测顺序、Docker exec 超时、notes 勘误）。
+
+### [v3.9.53](docs/releases/RELEASE_NOTES_3.9.53.md) · 2026-10-23
+
+CascadeTurn 生产者对象（`WINDSURFAPI_CASCADE_TURN`，默认关，快照缺逐 step 游标即拒绝）；Docker 一条命令
+更新 `deploy/update.sh`（健康门 + 自动回滚）；五项安全修复（空白 dashboard proof 不再付 scrypt、nginx 不记
+query、Windows ACL、SHA256SUMS、secret-scan 未加引号规则）；GitHub backlog #272/#258/#236；出站历史预算
+（413 `history_budget_exceeded`）与 PR #274 孤儿守卫；smoke 矩阵扩到 124 条 / 20 族。
+
+### [v3.9.52](docs/releases/RELEASE_NOTES_3.9.52.md) · 2026-10-22
+
+账号 `reauth` 状态（选择器跳过、免费 GetUserStatus 探针门控、409 防误清、重登替换行、删除账号
+同时删凭据）；Node 支持收紧到 `>=22.13.0`，Node 20 明确不支持，发布门仍是 24.x。
+
+### [v3.9.51](docs/releases/RELEASE_NOTES_3.9.51.md) · 2026-10-22（已发布）
+
+登录 wave 3：双 host 探测、无密码账号/未知探测分类、Auth1 先于 Firebase、无状态 token 导入、
+验证码 UI 与倒计时、CDP token 捕获脚本；ACU/用量面板（按 org 去重、每日/产品、空/错误态）。
+
+### [v3.9.50](docs/releases/RELEASE_NOTES_3.9.50.md) · 2026-10-22（已发布）
+
+重试所有权收敛（适配器管传输、handler 管账号 failover，5xx 恰好 2 次；re-login signal 可达；
+进程级突发窗口；ACP 一次有界重试）；账号页 v3（登录/导入/添加合并、请求历史、骨架/错误/空态、
+焦点陷阱）；108 条 smoke 矩阵 + 14/14 负向突变。
+
+### [v3.9.49](docs/releases/RELEASE_NOTES_3.9.49.md) · 2026-10-22（已发布）
+
+协议按描述符修正（StopReason 映射、int64 字符串余额、tool_choice oneof）；LS 安装器改为清单 +
+固定哈希，默认 3.10.67、可回滚 3.5.17、失败即停；账务 UI 未知显示 `—`，不再编造 0/日期。
+
+### [v3.9.48](docs/releases/RELEASE_NOTES_3.9.48.md) · 2026-10-22（已发布）
+
+登录/账号页/模型/可靠性四条线：不存在的邮箱不再误判、验证码可重试且只发一封；批量删除不再
+误删隐藏行、封禁账号可见、探测 skipped 不再算成功；免费/付费由 costTier 驱动、配额消息归
+`insufficient_quota`；预内容失败保留 429/503 + Retry-After，新增单请求预算（600s/300s，轮次上限 6）。
+
+### [v3.9.47](docs/releases/RELEASE_NOTES_3.9.47.md) · 2026-10-22（已发布）
+
+Devin 能力卡：ACU 账本（只展示可观测字段，`no_billing_tag` 显式）、模型四态、Key 轮换
+（masked，过期不可观测时显式 unknown）、容量预检（失败显示未知而非 unlimited）。60 条新测试，
+194 条相关批次，截图 25/25。
+
+### [v3.9.46](docs/releases/RELEASE_NOTES_3.9.46.md) · 2026-10-22（已发布）
+
+账务显示修复：`GetUserStatus` 的 uint64 余额 `-1` 哨兵不再被当成 `$18,446,744,073,709.43`
+计入账号池；解码层只接受 0..$1,000,000，刷新层清除旧值，聚合层忽略哨兵/超界值。
+
+### [v3.9.45](docs/releases/RELEASE_NOTES_3.9.45.md) · 2026-10-22（已发布）
+
+账号管理重做：登录/导入/维护合并为一页，KPI 条 + 服务端筛选 + 9 列表格 + 抽屉 + 吸底批量操作，
+Key 只显示 masked，8 态徽章与 AA 对比，`/accounts/ids` 与 `/accounts/batch` 新 API，组合筛选
+`total` 修复。新增 `npm run smoke:dashboard` 17 条真实 HTTP 流程并接入 CI。无协议破坏。
+
+### [v3.9.44](docs/releases/RELEASE_NOTES_3.9.44.md) · 2026-10-22（已发布）
+
+登录修复：OAuth-only 账号不再被误判成密码错误（`has_password` 才是密码信号），并补上邮箱验证码
+登录（probe / email/start / email/complete，服务端 flowId，10 分钟 TTL/一次性/5 次尝试/30 秒冷却）；
+Devin host 可回退。DEVIN_CONNECT 帧队列加上限（4096 帧 / 8 MiB，背压暂停/恢复）与 relogin 等待
+超时/中止。无协议破坏，无默认开启的新开关。
+
+### [v3.9.43](docs/releases/RELEASE_NOTES_3.9.43.md) · 2026-10-22（已发布）
+
+v3.9.42 之后的两条补丁：ACP 的 `tool_call`/`tool_call_update` 不再被丢弃，工具类 `stopReason`
+投影成 `tool_calls` + `finish_reason:"tool_calls"`，无法映射时返回 502 而不是静默 `stop`；
+Dashboard `.main{min-width:0}`，账号页/概览页在 1440/390 下不再横向溢出，表格只在自身容器内滚动。
+无协议破坏、无新路由、无默认开关变化。
+
+### [v3.9.42](docs/releases/RELEASE_NOTES_3.9.42.md) · 2026-10-22（已发布）
+
+v3.9.41 之后的加固补丁（8 条分支）：客户端断开后不再缓存/计费/复用半截答案（流式跳过完成尾，
+非流式返回 499）；Cascade SSE 增加写端背压门与 `WINDSURFAPI_MAX_DRAIN_MS` 上限，慢读客户端不再
+买到无限上游工作；Messages 在工具块打开时持有交错文本（参数不再被截成 `{"path"`）并把
+`tool_result.is_error` 传播到所有工具；Responses 修掉空尾 `message` 与分片 `function.name` 冻结；
+重复的上游 call id 在 Messages/Responses/Gemini 三个出口唯一化；SSE 修前导 BOM、提交后失败帧
+扫描与 typed ping 提交门；Node 20/22 的 Connect 绝对 deadline 不再被 unref；补 4 条流式两轮工具
+循环测试。无协议破坏、无新路由、默认 wire 由门禁对 `v3.9.41` 基线比较。
+
+### [v3.9.41](docs/releases/RELEASE_NOTES_3.9.41.md) · 2026-10-19（已发布）
+
+v3.9.40 之后的一次大补丁（90+ 个提交，57 feat/fix）：工具名/ID/历史跨三方言收敛，Messages 的 split
+tool name 不再以首片开块；SSE 提交门在写 200 前裁决预内容错误，混合帧/CRLF/超长帧有共用 framer；
+Dashboard 补账号用量、池冷却、请求环、目录差异和计费 burn-down，密钥前缀不再渲染；Connect 刷新
+live 目录/模型并修传输与限流重试；账号过滤、日志保留/轮转、ACP 原生配置均为默认关的可选项。
+发布审计后补：`WINDSURFAPI_TOOL_HYGIENE=0` 完整回滚、重复 tool ID/FIFO 配对、孤儿结果不拆 tool 对、Anthropic 错误状态补齐、Gemini split 名与 Dashboard token fallback。默认 wire 不变（270/270），本地/HMC 全量绿；昂贵模型 5 selector × 4 协议 20/20 200。无协议兼容性
+破坏；实际计费 debit、其余模型图片和 Any2API live 集成仍未验证。
+
+**2026-10-21 维护增量（代码候选 `f2b938d`，旧数字为 2026-10-19 快照）**：畸形/超长 tool id 保留
+FIFO 队列；预内容 Cascade 失败不再追加成功 `[DONE]`；SSE framer 与网络分片无关，支持 LF/CRLF/CR、
+空字段和注释开头内容，分隔符扫描改为单游标。本机 Node 24 固定批次观测 160k 帧约 28 ms（修复前约
+3.6 s），不作为通用延迟保证。Windows `npm run gate`（含 `test:release`）**5,415 pass / 0 fail /
+82 skip**，Linux release **5,497 pass / 0 fail / 0 skip**，wire **270/270**；受影响 mutation 共
+**11** 个预期（10 caught + 1 declared survivor）。Linux 首次聚合 gate **exit 2** 是 detached clone
+缺 `origin/master`，补跑缺失层为 **85 specs / 0 drift / 0 untrustworthy**。Any2API 候选 `a4b3406`
+是独立项目：LF 集成树 `go test ./...` 为 **18 ok + 1 no-test / 0 fail**，二进制已构建并固定哈希；
+其 live 结果不在本版范围，不作为本版证据。
+
+**2026-10-22 发布集成（`release/3.9.41`，六条分支合入）**：分片工具参数在 chat/Messages/Responses/
+Gemini 四出口按 1/128/4096 字节逐字节重组（补覆盖，8 条突变全捕获）；Messages 并行工具调用参数交错
+不再丢片；终态后错误不再被吞；SSE 多行 `data` 固定；Gemini `oneOf`/属性级 `allOf`/数字 `enum` 保真度
+characterization；Cascade 历史改按 UTF-8 计数、步骤读取改为有界重叠（工具活跃停顿上限保留）；
+“Panel state lost” 终态不再按传输错误轮换账号；流式失败类写入请求环；Windows LS 放行 `APPDATA`。
+Live：付费 devin-team 账号 3 个 selector 可达；#272 assistant 轮图片被上游忽略；#236 GLM-5.2 工具调用
+正常；#239 付费回合 wire 无计费标签；#250 3 回合未复现、维持 inconclusive；workspace trust #4 验证。
+Windows release **5,507 pass / 0 fail / 82 skip（452 文件）**、gate **PASS**；Linux release **5,588 pass /
+0 fail / 1 skip（452 文件）**；wire **270/270**；mutation **170 条：167 caught + 3 declared survivor**。未打 tag、未 push。
+
+### [v3.9.40](docs/releases/RELEASE_NOTES_3.9.40.md) · 2026-10-07
+
+畸形输入不再打成 500 或变成上游文本:带 per-user scope 的 `content:[null]`、`system:[null]` 和
+`/v1/responses` 的空 `content: []` 现在都按既有规则在本地裁决(共用 400 / 转换器放行)。仪表盘显示
+解码后的 ACU 成本(仅有值时、绝不显示假 0,子分位不压平);校准器不再把费用坐标 `#22` 当模型名;
+thinking 块始终携带 `signature`(PR #278)。工程侧:请求尾契约成文、CONTRIBUTING 补审查合并标准
+(RC0–RC12)、s2-b 突变规格收窄后可评分、八处烂数字改指来源。无新路由、无新增字段(`signature`
+为既有字段、现始终存在)、无默认开关变化;无 live-account 验收。
+
+### [v3.9.39](docs/releases/RELEASE_NOTES_3.9.39.md) · 2026-10-05
+
+上游错误响应体在**流式与 unary 两条读取路径**上都没有上限:一个坏上游的 600 MiB 5xx 就能
+`ERR_STRING_TOO_LONG` 退掉整个进程,所有租户断连。三处读取改用共用的带上限累加器(8 MiB,可 env
+覆盖),截断保留真实前缀——修复后同样的 600 MiB 响应退出 0 + `UPSTREAM_ERROR` + 截断标记。
+门禁新增**逐文件 inert 普查**:声明了测试却一条没执行的文件(含整段 `describe.skip`)判红并点名,
+宿主需显式声明两条;`mutate-verify` 把被取消的 baseline 报成"截断"而非失败套件。突变全量扫描
+2026-10-05 首次在 HMC bench 原生跑完(84 份规格 / 759 条突变)。无公开接口、路由、字段或默认
+开关变化;无 live-account 验收。
 
 ### [v3.9.38](docs/releases/RELEASE_NOTES_3.9.38.md) · 2026-09-23
 
@@ -214,5 +396,5 @@ v2.0.6 到 v3.8.x 共 150 份说明,都在 [`docs/releases/`](docs/releases/) �
 ## 想知道某个改动为什么这么做
 
 发布说明讲"改了什么",[`docs/AUDIT-LEDGER.md`](docs/AUDIT-LEDGER.md) 讲"怎么发现的、
-判据是什么、哪些结论后来被推翻了"。十六轮追加,按时间排列 —— 它记录的方法论
+判据是什么、哪些结论后来被推翻了"。十七轮追加,按时间排列 —— 它记录的方法论
 比单条修复更有用。

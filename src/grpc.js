@@ -11,7 +11,7 @@
 
 import http2 from 'http2';
 import { log } from './config.js';
-import { wrapRequest, StreamingFrameParser } from './connect.js';
+import { wrapRequest, unwrapRequest, gunzip, StreamingFrameParser } from './connect.js';
 import { traceGrpcPayload } from './proto-trace.js';
 
 const USE_CONNECT = process.env.GRPC_PROTOCOL === 'connect';
@@ -92,6 +92,9 @@ export function closeSessionForPort(port) {
  * Wrap a protobuf payload for transport.
  * Connect mode: gzip-compressed connect envelope.
  * gRPC mode: uncompressed gRPC frame.
+ *
+ * Connect *unary* calls unwrap this again inside grpcUnary (the protocol wants a
+ * bare message there); streaming calls send it as-is.
  */
 export function grpcFrame(payload) {
   const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
@@ -133,6 +136,87 @@ export function extractGrpcFrames(buf) {
   return frames;
 }
 
+// ─── Terminal truth ───────────────────────────────────────
+//
+// grpcStatus defaults to '0', so a response that ends without any grpc-status
+// used to fall through to the success branch: a truncated or crashed LS reply
+// surfaced as an empty assistant turn and the account pool never failed over
+// (audit G4, probe G1). Presence is tracked separately from the value.
+//
+// Connect is exempt: its terminal truth is the HTTP status plus the end-stream
+// JSON frame. The HTTP-status half is decided as soon as the response headers
+// arrive (see the 'response' handlers) — a non-2xx body is an HTML/proxy page,
+// and feeding it to the frame reader reported a nonsense frame size instead of
+// the real cause (audit G2, probe C2) — so it never reaches this classifier.
+
+/**
+ * @returns {Error|null} the failure to surface, or null when the response is a
+ *   success and its body may be parsed.
+ */
+function terminalFailure({ connect, grpcStatus, sawGrpcStatus, grpcMessage }) {
+  if (connect) return null;
+  if (!sawGrpcStatus) return new Error('gRPC response ended without grpc-status');
+  if (grpcStatus !== '0') {
+    return new Error(grpcMessage ? decodeGrpcMessage(grpcMessage) : `gRPC status ${grpcStatus}`);
+  }
+  return null;
+}
+
+/**
+ * Split a Connect envelope stream, or return null when the buffer is not one.
+ *
+ * A spec-compliant Connect *unary* response body is a bare protobuf message;
+ * the 5-byte envelope only applies to `application/connect+proto` streaming.
+ * The LS has historically answered unary calls with envelopes, so both shapes
+ * are accepted — but the discriminator is structural, never try/catch: a valid
+ * protobuf message cannot begin with 0x00-0x03 (field number 0 is illegal, and
+ * tags 0x01-0x03 are field 0 with wire types 1-3), which is exactly the first
+ * byte of every envelope. That makes the two shapes unambiguous, so a corrupt
+ * envelope is reported as such instead of being parsed as a message (G12).
+ */
+function scanConnectEnvelope(buf) {
+  const frames = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    if (offset + 5 > buf.length) return null;
+    const flags = buf[offset];
+    if (flags & ~0x03) return null;
+    const len = buf.readUInt32BE(offset + 1);
+    if (offset + 5 + len > buf.length) return null;
+    frames.push({ flags, isEndStream: !!(flags & 0x02), payload: buf.subarray(offset + 5, offset + 5 + len) });
+    offset += 5 + len;
+  }
+  return frames;
+}
+
+/**
+ * Decode a Connect unary response body.
+ *
+ * Returns the bare message plus any error the end-stream frame carried. A
+ * trailer-only body decodes to an EMPTY message — never to the envelope bytes,
+ * which callers then ran through parseFields as if they were protobuf (G1).
+ */
+function decodeConnectUnaryResponse(body) {
+  if (body.length === 0 || body[0] > 0x03) return { payload: body, error: null };
+  const frames = scanConnectEnvelope(body);
+  if (!frames) throw new Error('Connect unary response is not a valid frame stream');
+  const data = [];
+  let error = null;
+  for (const frame of frames) {
+    if (frame.isEndStream) {
+      if (!error) {
+        try {
+          const trailer = JSON.parse(frame.payload.toString());
+          if (trailer.error) error = new Error(trailer.error.message || 'connect error');
+        } catch {}
+      }
+      continue;
+    }
+    data.push(frame.flags & 0x01 ? gunzip(frame.payload) : frame.payload);
+  }
+  return { payload: Buffer.concat(data), error };
+}
+
 /**
  * Make a unary gRPC call to the language server.
  *
@@ -155,6 +239,17 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
       fn(...args);
     };
 
+    // Connect unary RPCs use `application/proto` with a BARE message; the
+    // envelope plus `application/connect+proto` belongs to streaming RPCs only
+    // (connectrpc.com/docs/protocol). Callers hand every request through
+    // grpcFrame(), which envelopes under GRPC_PROTOCOL=connect, so unwrap here
+    // instead of teaching every call site which transport is active.
+    //
+    // Done before the timer is armed: unwrapRequest can throw on a corrupt
+    // envelope, and a throw after setTimeout() would leave a timer whose
+    // callback dereferences `req` before it exists.
+    const requestBody = USE_CONNECT ? unwrapRequest(body, {}) : body;
+
     const client = getSession(port);
     const chunks = [];
     let timer;
@@ -167,9 +262,8 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
     const headers = USE_CONNECT ? {
       ':method': 'POST',
       ':path': path,
-      'content-type': 'application/connect+proto',
+      'content-type': 'application/proto',
       'connect-protocol-version': '1',
-      'connect-accept-encoding': 'gzip',
       'user-agent': 'connect-es/2.0.0',
       'x-codeium-csrf-token': csrfToken,
     } : {
@@ -186,13 +280,13 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
       port,
       path,
       direction: 'request',
-      body,
+      body: requestBody,
       transport: USE_CONNECT ? 'connect' : 'grpc',
-      framed: true,
+      framed: !USE_CONNECT,
     });
     req.on('data', (chunk) => chunks.push(chunk));
 
-    let grpcStatus = '0', grpcMessage = '', httpStatus = 0;
+    let grpcStatus = '0', grpcMessage = '', sawGrpcStatus = false;
 
     // H-3 (ultracode audit 2026-07-13): a gRPC Trailers-Only response folds
     // grpc-status into the FIRST HEADERS frame (END_STREAM, no DATA) — it arrives
@@ -202,62 +296,52 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
     // pool's error classification/failover. Capture status from the response
     // headers too, then honour it in the end handler below.
     req.on('response', (headers) => {
-      httpStatus = Number(headers[':status'] || 0);
-      if (headers['grpc-status'] != null) grpcStatus = String(headers['grpc-status']);
+      const status = Number(headers[':status'] || 0);
+      if (headers['grpc-status'] != null) { grpcStatus = String(headers['grpc-status']); sawGrpcStatus = true; }
       if (headers['grpc-message'] != null) grpcMessage = String(headers['grpc-message']);
+      // A non-2xx body is an error page (proxy/HTML), never a message. Decide at
+      // the headers and stop reading so the real cause is reported instead of a
+      // frame-size error produced by parsing HTML as frames (G2).
+      if (status && (status < 200 || status >= 300)) {
+        clearTimeout(timer);
+        try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
+        done(reject, new Error(`upstream HTTP ${status}`));
+      }
     });
 
     req.on('trailers', (trailers) => {
       // Trailers override/confirm; only take grpc-status when actually present so
       // a Trailers-Only status captured from headers isn't reset to '0'.
-      if (trailers['grpc-status'] != null) grpcStatus = String(trailers['grpc-status']);
+      if (trailers['grpc-status'] != null) { grpcStatus = String(trailers['grpc-status']); sawGrpcStatus = true; }
       if (trailers['grpc-message'] != null) grpcMessage = String(trailers['grpc-message']);
     });
 
     req.on('end', () => {
       clearTimeout(timer);
-      if (!USE_CONNECT && httpStatus && (httpStatus < 200 || httpStatus >= 300)) {
-        done(reject, new Error(`upstream HTTP ${httpStatus}`));
-        return;
-      }
-      if (!USE_CONNECT && grpcStatus !== '0') {
-        const msg = grpcMessage ? decodeGrpcMessage(grpcMessage) : `gRPC status ${grpcStatus}`;
-        done(reject, new Error(msg));
-        return;
-      }
+      if (settled) return;
+      const failure = terminalFailure({ connect: USE_CONNECT, grpcStatus, sawGrpcStatus, grpcMessage });
+      if (failure) { done(reject, failure); return; }
       const full = Buffer.concat(chunks);
 
       if (USE_CONNECT) {
-        let parsed;
+        let decoded;
         try {
-          const parser = new StreamingFrameParser();
-          parser.push(full);
-          parsed = parser.drain();
+          decoded = decodeConnectUnaryResponse(full);
         } catch (err) {
           try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
           done(reject, err);
           return;
         }
-        const dataFrames = parsed.filter(f => !f.isEndStream);
-        const trailer = parsed.find(f => f.isEndStream);
-        if (trailer) {
-          try {
-            const t = JSON.parse(trailer.payload.toString());
-            if (t.error) { done(reject, new Error(t.error.message || 'connect error')); return; }
-          } catch {}
-        }
-        const payload = dataFrames.length > 0
-          ? Buffer.concat(dataFrames.map(f => f.payload))
-          : full;
+        if (decoded.error) { done(reject, decoded.error); return; }
         traceGrpcPayload({
           port,
           path,
           direction: 'response',
-          body: payload,
+          body: decoded.payload,
           transport: 'connect',
           framed: false,
         });
-        done(resolve, payload);
+        done(resolve, decoded.payload);
       } else {
         const frames = extractGrpcFrames(full);
         const payload = frames.length > 0 ? Buffer.concat(frames) : stripGrpcFrame(full);
@@ -278,7 +362,7 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
       done(reject, err);
     });
 
-    req.write(body);
+    req.write(requestBody);
     req.end();
   });
 }
@@ -291,10 +375,26 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
  * @param {string} csrfToken
  * @param {string} path
  * @param {Buffer} body
- * @param {object} opts - { onData, onEnd, onError, timeout }
+ * @param {object} opts - { onData, onEnd, onError, timeout, signal }
  */
 export function grpcStream(port, csrfToken, path, body, opts = {}) {
-  const { onData, onEnd, onError, timeout = 300000 } = opts;
+  const { onData, onEnd, onError, timeout = 300000, signal } = opts;
+
+  // GAP-2: caller-supplied cancellation. A client disconnect (or a server
+  // shutdown drain) aborts `signal`; close the HTTP/2 stream with
+  // NGHTTP2_CANCEL and surface an AbortError so callers stop burning
+  // LS + account quota. No-op when no signal is supplied.
+  const abortError = () => {
+    const err = new Error('The operation was aborted');
+    err.name = 'AbortError';
+    err.code = 'ABORT_ERR';
+    return err;
+  };
+  if (signal?.aborted) {
+    // Already aborted before any stream was opened — settle without a request.
+    onError?.(abortError());
+    return;
+  }
 
   // req may emit both 'end' and 'error' (or error twice) when the server
   // trailers report non-OK — flip this to only fire one callback.
@@ -395,6 +495,17 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
     transport: USE_CONNECT ? 'connect' : 'grpc',
     framed: true,
   });
+
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
+      onError?.(abortError());
+    }, { once: true });
+  }
+
   const connectParser = USE_CONNECT ? new StreamingFrameParser() : null;
 
   req.on('data', (chunk) => {
@@ -472,7 +583,7 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
     }
   });
 
-  let grpcStatus = '0', grpcMessage = '', httpStatus = 0;
+  let grpcStatus = '0', grpcMessage = '', sawGrpcStatus = false;
 
   // H-3 (ultracode audit 2026-07-13): capture Trailers-Only status from the
   // HEADERS frame ('response' event) — same fix as grpcUnary. Without it a
@@ -480,13 +591,22 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
   // 4xx/5xx, END_STREAM no DATA) produced zero chunks → onEnd → a silent empty
   // assistant reply instead of an error the pool can classify.
   req.on('response', (headers) => {
-    httpStatus = Number(headers[':status'] || 0);
-    if (headers['grpc-status'] != null) grpcStatus = String(headers['grpc-status']);
+    const status = Number(headers[':status'] || 0);
+    if (headers['grpc-status'] != null) { grpcStatus = String(headers['grpc-status']); sawGrpcStatus = true; }
     if (headers['grpc-message'] != null) grpcMessage = String(headers['grpc-message']);
+    // Fail at the headers for a non-2xx response: its body is an error page, and
+    // the frame reader would report a bogus frame size for it instead of the
+    // status (G2). Settle here so the data handler never parses that body.
+    if (!settled && status && (status < 200 || status >= 300)) {
+      settled = true;
+      clearTimeout(timer);
+      try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
+      onError?.(new Error(`upstream HTTP ${status}`));
+    }
   });
 
   req.on('trailers', (trailers) => {
-    if (trailers['grpc-status'] != null) grpcStatus = String(trailers['grpc-status']);
+    if (trailers['grpc-status'] != null) { grpcStatus = String(trailers['grpc-status']); sawGrpcStatus = true; }
     if (trailers['grpc-message'] != null) grpcMessage = String(trailers['grpc-message']);
   });
 
@@ -494,14 +614,9 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
     clearTimeout(timer);
     if (settled) return;
     settled = true;
-    if (!USE_CONNECT && httpStatus && (httpStatus < 200 || httpStatus >= 300)) {
-      onError?.(new Error(`upstream HTTP ${httpStatus}`));
-    } else if (!USE_CONNECT && grpcStatus !== '0') {
-      const msg = grpcMessage ? decodeGrpcMessage(grpcMessage) : `gRPC status ${grpcStatus}`;
-      onError?.(new Error(msg));
-    } else {
-      onEnd?.();
-    }
+    const failure = terminalFailure({ connect: USE_CONNECT, grpcStatus, sawGrpcStatus, grpcMessage });
+    if (failure) onError?.(failure);
+    else onEnd?.();
   });
 
   req.on('error', (err) => {

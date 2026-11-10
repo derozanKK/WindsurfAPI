@@ -1,12 +1,16 @@
 name: CI
 
+# Every job only reads the repository; keep the token from defaulting to write.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [master]
   pull_request:
     branches: [master]
   # Manual mutation sweep (Actions -> CI -> Run workflow). Deliberately NOT on the PR path:
-  # each mutation re-runs its spec's whole test suite, so all 44 specs is hours, and a gate
+  # each mutation re-runs its spec's whole test suite, so all 85 specs is hours, and a gate
   # nobody can afford to run is worse than no gate — that is the warning in the specs job's
   # own comment. Until 2026-09-13 nothing in this repo ever executed `npm run mutate`.
   workflow_dispatch:
@@ -31,12 +35,12 @@ jobs:
       # `git clone --local` and reads history objects, so a shallow checkout fails it.
       # Measured 2026-09-13: with the default depth 1 the sweep died on the FIRST spec
       # with exit 2 and produced no verdict lines at all.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
       - name: Setup Node 24
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '24'
 
@@ -66,7 +70,7 @@ jobs:
 
       - name: Publish mutation evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mutation-report-${{ github.run_id }}-${{ strategy.job-index || 0 }}
           path: ${{ runner.temp }}/mutation-report/
@@ -77,10 +81,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Setup Node 24
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '24'
 
@@ -106,21 +110,22 @@ jobs:
   # Baseline VALUE drift is measured here too, by EXECUTING the covered specs and reading
   # the runner's events (scripts/spec-baseline-check.mjs) — never by scraping display text
   # and never by rewriting a pin. A changed diff measures only the affected specs; a
-  # synchronised checkout measures all of them, which costs ~100s for 82 specs. The check
-  # used to run only in the local gate, so a wrong pin reached CI green.
+  # synchronised checkout measures all of them, which costs ~100s for the whole set (82
+  # specs when that was measured; 85 today). The check used to run only in the local gate,
+  # so a wrong pin reached CI green.
   specs:
     name: Mutation spec consistency
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # Change-scoped selection diffs against origin/master, so the history has to be
           # here; a shallow clone would silently widen the selection to every spec.
           fetch-depth: 0
 
       - name: Setup Node 24
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '24'
 
@@ -133,18 +138,47 @@ jobs:
       - name: Secret scan (includes test/ — half of a typical diff lives there)
         run: node scripts/secret-scan.mjs
 
+  # The `specs` job scans the WORKING TREE. A credential that was committed and then
+  # deleted is invisible there and still present in every clone, so this job scans every
+  # blob reachable from any ref plus the unreachable objects an amend / rebase /
+  # force-push leaves behind (the objects a rewrite was meant to hide). fetch-depth: 0 is
+  # the whole point — a shallow clone would scan the tip and report it clean.
+  #
+  # A finding that is not in scripts/history-secret-scan.baseline fails this job. That
+  # file is a reviewed list, one line per accepted historical finding with its reason;
+  # it is not a mute button (the scan warns about stale entries, so a fixed leak leaves a
+  # line someone has to delete). The scan is ~15s on a 1.9k-commit history and needs no
+  # network, no binary download and no token — which is why it is the gate instead of
+  # gitleaks; see HistorySecretScan.md for the gitleaks cross-check.
+  history-secrets:
+    name: History secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node 24
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '24'
+
+      - name: Scan every blob in every ref
+        run: node scripts/history-secret-scan.mjs
+
   wire-identity:
     name: Default-path request bytes
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # The comparison base is a tag, so the tags have to be here.
           fetch-depth: 0
 
       - name: Setup Node 24
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '24'
 
@@ -184,17 +218,25 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # test/docs-consistency-guard.test.js resolves the handoff's tag and commit
+          # claims with git. The default depth-1 clone carries neither the history nor
+          # the tags, so shards 1 and 3 failed on "ambiguous argument '<sha>^{commit}'"
+          # and "no release tags reachable from HEAD" while the same suite passed
+          # locally. The guard fails closed by design; give it the objects, not an
+          # exemption. release.yml checks out full history for the same reason.
+          fetch-depth: 0
 
       - name: Setup Node 24
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '24'
           cache: 'npm'
 
-      # image-resize.test.js imports jimp (the sole runtime dependency), so the
-      # runner needs node_modules — without this step every shard that touches
-      # a jimp-importing test fails with ERR_MODULE_NOT_FOUND.
+      # Zero npm dependencies: package.json declares none, and the JPEG/PNG decoders
+      # are vendored under src/vendor/. This step is a no-op today — kept so that a
+      # future dependency cannot silently break the shards that import it.
       - name: Install dependencies
         run: npm ci
 

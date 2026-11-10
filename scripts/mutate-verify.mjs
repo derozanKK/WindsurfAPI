@@ -189,6 +189,41 @@ function runSuite(tests) {
   };
 }
 
+/**
+ * The refusal text for a baseline that is not `ok`, split by WHAT WAS MEASURED.
+ *
+ * `node:test` reports a suite whose event loop drained before every test ran as
+ * CANCELLED tests, not failed ones: `pass=99 fail=0 cancelled=95`. That is a
+ * truncated run wearing a green `fail=0`, and calling it a red suite sends the
+ * reader to fix assertions that never ran. Measured on node 22 with this repo's
+ * own suite (2026-10-05); node 24 does not drain this way.
+ *
+ * With fail === 0 there are no `test:fail` records from failing assertions, so
+ * every name in `failedNames` belongs to a cancelled test — which is why the
+ * same array can be relabelled rather than re-derived.
+ */
+function baselineRefusal(base) {
+  if (base.fail > 0) {
+    return `baseline is not green (pass=${base.pass} fail=${base.fail} tests=${base.tests}). `
+      + 'Every "SURVIVED" below would be meaningless. Fix the suite first.'
+      + (base.failedNames.length ? `\n  failing: ${base.failedNames.join(', ')}` : '');
+  }
+  if (base.cancelled > 0) {
+    return `baseline is TRUNCATED, not green and not red (pass=${base.pass} fail=0 `
+      + `cancelled=${base.cancelled} tests=${base.tests}). `
+      + `${base.cancelled} test(s) were cancelled because the event loop drained before they ran, `
+      + 'so this run measured less than the suite owns and every verdict below is unproven. '
+      + 'Make the whole suite run (keep a live handle until the suite ends) and re-run.'
+      + (base.failedNames.length ? `\n  cancelled: ${base.failedNames.join(', ')}` : '');
+  }
+  return `baseline did not measure what it claims (pass=${base.pass} fail=${base.fail} `
+    + `tests=${base.tests} skipped=${base.skipped} cancelled=${base.cancelled} todo=${base.todo}). `
+    + 'Nothing failed and nothing was cancelled, so no cause is claimed here: the counts do not '
+    + 'add up to a completed run, and every "SURVIVED" below would be meaningless. '
+    + 'Make the suite run to completion first.'
+    + (base.failedNames.length ? `\n  failing: ${base.failedNames.join(', ')}` : '');
+}
+
 function main() {
   const argv = process.argv.slice(2);
   const keepGoing = argv.includes('--keep-going');
@@ -227,9 +262,7 @@ function main() {
   console.log(`${DIM}baseline: ${spec.tests.join(' ')}${RESET}`);
   const base = runSuite(spec.tests);
   if (!base.ok) {
-    die(`baseline is not green (pass=${base.pass} fail=${base.fail} tests=${base.tests}). `
-      + 'Every "SURVIVED" below would be meaningless. Fix the suite first.'
-      + (base.failedNames.length ? `\n  failing: ${base.failedNames.join(', ')}` : ''));
+    die(baselineRefusal(base));
   }
   if (workspaceSnapshot(WORKSPACE_ROOT) !== baselineWorkspace) {
     die('baseline test run changed repository files, refs, index, or remotes; mutation evidence is unsafe.');

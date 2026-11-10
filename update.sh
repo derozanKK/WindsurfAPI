@@ -587,6 +587,48 @@ if [ -n "$MUTATION_TARGET" ]; then
   fi
 fi
 
+# ── D9 source-OTA attestation ─────────────────────────────────────────
+# The selected release tag must carry a release-attestation.json whose commit
+# equals the peeled tag commit, signed by the release workflow identity. This
+# runs before any stash/reset/merge and before the service restart.
+#   warn (default): missing attestation/bundle/cosign logs a warning and the
+#                   update proceeds, so existing installs keep working;
+#   required:       missing material refuses the update.
+# A present but mismatched or invalid attestation is always fatal.
+ATTESTATION_MODE="${WINDSURFAPI_UPDATE_ATTESTATION:-warn}"
+case "$ATTESTATION_MODE" in
+  warn|required) ;;
+  *)
+    echo "    ! invalid WINDSURFAPI_UPDATE_ATTESTATION='$ATTESTATION_MODE' (expected warn or required); refusing update"
+    exit 1
+    ;;
+esac
+if [ -n "$LATEST_TAG" ] && [ "$FORCE_UPDATE" != "1" ] \
+    && { [ -z "$MUTATION_TARGET" ] || [ "$MUTATION_TARGET" = "$TARGET" ]; }; then
+  ATTESTATION_REPOSITORY=""
+  ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
+  case "$ORIGIN_URL" in
+    https://github.com/dwgx/WindsurfAPI|https://github.com/dwgx/WindsurfAPI.git|git@github.com:dwgx/WindsurfAPI.git|ssh://git@github.com/dwgx/WindsurfAPI.git)
+      ATTESTATION_REPOSITORY="dwgx/WindsurfAPI"
+      ;;
+  esac
+  ATTESTATION_ARGS=(--tag "$LATEST_TAG" --commit "$RELEASE_COMMIT" --mode "$ATTESTATION_MODE")
+  [ -n "$ATTESTATION_REPOSITORY" ] && ATTESTATION_ARGS+=(--repository "$ATTESTATION_REPOSITORY")
+  [ -n "${WINDSURFAPI_ATTESTATION_DIR:-}" ] && ATTESTATION_ARGS+=(--dir "$WINDSURFAPI_ATTESTATION_DIR")
+  [ -n "${COSIGN:-}" ] && ATTESTATION_ARGS+=(--cosign "$COSIGN")
+  if command -v node >/dev/null 2>&1 && [ -f scripts/verify-release-attestation.mjs ]; then
+    if ! node scripts/verify-release-attestation.mjs "${ATTESTATION_ARGS[@]}"; then
+      echo "    ! release attestation verification failed for $LATEST_TAG; refusing update before any Git mutation"
+      exit 1
+    fi
+  elif [ "$ATTESTATION_MODE" = "required" ]; then
+    echo "    ! node or scripts/verify-release-attestation.mjs is missing; WINDSURFAPI_UPDATE_ATTESTATION=required refuses update"
+    exit 1
+  else
+    echo "    ! node or the release attestation verifier is missing; continuing because WINDSURFAPI_UPDATE_ATTESTATION=warn"
+  fi
+fi
+
 if [ "$FORCE_RESET" = "1" ]; then
   if [ -n "$DIRTY" ]; then
     echo "    ! preserving local changes in a stash before forced reset"

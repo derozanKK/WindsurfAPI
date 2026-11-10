@@ -6,8 +6,8 @@
     {
       "name": "Storage boundary stops detaching retained messages",
       "file": "src/response-store.js",
-      "anchor": "  const kept = copyStoredValue(capEntryBytes(truncateMessages(messages)));",
-      "replacement": "  const kept = capEntryBytes(truncateMessages(messages));",
+      "anchor": "  const kept = copyStoredValue(capped);",
+      "replacement": "  const kept = capped;",
       "expectCaught": true
     },
     {

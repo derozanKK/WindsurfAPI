@@ -1,0 +1,12 @@
+{
+  "tests": ["test/devin-acp-model-argv.test.js"],
+  "expectBaselinePass": 2,
+  "mutations": [
+    {
+      "name": "the --model argv push is deleted — the requested model never reaches the `devin acp` launch",
+      "file": "src/devin-acp.js",
+      "anchor": "  if (modelKey && !args.includes('--model')) {\n    args.push('--model', modelKey);\n  }",
+      "replacement": "  if (modelKey && !args.includes('--model')) {\n  }"
+    }
+  ]
+}

@@ -1,0 +1,99 @@
+  ﹣ --keep-going cannot continue after untrustworthy evidence  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ FORCE_COLOR="" still yields a real baseline and verdict  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ FORCE_COLOR="1" still yields a real baseline and verdict  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ FORCE_COLOR="3" still yields a real baseline and verdict  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ FORCE_COLOR=0 (the one value that does not colour) is unaffected  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ a genuinely failing baseline keeps the red-suite wording  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ a mutation target outside the repo is refused before anything runs  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ a mutation that exits the process mid-suite aborts with an explanation  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ a stale expectBaselinePass is refused  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ a survivor expected to be caught exits 1  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ a syntax-error mutation is UNTRUSTWORTHY, not CAUGHT  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ a test path that would be parsed as a node option is refused  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ accepts a nonzero merge exit only after the exact target is independently clean  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ accepts a nonzero rollback reset only after independently verifying the exact clean target  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ allows explicit force mode to follow branch HEAD without a stable tag  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ allows unrelated ignored runtime data that cannot collide with the target tree  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ an anchor that does not match exactly once is refused  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ an untracked target is refused, since the restore could not undo it  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ and the tree is left clean either way  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ blocks hard-coded non-loopback fetch before it can become mutation evidence  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ bounds a hanging in-container health probe and still rolls back  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ builds locally with --build instead of pulling  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ cannot bless a truncated run through allowTruncatedCatch  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ cannot forge a complete caught run with test-authored TAP  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ case-folds ignored target collisions even when core.ignorecase is false  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ discards non-target test side effects instead of leaving them in the Owner checkout  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ does not carry credentials, proxies, auth switches, or real data paths  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ does not delete a replacement lock when cleanup ownership no longer matches  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ does not mutate anything in --dry-run  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ exits 2 when the rollback is also unhealthy  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ fails before fetch or installation when pm2 is unavailable  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when a stale lock already has a competing recovery claim  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when an annotated tag peels to a commit other than the advertised peeled OID  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when ls-remote output contains an empty field via repeated tabs  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when no usable listener probe is available  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when only prerelease or arbitrary tags exist  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when release-tag enumeration emits partial output then exits nonzero  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when successful remote-tag output violates the ls-remote protocol  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when the fetched tag object differs from the advertised remote ref  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails closed when the lock has no owner pid  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ fails closed when the release-distance rev-list probe fails  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails when rollback health answers 200 for a different commit  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ fails when rollback pm2 start exits zero but the named app has no live pid  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ follows the untagged branch head only with WINDSURFAPI_UPDATE_FORCE=1  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ force-reset cleans tracked changes without downgrading a checkout past the tag  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ ignores a revoked remote tag without pruning the stale local tag  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ ignores index stat-cache churn but still detects staged index semantics  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ installs the newest release tag and leaves post-tag commits unpublished  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ keeps the failed target checked out when rollback cannot prove PM2 and the port are stopped  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ leaves the running container untouched when the pull fails  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ materializes the network preload but never copies forbidden state trees  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ never pattern-kills unrelated processes whose command line contains src/index.js  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ never pops an older user stash when status-to-stash races to no local changes  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ never restores its stash when health rollback leaves HEAD on the failed release  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ never restores its stash when health rollback reaches the target with tracked dirt  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ pins a release tag with --tag and pulls that exact reference  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ pins the exact tag with --tag and rejects a lookalike version  # requires a POSIX host to exec a shebang fake cosign
+  ﹣ pulls, recreates the app, and passes the health gate  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ recovers a lock whose owner pid is provably dead  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ recovers a repository lock whose recorded owner PID is gone  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses a normal fast-forward that would overwrite ignored owner data  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses a stale lock that already has a competing recovery claim  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses an automatic health rollback that would overwrite newly-created ignored owner data  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses an unsafe oversized successful rev-list count before any mutation  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses every malformed successful rev-list count before any mutation  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses force-reset when the target collides with ignored owner data  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses to continue when a post-merge hook leaves the verified target tracked-dirty  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ refuses to run while another update holds the lock  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ refuses to start while another script updater holds the repository lock  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ rejects a 200 health response from an unrelated process pid  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ rejects a 200 health response from the wrong commit and verifies the rollback service  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ rejects dashboard fixture children that are symlinks escaping the temporary root  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ rejects fixture children that are symlinks escaping the temporary root  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ rejects incomplete or out-of-root fixtures before spawning update.sh  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ rejects incomplete or out-of-root real Git fixtures before spawning the dashboard check  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ reports an incomplete health rollback when its exact stash cannot be applied  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ reports rollback PM2 restart failure instead of claiming the service is healthy  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ restores the saved rollback point with --rollback  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ rolls back automatically when /health fails, preserving the data volume  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ rolls back verified code and restores its exact stash when the first pm2 start fails  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ rolls back when pm2 start exits zero but the named app has no live pid  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ runs one cosign verification per signed file  # requires a POSIX host to exec a shebang fake cosign
+  ﹣ runtime fixture environments ignore poisoned system and global Git config  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ says truncated and labels the names cancelled, not failing  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ skips a newer stable tag that is not reachable from origin/master  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ snapshots every ref namespace and Git pseudoref state  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ snapshots ignored owner files and executable mode changes  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ starts the whole stack when no app container exists yet  # deploy/update.sh integration fixtures require a POSIX host (Linux/macOS)
+  ﹣ stops/deletes the failed PM2 target before rollback so duplicate names and stale PIDs cannot survive Git reset  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ takes the lock in the Owner repo before materializing a clone  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ treats kill-denied plus a present ps row as a live lock owner  # real-Git fixtures require git at a trusted absolute POSIX system path
+  ﹣ uses remote refs as authority after a tag is revoked without deleting the local tag  # real-Git fixtures require git at a trusted absolute POSIX system path
+﹣ Detach P1 soak  # set DETACH_SOAK=1 (real 120 s TTL)
+﹣ Detach gate 2 — LS pool pressure  # ensureLs needs to spawn a POSIX shebang fake LS
+﹣ an owned current-day symlink cannot receive log data  # file symlinks require Developer Mode on this Windows host
+﹣ reLogin live recovery chain (real credentials)  # not armed — set RELOGIN_LIVE=1 + RELOGIN_LIVE_EMAIL/PASSWORD + DEVIN_CONNECT_CRED_KEY
+﹣ rollback refuses an ignored target collision even with force, without blocking unrelated ignored data  # real-Git fixtures require git at a trusted absolute POSIX system path
+﹣ rollback refuses an untracked path that reset --hard would overwrite, then force mode stashes it  # real-Git fixtures require git at a trusted absolute POSIX system path
+﹣ the real gate refuses a real checkout that is not the selected release  # real-Git fixtures require git at a trusted absolute POSIX system path

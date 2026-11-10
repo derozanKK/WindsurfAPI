@@ -73,6 +73,13 @@ describe('fixture', () => {
   it('delta', () => assert.equal(delta(), 'd'));
 });
 `);
+  // A deliberately red suite, committed like every other fixture: the refusal wording for a
+  // genuinely failing baseline is only meaningful against a real failing run.
+  writeFileSync(join(clone, 'test/red.test.js'), `
+import { it } from 'node:test';
+import assert from 'node:assert/strict';
+it('failing fixture assertion', () => assert.equal(1, 2));
+`);
   const git = (...a) => execFileSync('git', a, { cwd: clone, stdio: 'ignore' });
   git('init', '-q');
   git('config', 'user.email', 't@example.invalid');
@@ -307,6 +314,125 @@ describe('an unexpected verdict exits 1, distinct from a harness error', () => {
     const status = execFileSync('git', ['status', '--porcelain'], { cwd: clone, encoding: 'utf8' });
     assert.equal(status.trim(), '',
       `the harness left the scratch repo dirty:\n${status}`);
+  });
+});
+
+// A baseline that node CANCELLED is not a red suite, and the label matters: on 2026-10-05
+// a node-22 run reported `pass=99 fail=0 cancelled=95` (the event loop drained before the
+// rest ran — test/devin-connect.test.js's fake transport swallows the idle timer that
+// src/devin-connect.js unrefs) and guard 2 printed zero failures as the explanation while
+// listing all 95 cancelled tests under `failing:`. That cost a full investigation chasing
+// assertions that never executed.
+//
+// Node 24 will not cancel a suite on request — every recipe tried here (unref'd wake-up
+// timers, a never-resolving promise with nothing holding the loop, process.exit, pre-aborted
+// and mid-flight AbortSignals) yields `cancelled: 0` — so the second clone below swaps in a
+// reporter that emits exactly the summary the node-22 run produced. Everything downstream of
+// the runner is the real script: real git, real clone, real guards. Only the counter source
+// is a stub, because the counter is the thing under test.
+describe('a cancelled baseline is reported as truncated, never as a failing suite', () => {
+  let truncClone;
+
+  before(() => {
+    if (!REAL_GIT) return;
+    truncClone = mkdtempSync(join(tmpdir(), 'mv-trunc-'));
+    mkdirSync(join(truncClone, 'scripts'));
+    mkdirSync(join(truncClone, 'test'));
+    cpSync(join(REPO, 'scripts/mutate-verify.mjs'), join(truncClone, 'scripts/mutate-verify.mjs'));
+    cpSync(join(REPO, 'scripts/mutation-harness-utils.mjs'), join(truncClone, 'scripts/mutation-harness-utils.mjs'));
+    cpSync(join(REPO, 'scripts/mutation-network-deny.mjs'), join(truncClone, 'scripts/mutation-network-deny.mjs'));
+    writeFileSync(join(truncClone, 'test/setup-env.mjs'), 'export {};\n');
+    writeFileSync(join(truncClone, 'src.mjs'), "export function alpha() { return 'a'; }\n");
+    writeFileSync(join(truncClone, 'test/fixture.test.js'), `
+import { it } from 'node:test';
+import assert from 'node:assert/strict';
+import { alpha } from '../src.mjs';
+it('alpha', () => assert.equal(alpha(), 'a'));
+`);
+    // The node-22 summary: nothing failed, 95 tests were cancelled, and each cancellation
+    // arrives as a test:fail record carrying the test's name — which is exactly why the old
+    // message could print 95 names beside zero failures.
+    writeFileSync(join(truncClone, 'test/truncating-reporter.mjs'), `
+export default async function* truncatingReporter() {
+  yield '@@MUTATION_SUMMARY ' + JSON.stringify({
+    success: false,
+    counts: { tests: 194, failed: 0, passed: 99, cancelled: 95, skipped: 0, todo: 0, topLevel: 1, suites: 3 },
+  }) + '\\n';
+  for (let i = 1; i <= 95; i++) {
+    yield '@@MUTATION_FAIL ' + JSON.stringify({ name: 'cancelled test #' + i, failureType: 'cancelledByParent' }) + '\\n';
+  }
+}
+`);
+    // The real spec is untouched; only the summary source is replaced.
+    const harness = readFileSync(join(truncClone, 'scripts/mutate-verify.mjs'), 'utf8');
+    writeFileSync(join(truncClone, 'scripts/mutate-verify.mjs'), harness.replace(
+      "'--test-reporter=./scripts/mutation-harness-utils.mjs',",
+      "'--test-reporter=./test/truncating-reporter.mjs',"));
+    const git = (...a) => execFileSync('git', a, { cwd: truncClone, stdio: 'ignore' });
+    git('init', '-q');
+    git('config', 'user.email', 't@example.invalid');
+    git('config', 'user.name', 'harness test');
+    git('add', '-A');
+    git('commit', '-q', '-m', 'fixture');
+  });
+
+  after(() => { if (truncClone) rmSync(truncClone, { recursive: true, force: true }); });
+
+  const truncSpec = () => ({
+    tests: ['test/fixture.test.js'],
+    mutations: [{ name: 'x', file: 'src.mjs', anchor: 'alpha', replacement: 'ALPHA' }],
+  });
+
+  function runTruncHarness() {
+    const specPath = join(specDir, 'trunc.json');
+    writeFileSync(specPath, JSON.stringify(truncSpec(), null, 2));
+    try {
+      const out = execFileSync(process.execPath, ['scripts/mutate-verify.mjs', specPath],
+        { cwd: truncClone, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+      return { code: 0, out };
+    } catch (e) {
+      return { code: e.status, out: `${e.stdout || ''}${e.stderr || ''}` };
+    }
+  }
+
+  it('says truncated and labels the names cancelled, not failing', { skip: REAL_GIT ? false : SKIP_REASON }, () => {
+    const r = runTruncHarness();
+    const out = strip(r.out);
+    assert.match(out, /TRUNCATED/, `a cancelled run must not read as a red suite:\n${out}`);
+    assert.match(out, /cancelled=95/, 'and it must name the count it measured');
+    assert.match(out, /^\s*cancelled: cancelled test #1\b/m, 'the list belongs under cancelled:');
+    assert.doesNotMatch(out, /^\s*failing:/m,
+      'zero failures were measured; printing names under failing: is the mislabel itself:\n' + out);
+    assert.doesNotMatch(out, /Fix the suite first/,
+      'the suite is not failing — telling the reader to fix it sends them after assertions that never ran');
+    // The remedy must name a control that actually exists. "raise the runner's force-exit
+    // threshold" named nothing: node --help on 22.23.3 and 24.21.0 lists only the boolean
+    // --test-force-exit among the --test* options, there is no threshold knob, and
+    // runSuite's own comment records that the flag ends runs early and must not be used —
+    // so the sentence's only real-world referent makes truncation WORSE. Pinned as an
+    // absence assertion, because a presence assertion alone lets the dead remedy back in.
+    // Ordered absence-first on purpose: the absence guard is the regression guard, so when
+    // the dead remedy comes back this is the assertion that names it.
+    assert.doesNotMatch(out, /force-exit threshold/,
+      'no such knob exists; --test-force-exit ends a run early, it does not raise a threshold:\n' + out);
+    assert.match(out, /Make the whole suite run \(keep a live handle until the suite ends\) and re-run\./,
+      `the remedy must name a control that exists:\n${out}`);
+    assert.equal(r.code, 2, 'a truncated baseline is still a harness-level refusal (exit 2)');
+  });
+
+  it('a genuinely failing baseline keeps the red-suite wording', { skip: REAL_GIT ? false : SKIP_REASON }, () => {
+    // The control: the split must not soften a real failure into "truncated". A committed
+    // red fixture through the REAL reporter, so this is the shape a broken suite produces.
+    const r = runHarness({
+      tests: ['test/red.test.js'],
+      mutations: [{ name: 'x', file: 'src.mjs', anchor: 'alpha', replacement: 'ALPHA' }],
+    });
+    const out = strip(r.out);
+    assert.match(out, /baseline is not green/, `a red suite must still say so:\n${out}`);
+    assert.match(out, /^\s*failing: failing fixture assertion/m, 'and list real failures as failing:');
+    assert.doesNotMatch(out, /TRUNCATED|cancelled=/,
+      'fail>0 with cancelled=0 is a red suite, not a truncated one');
+    assert.equal(r.code, 2);
   });
 });
 

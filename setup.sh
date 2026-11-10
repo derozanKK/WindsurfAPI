@@ -108,11 +108,11 @@ else
 fi
 
 # Check Node.js version
-NODE_VER=$(node -v 2>/dev/null | sed 's/v//' | cut -d. -f1)
+NODE_VER=$(node -v 2>/dev/null | sed 's/^v//')
 if [ -z "$NODE_VER" ]; then
-  echo "[4/4] WARNING: Node.js not found. Install Node.js >= 20"
-elif [ "$NODE_VER" -lt 20 ]; then
-  echo "[4/4] WARNING: Node.js v$NODE_VER detected, need >= 20"
+  echo "[4/4] WARNING: Node.js not found. Install Node.js >= 22.13"
+elif ! node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a===22&&b>=13)?0:1)' 2>/dev/null; then
+  echo "[4/4] WARNING: Node.js v$NODE_VER detected, need >= 22.13"
 else
   echo "[4/4] Node.js $(node -v) OK"
 fi

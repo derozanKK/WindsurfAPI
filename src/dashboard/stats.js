@@ -3,10 +3,13 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { writeJsonAtomic } from '../fs-atomic.js';
 import { join } from 'path';
 import { config } from '../config.js';
-import { getModelInfo } from '../models.js';
+import { getModelInfo, getCloudSelectorPricing, resolveModel } from '../models.js';
+import { resolveConnectSelector } from '../devin-connect-models.js';
+import { accountRef } from '../log-safety.js';
 
 const STATS_FILE = join(config.dataDir, 'stats.json');
 
@@ -23,24 +26,6 @@ const MAX_MODELS = (() => {
   return Number.isFinite(raw) && raw >= 0 ? raw : 500;
 })();
 
-// Account-ref translator. Callers historically passed an apiKey where an
-// account id was intended, and every `devin-session-token$<JWT>` shares the
-// same "devin-se" 8-char prefix — so per-account stats collapsed the whole
-// pool into one bucket. chat.js registers an apiKey→account.id resolver here
-// (same injection pattern as auth.js setDroughtRestrictResolver) so
-// accountCounts keys are real account ids. No resolver → raw ref, pre-fix
-// behaviour preserved for tests that import this module directly.
-let _accountRefResolver = null;
-export function setAccountRefResolver(fn) {
-  _accountRefResolver = typeof fn === 'function' ? fn : null;
-}
-
-function accountStatKey(accountId) {
-  if (!accountId) return null;
-  const resolved = (_accountRefResolver && _accountRefResolver(accountId)) || accountId;
-  return typeof resolved === 'string' ? resolved.slice(0, 8) : String(resolved);
-}
-
 // Monotonic recency counter for LRU eviction. Wall-clock time ties within a
 // single millisecond (many requests can land there), which would make
 // eviction fall back to insertion order and starve hot-but-old keys; a
@@ -52,21 +37,62 @@ let _touchSeq = 0;
 // record" — safe after restart or hour rollover.
 let _curBucket = null;
 
+// Every caller-keyed map is stored on a null prototype so a model literally
+// named "__proto__" is an ordinary own key instead of Object.prototype. The
+// public getStats()/exportStats() views convert these back to plain objects so
+// JSON consumers keep the historical shape.
+const MAP_KEYS = ['modelCounts', 'accountCounts', 'creditsByHour', 'creditsByDay', 'creditsByModel', 'tokensByModel'];
+const UNSAFE_MODEL_KEYS = new Set(['__proto__', 'constructor', 'toString', 'prototype']);
+
+/** A dictionary with no inherited keys. */
+function emptyMap() {
+  return Object.create(null);
+}
+
+/**
+ * True for model names that would collide with a prototype/function property.
+ * `Object.hasOwn(Object.prototype, key)` catches the wider inherited surface
+ * (`valueOf`, `hasOwnProperty`, …) while the explicit set documents the three
+ * names this fix is contracted to reject.
+ */
+function isUnsafeModelKey(key) {
+  return typeof key !== 'string' || key === '' || UNSAFE_MODEL_KEYS.has(key)
+    || Object.hasOwn(Object.prototype, key);
+}
+
+/** Shallow plain-object copy of an internal null-prototype map. */
+function plainMap(source) {
+  return Object.fromEntries(Object.entries(source && typeof source === 'object' ? source : {}));
+}
+
+/** Ensure a state map is null-prototype; migrate a plain object in place. */
+function ensureNullProtoMap(name) {
+  const current = _state[name];
+  if (!current || typeof current !== 'object' || Array.isArray(current)
+    || Object.getPrototypeOf(current) !== null) {
+    if (name === 'modelCounts') _state[name] = adoptModelCounts(current);
+    else if (name === 'tokensByModel') _state[name] = adoptTokensByModel(current);
+    else if (name === 'creditsByModel') _state[name] = adoptCreditsByModel(current);
+    else _state[name] = adoptMap(current);
+  }
+  return _state[name];
+}
+
 /** Count of tracked model keys excluding the shared overflow bucket. */
-function realModelKeyCount() {
+function realModelKeyCount(modelCounts = _state.modelCounts) {
   let n = 0;
-  for (const k of Object.keys(_state.modelCounts)) {
+  for (const k of Object.keys(modelCounts)) {
     if (k !== OTHER_MODEL_KEY) n++;
   }
   return n;
 }
 
 /** Fold an evicted model's counts into the shared '(other)' bucket. */
-function foldIntoOther(src) {
-  let dst = _state.modelCounts[OTHER_MODEL_KEY];
+function foldIntoOther(src, modelCounts = _state.modelCounts) {
+  let dst = Object.hasOwn(modelCounts, OTHER_MODEL_KEY) ? modelCounts[OTHER_MODEL_KEY] : null;
   if (!dst) {
     dst = { requests: 0, success: 0, errors: 0, totalMs: 0, recentMs: [], lastTs: 0 };
-    _state.modelCounts[OTHER_MODEL_KEY] = dst;
+    modelCounts[OTHER_MODEL_KEY] = dst;
   }
   dst.requests += src.requests || 0;
   dst.success += src.success || 0;
@@ -77,7 +103,28 @@ function foldIntoOther(src) {
     for (const v of src.recentMs) dst.recentMs.push(v);
     if (dst.recentMs.length > 200) dst.recentMs = dst.recentMs.slice(-200);
   }
-  dst.lastTs = ++_touchSeq;
+  dst.lastTs = modelCounts === _state.modelCounts ? ++_touchSeq : Math.max(dst.lastTs || 0, src.lastTs || 0);
+}
+
+/**
+ * The modelCounts key a request belongs to, applying the cardinality cap.
+ *
+ * Shared by recordRequest and recordTokenUsage so the two maps cannot disagree
+ * about which bucket a model landed in — a token row under a key the request
+ * table never created would render as a model with tokens and zero requests.
+ */
+function boundedModelKey(model) {
+  let key = typeof model === 'string' && model ? model : OTHER_MODEL_KEY;
+  // Reject prototype-shaped names before any map lookup: "__proto__" would
+  // otherwise resolve to Object.prototype, and "constructor"/"toString" to a
+  // shared function object. They cannot be real model ids, so account for the
+  // request in the shared overflow bucket instead.
+  if (key !== OTHER_MODEL_KEY && isUnsafeModelKey(key)) key = OTHER_MODEL_KEY;
+  if (key !== OTHER_MODEL_KEY && !Object.hasOwn(_state.modelCounts, key)) {
+    enforceModelCap();
+    if (MAX_MODELS > 0 && realModelKeyCount() >= MAX_MODELS) key = OTHER_MODEL_KEY;
+  }
+  return key;
 }
 
 /**
@@ -85,29 +132,62 @@ function foldIntoOther(src) {
  * least-recently-updated real model into '(other)' while over the cap.
  * No-op when MAX_MODELS is 0 (unbounded).
  */
-function enforceModelCap() {
-  if (MAX_MODELS <= 0) return;
-  while (realModelKeyCount() >= MAX_MODELS) {
+function enforceModelCap(reserveSlot = true, modelCounts = _state.modelCounts) {
+  const evicted = [];
+  if (MAX_MODELS <= 0) return evicted;
+  while (realModelKeyCount(modelCounts) > MAX_MODELS - (reserveSlot ? 1 : 0)) {
     let coldestKey = null;
     let coldestTs = Infinity;
-    for (const [k, s] of Object.entries(_state.modelCounts)) {
+    for (const [k, s] of Object.entries(modelCounts)) {
       if (k === OTHER_MODEL_KEY) continue;
       const ts = s.lastTs || 0;
       if (ts < coldestTs) { coldestTs = ts; coldestKey = k; }
     }
     if (coldestKey == null) break;
-    foldIntoOther(_state.modelCounts[coldestKey]);
-    delete _state.modelCounts[coldestKey];
+    foldIntoOther(modelCounts[coldestKey], modelCounts);
+    delete modelCounts[coldestKey];
+    evicted.push(coldestKey);
+  }
+  // Only the live state owns the live token map, and only the keys THIS call
+  // evicted may be folded: a token row can legitimately exist before its request
+  // row (recordTokenUsage runs first on several chat paths), so sweeping every
+  // key absent from modelCounts would misfile a live model under '(other)'.
+  if (modelCounts === _state.modelCounts && evicted.length) {
+    pruneTokensToModelCounts(evicted, modelCounts);
+  }
+  return evicted;
+}
+
+/**
+ * Fold the given models' token rows into '(other)'.
+ *
+ * Used for keys the request table actually lost (LRU eviction, or an imported
+ * snapshot whose cap dropped them). The dashboard joins the two maps by key, and
+ * an orphan would render a model that "moved 2M tokens" while the request table
+ * says it never ran.
+ */
+function pruneTokensToModelCounts(keys, modelCounts = _state.modelCounts, tokens = _state.tokensByModel) {
+  if (!tokens || typeof tokens !== 'object') return;
+  for (const key of keys || []) {
+    if (key === OTHER_MODEL_KEY) continue;
+    if (Object.hasOwn(modelCounts, key)) continue;
+    if (!Object.hasOwn(tokens, key)) continue;
+    const dst = tokens[OTHER_MODEL_KEY] || {
+      fresh_input: 0, cache_read: 0, cache_write: 0, output: 0, total: 0, requests_with_usage: 0,
+    };
+    tokens[OTHER_MODEL_KEY] = dst;
+    for (const field of Object.keys(dst)) dst[field] += tokens[key][field] || 0;
+    delete tokens[key];
   }
 }
 
-const _state = {
-  startedAt: Date.now(),
+const STATS_DEFAULTS = {
+  startedAt: 0,
   totalRequests: 0,
   successCount: 0,
   errorCount: 0,
   modelCounts: {},    // { "gpt-4o-mini": { requests, success, errors, totalMs } }
-  accountCounts: {},  // { "abc123": { requests, success, errors } }
+  accountCounts: {},  // { "acct-<8 hex>": { requests, success, errors } } — opaque ref, never a key/email
   hourlyBuckets: [],  // [{ hour: "2026-04-09T07:00:00Z", requests, errors }]
   // v2.0.69 (#118 wnfilm) — bucket-level token totals so the dashboard
   // can show fresh_input / cache_read / cache_write / output without
@@ -132,23 +212,243 @@ const _state = {
   // v2.0.148 — Credits spend dimension. creditsByHour/Day are keyed maps
   // { "<iso-hour|day>": creditsFloat } so the dashboard can chart spend over
   // time. Cost per request = MODELS[model].credit (rate card), summed here so we
-  // never have to thread cost through the 10 recordRequest call sites.
+  // never have to thread cost through the 10 recordRequest call sites. Only
+  // successful attempts are charged; failed attempts keep their request row
+  // with credit 0, so the log and this card share one number.
   creditsTotal: 0,
   creditsByHour: {},   // { "2026-07-09T01:00:00Z": 12.5 }
   creditsByDay: {},    // { "2026-07-09": 340.0 }
   creditsByModel: {},  // { "claude-opus-4-8-medium": 88.0 }
+  // v3.10.x — per-model token totals. tokenTotals answers "how many tokens did
+  // this deployment move"; this answers "which model moved them", which is the
+  // question a bill asks. Keyed by the same bounded model key modelCounts uses,
+  // so a client-permuted name cannot grow this map without bound.
+  tokensByModel: {},   // { "swe-2-medium": { fresh_input, cache_read, cache_write, output, total, requests_with_usage } }
   // v2.0.148 — per-request detail ring buffer (bounded, persisted) so long runs
   // keep a rolling window of recent calls for audit/export instead of losing them.
-  recentRequests: [],  // [{ ts, model, success, ms, account, credit }]  newest last, cap 500
+  recentRequests: [],  // [{ ts, model, success, ms, account, credit }]  newest last, cap 500; account is an opaque acct-<hash> ref
 };
+
+function createStatsState() {
+  const state = structuredClone(STATS_DEFAULTS);
+  for (const key of MAP_KEYS) state[key] = emptyMap();
+  return { ...state, startedAt: Date.now() };
+}
+
+const _state = createStatsState();
 
 const RECENT_REQ_CAP = 500;
 
-// Load persisted stats
+const ACCOUNT_REF_RE = /^acct-[0-9a-f]{8}$/;
+
+/**
+ * Canonical account reference for stats persistence and display.
+ *
+ * The request log used to key this dimension by `String(accountId).slice(0, 8)`.
+ * Chat handlers passed the credential the attempt presented, and every
+ * `devin-session-token$…` key starts with `devin-se`, so all connect accounts
+ * collapsed into one bucket and stats.json stored a credential prefix. Callers
+ * now pass the immutable account id; this boundary turns any value into an
+ * opaque `acct-<8 hex>` ref (the same shape the DevIn panel uses). A value that
+ * already looks like a ref passes through, so re-reading a persisted row or
+ * importing an exported snapshot is idempotent.
+ */
+function normalizeAccountRef(value) {
+  if (value == null) return null;
+  const raw = typeof value === 'string' ? value : String(value);
+  if (!raw) return null;
+  return ACCOUNT_REF_RE.test(raw) ? raw : accountRef(raw);
+}
+
+/** Re-key a persisted account map by normalized ref, merging old duplicates. */
+function normalizeAccountCounts(map) {
+  const out = emptyMap();
+  const source = map && typeof map === 'object' && !Array.isArray(map) ? map : {};
+  for (const [key, counts] of Object.entries(source)) {
+    const ref = normalizeAccountRef(key);
+    if (!ref) continue;
+    const current = out[ref] || { requests: 0, success: 0, errors: 0 };
+    current.requests += Number(counts?.requests) || 0;
+    current.success += Number(counts?.success) || 0;
+    current.errors += Number(counts?.errors) || 0;
+    out[ref] = current;
+  }
+  return out;
+}
+
+/** Scrub the credential-derived `account` values older versions persisted. */
+function normalizeRecentRequests(rows) {
+  if (!Array.isArray(rows)) return [];
+  for (const row of rows) {
+    if (row && typeof row === 'object') row.account = normalizeAccountRef(row.account);
+  }
+  return rows;
+}
+
+/**
+ * Copy a persisted/generic map onto a null-prototype dictionary. Only own
+ * enumerable keys are read, and the three prototype-shaped names are dropped.
+ * Model-keyed maps use the adopt* helpers below, which fold unsafe names into
+ * the shared '(other)' bucket instead of silently losing their totals.
+ */
+function adoptMap(source) {
+  const out = emptyMap();
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return out;
+  for (const [key, value] of Object.entries(source)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Adopt persisted model rows, folding prototype-shaped keys into '(other)'. */
+function adoptModelCounts(source) {
+  const out = emptyMap();
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return out;
+  for (const [key, value] of Object.entries(source)) {
+    if (!isUnsafeModelKey(key)) { out[key] = value; continue; }
+    if (!value || typeof value !== 'object') continue;
+    const dst = out[OTHER_MODEL_KEY] || (out[OTHER_MODEL_KEY] = {
+      requests: 0, success: 0, errors: 0, totalMs: 0, recentMs: [], lastTs: 0,
+    });
+    for (const field of ['requests', 'success', 'errors', 'totalMs']) {
+      dst[field] = (Number(dst[field]) || 0) + (Number(value[field]) || 0);
+    }
+    if (!Array.isArray(dst.recentMs)) dst.recentMs = [];
+    if (Array.isArray(value.recentMs)) {
+      for (const sample of value.recentMs) {
+        if (Number.isFinite(sample)) dst.recentMs.push(sample);
+      }
+      if (dst.recentMs.length > 200) dst.recentMs = dst.recentMs.slice(-200);
+    }
+    dst.lastTs = Math.max(Number(dst.lastTs) || 0, Number(value.lastTs) || 0);
+  }
+  return out;
+}
+
+const TOKEN_FIELDS = ['fresh_input', 'cache_read', 'cache_write', 'output', 'total', 'requests_with_usage'];
+
+/** Adopt persisted token rows, folding prototype-shaped keys into '(other)'. */
+function adoptTokensByModel(source) {
+  const out = emptyMap();
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return out;
+  for (const [key, value] of Object.entries(source)) {
+    if (!isUnsafeModelKey(key)) { out[key] = value; continue; }
+    if (!value || typeof value !== 'object') continue;
+    let dst = out[OTHER_MODEL_KEY];
+    if (!dst) {
+      dst = emptyMap();
+      out[OTHER_MODEL_KEY] = dst;
+    }
+    for (const field of TOKEN_FIELDS) {
+      dst[field] = (Number(dst[field]) || 0) + (Number(value[field]) || 0);
+    }
+  }
+  return out;
+}
+
+/** Adopt persisted per-model credits, folding prototype-shaped keys into '(other)'. */
+function adoptCreditsByModel(source) {
+  const out = emptyMap();
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return out;
+  for (const [key, value] of Object.entries(source)) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+    const target = isUnsafeModelKey(key) ? OTHER_MODEL_KEY : key;
+    out[target] = (Object.hasOwn(out, target) ? out[target] : 0) + value;
+  }
+  return out;
+}
+
+// ─── Per-HTTP-request accounting scope ─────────────────────────────────
+// recordRequest (the attempt row) and recordTokenUsage (the usage block) are
+// called from different depths of a chat handler and, depending on the route,
+// in either order. A module-level "last row" pointer would attribute tokens to
+// whichever concurrent request happened to finish last, so the two calls are
+// joined through the async context the HTTP server establishes per request.
+// Outside such a scope (unit tests, direct handler calls) both functions keep
+// their pre-existing aggregate-only behaviour and the log row gets the
+// success-derived status.
+const _requestScope = new AsyncLocalStorage();
+
+/**
+ * Run `fn` inside a per-request accounting scope. Returns fn's own result.
+ * Re-entrant: an existing scope is reused, so wrapping a handler twice never
+ * splits one request across two scopes.
+ */
+export function withStatsScope(fn) {
+  const existing = _requestScope.getStore();
+  if (existing) return fn(existing);
+  const scope = { rows: [], pendingUsage: null, status: null };
+  return _requestScope.run(scope, () => fn(scope));
+}
+
+/**
+ * Close a scope. The last attempt row is the one the client actually received,
+ * so it gets the real HTTP status; earlier failover attempts keep the
+ * success-derived 200/500 they were recorded with. Rows are the same objects
+ * held in recentRequests, so this patch persists with the next scheduled save.
+ */
+export function finalizeStatsScope(scope) {
+  if (!scope) return;
+  const row = scope.rows[scope.rows.length - 1];
+  if (row && Number.isFinite(scope.status)) row.status = scope.status;
+}
+
+/** Non-negative finite number or 0 — rows come from persisted JSON too. */
+function nonNeg(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * Normalize an OpenAI-shaped usage block into the four counters the request
+ * log stores. `tokensIn` is the full billable input (fresh + cache read +
+ * cache write), matching what tokenTotals.total counts, so a row's
+ * tokensIn + tokensOut always reconciles with the lifetime token card.
+ */
+function usageTokenCounts(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const bd = usage.cascade_breakdown || null;
+  const prompt = nonNeg(usage.prompt_tokens);
+  const cacheRead = nonNeg(bd?.cache_read_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? usage.cache_read_input_tokens);
+  const cacheWrite = nonNeg(bd?.cache_write_tokens ?? usage.cache_creation_input_tokens);
+  // Connect usage carries the fresh bucket explicitly because its prompt_tokens
+  // includes cache_write (O2); `prompt - cached` would count the write as fresh.
+  const fresh = nonNeg(bd?.fresh_input_tokens ?? usage.fresh_input_tokens ?? Math.max(0, prompt - cacheRead));
+  const tokensOut = nonNeg(bd?.output_tokens ?? usage.completion_tokens ?? usage.output_tokens);
+  if (!fresh && !cacheRead && !cacheWrite && !tokensOut) return null;
+  return { tokensIn: fresh + cacheRead + cacheWrite, tokensOut, cacheRead, cacheWrite };
+}
+
+function applyUsageToRow(row, usage) {
+  const counts = usageTokenCounts(usage);
+  if (!counts) return;
+  row.tokensIn = counts.tokensIn;
+  row.tokensOut = counts.tokensOut;
+  row.cacheRead = counts.cacheRead;
+  row.cacheWrite = counts.cacheWrite;
+}
+
+// Load persisted stats. The reviver drops prototype-shaped keys at every
+// depth (JSON.parse creates an own "__proto__" property, and Object.assign
+// would otherwise invoke its setter on _state). Each keyed map is then rebuilt
+// on a null prototype so a legacy stats.json written by the vulnerable version
+// cannot reintroduce a prototype key.
 try {
   if (existsSync(STATS_FILE)) {
-    const saved = JSON.parse(readFileSync(STATS_FILE, 'utf-8'));
+    const saved = JSON.parse(readFileSync(STATS_FILE, 'utf-8'), (key, value) =>
+      key === '__proto__' || key === 'constructor' || key === 'prototype' ? undefined : value);
     Object.assign(_state, saved);
+    _state.modelCounts = adoptModelCounts(_state.modelCounts);
+    _state.tokensByModel = adoptTokensByModel(_state.tokensByModel);
+    _state.creditsByModel = adoptCreditsByModel(_state.creditsByModel);
+    _state.creditsByHour = adoptMap(_state.creditsByHour);
+    _state.creditsByDay = adoptMap(_state.creditsByDay);
+    // Older versions persisted the credential prefix (or a raw id) as the
+    // account key/value. Normalize on load so stats.json and the dashboard stop
+    // displaying it without waiting for the 500-row ring to rotate.
+    _state.accountCounts = normalizeAccountCounts(_state.accountCounts);
+    _state.recentRequests = normalizeRecentRequests(_state.recentRequests);
     // Reseed the recency counter above any persisted lastTs so LRU ordering
     // survives a restart without an early wrap-collision.
     for (const s of Object.values(_state.modelCounts || {})) {
@@ -175,26 +475,60 @@ function getHourKey() {
 }
 
 /**
- * Record a completed request.
+ * Credit cost of one request, from live billing data when the sync knows it.
+ *
+ * The static rate card is a snapshot of one moment and knows nothing about
+ * promotions: swe-2-medium's card says 6 credits while the upstream marks it
+ * FREE until 2026-11-01. Metering the card would report spend the account never
+ * incurred, and the free badge on the model row would then contradict the very
+ * number next to it. Precedence: live free → 0; live credit rate → that rate;
+ * nothing live → the static card (the pre-existing behaviour).
  */
-export function recordRequest(model, success, durationMs, accountId) {
+function requestCreditCost(model) {
+  if (!model) return 0;
+  const key = resolveModel(model) || model;
+  const resolution = resolveConnectSelector(key, { warnOnFallback: false });
+  if (resolution?.mapped) {
+    const live = getCloudSelectorPricing(resolution.selector);
+    if (live.freeNow === true) return 0;
+    if (typeof live.rate === 'number') return Math.max(0, live.rate);
+  }
+  const card = Number(getModelInfo(key)?.credit);
+  return Number.isFinite(card) && card > 0 ? card : 0;
+}
+
+/**
+ * Record a completed request.
+ *
+ * `extra` is optional and additive: `{ status, usage }`. `status` is the real
+ * HTTP status when the caller knows it; otherwise the row carries the
+ * success-derived 200/500. `usage` lets a caller that already holds the usage
+ * block attach it directly; normally recordTokenUsage joins it via the scope.
+ */
+export function recordRequest(model, success, durationMs, accountId, extra = {}) {
   _state.totalRequests++;
   if (success) _state.successCount++;
   else _state.errorCount++;
+
+  // A cache-served turn is real client traffic but ZERO upstream consumption:
+  // no request reached the backend, so it must not charge the model's credit
+  // card. Before this flag the Connect replay arms called recordRequest like any
+  // completed turn, so every cache hit re-billed the answer it replayed. The row
+  // keeps the marker so the log can tell the two apart.
+  const cacheServed = extra?.cacheServed === true;
 
   // Per-model stats (includes a small ring buffer for p50/p95 latency).
   // Cap real-model cardinality: a brand-new key that would exceed the limit
   // gets folded into the shared '(other)' bucket instead (LRU eviction of the
   // coldest existing key). Known keys and '(other)' itself always update.
-  let key = model;
-  if (!_state.modelCounts[key] && key !== OTHER_MODEL_KEY) {
-    enforceModelCap();
-    if (MAX_MODELS > 0 && realModelKeyCount() >= MAX_MODELS) key = OTHER_MODEL_KEY;
+  // The map is null-prototype and every read is an own-key check, so a model
+  // string can never resolve to an inherited object/function.
+  const modelCounts = ensureNullProtoMap('modelCounts');
+  const key = boundedModelKey(model);
+  if (!Object.hasOwn(modelCounts, key)) {
+    modelCounts[key] = { requests: 0, success: 0, errors: 0, totalMs: 0, recentMs: [], lastTs: 0 };
   }
-  if (!_state.modelCounts[key]) {
-    _state.modelCounts[key] = { requests: 0, success: 0, errors: 0, totalMs: 0, recentMs: [], lastTs: 0 };
-  }
-  const mc = _state.modelCounts[key];
+  const mc = modelCounts[key];
   mc.requests++;
   if (success) mc.success++;
   else mc.errors++;
@@ -206,13 +540,14 @@ export function recordRequest(model, success, durationMs, accountId) {
     if (mc.recentMs.length > 200) mc.recentMs.shift();
   }
 
-  // Per-account stats
-  const aid = accountStatKey(accountId);
-  if (aid) {
-    if (!_state.accountCounts[aid]) {
-      _state.accountCounts[aid] = { requests: 0, success: 0, errors: 0 };
+  // Per-account stats, keyed by the same opaque ref the log row carries.
+  const account = normalizeAccountRef(accountId);
+  if (account) {
+    const accountCounts = ensureNullProtoMap('accountCounts');
+    if (!Object.hasOwn(accountCounts, account)) {
+      accountCounts[account] = { requests: 0, success: 0, errors: 0 };
     }
-    const ac = _state.accountCounts[aid];
+    const ac = accountCounts[account];
     ac.requests++;
     if (success) ac.success++;
     else ac.errors++;
@@ -239,26 +574,58 @@ export function recordRequest(model, success, durationMs, accountId) {
   bucket.requests++;
   if (!success) bucket.errors++;
 
-  // v2.0.148 — Credits spend + per-request detail. Cost = model's rate-card
-  // credit (getModelInfo), 0 if unknown. Persisted maps stay JSON-safe.
+  // v2.0.148 — Credits spend + per-request detail. Cost comes from the live
+  // billing sync when it knows the model (free promo → 0, catalog/rate-table
+  // multiplier otherwise) and only falls back to the static rate card when the
+  // upstream has said nothing. Persisted maps stay JSON-safe.
+  //
+  // A failed attempt is not spend: the credits card has always charged
+  // successes only, while the row used to carry the model's price anyway, so
+  // the log's cost column/summary over-reported by every failover, 429 and 500.
+  // Store the charged amount (0 on failure); `success` is the explicit failed
+  // flag, so the row and the card share one number.
   let credit = 0;
-  try { credit = Number(getModelInfo(model)?.credit) || 0; } catch { credit = 0; }
-  if (credit > 0 && success) {
+  if (success && !cacheServed) {
+    // Never let a prototype-shaped model name reach the catalog lookup either;
+    // it cannot name a real price card.
+    const costModel = typeof model === 'string' && !isUnsafeModelKey(model) ? model : null;
+    try { credit = requestCreditCost(costModel); } catch { credit = 0; }
+  }
+  if (credit > 0) {
     const dayKey = hourKey.slice(0, 10);
+    const creditsByHour = ensureNullProtoMap('creditsByHour');
+    const creditsByDay = ensureNullProtoMap('creditsByDay');
+    const creditsByModel = ensureNullProtoMap('creditsByModel');
     _state.creditsTotal = (_state.creditsTotal || 0) + credit;
-    _state.creditsByHour[hourKey] = (_state.creditsByHour[hourKey] || 0) + credit;
-    _state.creditsByDay[dayKey] = (_state.creditsByDay[dayKey] || 0) + credit;
-    _state.creditsByModel[model] = (_state.creditsByModel[model] || 0) + credit;
+    creditsByHour[hourKey] = (Object.hasOwn(creditsByHour, hourKey) ? creditsByHour[hourKey] : 0) + credit;
+    creditsByDay[dayKey] = (Object.hasOwn(creditsByDay, dayKey) ? creditsByDay[dayKey] : 0) + credit;
+    // Key the credit row by the same bounded key as modelCounts so the
+    // dashboard join stays intact and a dangerous model name is normalized.
+    creditsByModel[key] = (Object.hasOwn(creditsByModel, key) ? creditsByModel[key] : 0) + credit;
     // Prune credit hour map to ~30 days (720 keys), day map to ~90 days.
-    pruneKeyed(_state.creditsByHour, 720);
-    pruneKeyed(_state.creditsByDay, 90);
+    pruneKeyed(creditsByHour, 720);
+    pruneKeyed(creditsByDay, 90);
   }
   if (!Array.isArray(_state.recentRequests)) _state.recentRequests = [];
-  _state.recentRequests.push({
+  const scope = _requestScope.getStore();
+  const row = {
     ts: Date.now(), model, success: !!success, ms: durationMs || 0,
-    account: aid,
+    account,
     credit,
-  });
+    status: Number.isFinite(extra?.status) ? extra.status : (success ? 200 : 500),
+    tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0,
+    ...(cacheServed ? { cacheServed: true } : {}),
+  };
+  // Usage can legitimately arrive before its row (the DEVIN_CONNECT non-stream
+  // path bills inside the attempt, then finalizes the account). The scope holds
+  // it until the row exists; a usage block handed in directly wins over it.
+  const usage = extra.usage || scope?.pendingUsage || null;
+  if (usage) applyUsageToRow(row, usage);
+  if (scope) {
+    scope.rows.push(row);
+    scope.pendingUsage = null;
+  }
+  _state.recentRequests.push(row);
   if (_state.recentRequests.length > RECENT_REQ_CAP) {
     _state.recentRequests.splice(0, _state.recentRequests.length - RECENT_REQ_CAP);
   }
@@ -281,13 +648,34 @@ function percentile(sortedArr, p) {
   return sortedArr[idx];
 }
 
+/**
+ * Split the lifetime request total into rows that carry an account id and rows
+ * that cannot be attributed to any account. Global/unauthenticated paths call
+ * recordRequest with `accountId == null`, so they increment totalRequests but
+ * have no accountCounts key — the account dimension silently sums short of the
+ * page total. Derived at read time so pre-fix persisted snapshots reconcile
+ * without a migration.
+ */
+function accountAttribution() {
+  let attributed = 0;
+  for (const s of Object.values(_state.accountCounts || {})) {
+    const n = Number(s?.requests);
+    if (Number.isFinite(n) && n > 0) attributed += n;
+  }
+  const total = Number(_state.totalRequests) || 0;
+  return { total, attributed, unattributed: Math.max(0, total - attributed) };
+}
+
 /** Get all stats, with computed latency percentiles per model. */
 export function getStats() {
   const out = { ..._state };
-  out.modelCounts = {};
-  for (const [m, s] of Object.entries(_state.modelCounts)) {
+  out.accountAttribution = accountAttribution();
+  // Rebuild every keyed map as a plain object: the public response keeps its
+  // historical Object.prototype shape, while Object.fromEntries creates own
+  // data properties (never the __proto__ setter) for every key.
+  out.modelCounts = Object.fromEntries(Object.entries(_state.modelCounts).map(([m, s]) => {
     const sorted = (s.recentMs || []).slice().sort((a, b) => a - b);
-    out.modelCounts[m] = {
+    return [m, {
       requests: s.requests,
       success: s.success,
       errors: s.errors,
@@ -295,75 +683,171 @@ export function getStats() {
       avgMs: s.requests > 0 ? Math.round(s.totalMs / s.requests) : 0,
       p50Ms: Math.round(percentile(sorted, 0.5)),
       p95Ms: Math.round(percentile(sorted, 0.95)),
-    };
-  }
+    }];
+  }));
+  out.accountCounts = plainMap(_state.accountCounts);
+  out.creditsByHour = plainMap(_state.creditsByHour);
+  out.creditsByDay = plainMap(_state.creditsByDay);
+  out.creditsByModel = plainMap(_state.creditsByModel);
+  out.tokensByModel = plainMap(_state.tokensByModel);
   return out;
 }
 
 // v2.0.148 — Export the full stats state as a JSON-serializable snapshot (for
 // backup / migration / offline analysis). Includes credits + recentRequests.
 export function exportStats() {
+  const out = { ..._state };
+  for (const key of MAP_KEYS) out[key] = plainMap(_state[key]);
   return {
     _exportedAt: new Date().toISOString(),
     _schema: 'windsurfapi-stats-v2',
-    ..._state,
+    ...out,
   };
+}
+
+function normalizeStatsSnapshot(src) {
+  const object = value => value && typeof value === 'object' && !Array.isArray(value);
+  const number = (value = 0) => {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error('invalid number');
+    return value;
+  };
+  const counts = (value, keys) => {
+    if (!object(value)) throw new Error('invalid counters');
+    // Own-key reads only: a polluted Object.prototype must never supply a
+    // counter that the imported snapshot did not actually contain.
+    return Object.fromEntries(keys.map(key =>
+      [key, number(Object.hasOwn(value, key) ? value[key] : 0)]));
+  };
+  const out = createStatsState();
+  if (!object(src) || !Object.keys(out).some(key => Object.hasOwn(src, key))) throw new Error('empty snapshot');
+  if (src._schema != null && !['windsurfapi-stats-v1', 'windsurfapi-stats-v2'].includes(src._schema)) {
+    throw new Error('unsupported schema');
+  }
+  for (const [key, value] of Object.entries(out)) {
+    if (typeof value === 'number' && Object.hasOwn(src, key)) out[key] = number(src[key]);
+  }
+  for (const key of ['modelCounts', 'accountCounts', 'creditsByHour', 'creditsByDay', 'creditsByModel']) {
+    if (!Object.hasOwn(src, key)) continue;
+    if (!object(src[key])) throw new Error('invalid map');
+    for (const [name, value] of Object.entries(src[key])) {
+      if (key.startsWith('credits')) { out[key][name] = number(value); continue; }
+      const entry = counts(value, key === 'modelCounts'
+        ? ['requests', 'success', 'errors', 'totalMs', 'lastTs'] : ['requests', 'success', 'errors']);
+      if (key === 'modelCounts') {
+        if (value.recentMs !== undefined && !Array.isArray(value.recentMs)) throw new Error('invalid latency samples');
+        entry.recentMs = (value.recentMs || []).map(v => number(v)).slice(-200);
+      }
+      out[key][name] = entry;
+    }
+  }
+  // Snapshots written before the id fix carry credential prefixes in both the
+  // account map keys and the request rows; scrub them on import too.
+  out.accountCounts = normalizeAccountCounts(out.accountCounts);
+  if (Object.hasOwn(src, 'tokenTotals')) out.tokenTotals = counts(src.tokenTotals, Object.keys(out.tokenTotals));
+  if (Object.hasOwn(src, 'tokensByModel')) {
+    if (!object(src.tokensByModel)) throw new Error('invalid token map');
+    for (const [name, value] of Object.entries(src.tokensByModel)) {
+      out.tokensByModel[name] = counts(value,
+        ['fresh_input', 'cache_read', 'cache_write', 'output', 'total', 'requests_with_usage']);
+    }
+  }
+  for (const key of ['hourlyBuckets', 'recentRequests', 'recentPolicyBlocks']) {
+    if (!Object.hasOwn(src, key)) continue;
+    if (!Array.isArray(src[key])) throw new Error('invalid history');
+    out[key] = src[key].map(entry => {
+      if (!object(entry)) throw new Error('invalid history entry');
+      if (key === 'hourlyBuckets') {
+        if (typeof entry.hour !== 'string' || !Number.isFinite(Date.parse(entry.hour))) throw new Error('invalid hour');
+        return { hour: new Date(entry.hour).toISOString(), ...counts(entry, ['requests', 'errors']) };
+      }
+      number(entry.ts);
+      if (!Object.hasOwn(entry, 'ts')) throw new Error('missing timestamp');
+      if (key === 'recentRequests') {
+        if (typeof entry.model !== 'string') throw new Error('invalid model');
+        if (entry.success !== undefined && typeof entry.success !== 'boolean') throw new Error('invalid success flag');
+        if (entry.account != null && typeof entry.account !== 'string') throw new Error('invalid account');
+        for (const field of ['ms', 'credit']) if (Object.hasOwn(entry, field)) number(entry[field]);
+      } else if (typeof entry.promptHash !== 'string') throw new Error('invalid prompt hash');
+      return entry;
+    });
+  }
+  out.recentRequests = normalizeRecentRequests(out.recentRequests);
+  return out;
+}
+
+function mergeStatsHistory(existing, incoming, identity, cap) {
+  const entries = new Map(existing.map(entry => [identity(entry), entry]));
+  for (const entry of incoming) {
+    const key = identity(entry);
+    if (!entries.has(key)) entries.set(key, entry);
+  }
+  return [...entries.values()].sort((a, b) => a.ts - b.ts).slice(-cap);
 }
 
 // v2.0.148 — Import a previously exported snapshot. MERGE mode (default) adds
 // counts onto current; REPLACE overwrites. Numeric fields are summed, keyed
 // maps merged, recentRequests concatenated + de-duped by ts+model then capped.
 export function importStats(snap, { mode = 'merge' } = {}) {
-  if (!snap || typeof snap !== 'object') return { ok: false, error: 'invalid snapshot' };
-  // Match runtime-config.js:182-190: ignore prototype keys at every depth.
-  // Complete the clone before clearing state so a failed clone is non-mutating.
-  const src = JSON.parse(JSON.stringify(snap), (key, value) => {
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return undefined;
-    return value;
-  });
-  if (mode === 'replace') {
-    for (const k of Object.keys(_state)) delete _state[k];
-    Object.assign(_state, src);
-    delete _state._exportedAt; delete _state._schema;
-    _curBucket = null; // S8: state wholesale-replaced, cached bucket ref is stale
-    scheduleSave();
-    return { ok: true, mode: 'replace' };
+  if (!['merge', 'replace'].includes(mode)) return { ok: false, error: 'invalid mode' };
+  let next;
+  try {
+    // Clone and validate before touching live state; prototype keys are stripped at every depth.
+    const src = normalizeStatsSnapshot(JSON.parse(JSON.stringify(snap), (key, value) => {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') return undefined;
+      return value;
+    }));
+    next = mode === 'replace' ? src : normalizeStatsSnapshot(JSON.parse(JSON.stringify(_state)));
+    if (mode === 'merge') {
+      for (const [key, value] of Object.entries(src)) {
+        if (typeof value === 'number' && key !== 'startedAt') next[key] += value;
+      }
+      for (const key of ['creditsByHour', 'creditsByDay', 'creditsByModel', 'tokenTotals']) {
+        for (const [name, value] of Object.entries(src[key])) {
+          next[key][name] = (Object.hasOwn(next[key], name) ? next[key][name] : 0) + value;
+        }
+      }
+      for (const [name, incoming] of Object.entries(src.tokensByModel)) {
+        const current = Object.hasOwn(next.tokensByModel, name) ? next.tokensByModel[name] : null;
+        if (!current) { next.tokensByModel[name] = { ...incoming }; continue; }
+        for (const field of Object.keys(current)) current[field] += incoming[field] || 0;
+      }
+      for (const key of ['modelCounts', 'accountCounts']) {
+        for (const [name, incoming] of Object.entries(src[key])) {
+          const current = Object.hasOwn(next[key], name) ? next[key][name] : null;
+          if (!current) { next[key][name] = incoming; continue; }
+          for (const field of ['requests', 'success', 'errors']) current[field] += incoming[field];
+          if (key === 'modelCounts') {
+            current.totalMs += incoming.totalMs;
+            current.lastTs = Math.max(current.lastTs, incoming.lastTs);
+            current.recentMs = [...current.recentMs, ...incoming.recentMs].slice(-200);
+          }
+        }
+      }
+    }
+    const hours = new Map();
+    for (const bucket of [...(mode === 'merge' ? src.hourlyBuckets : []), ...next.hourlyBuckets]) {
+      const current = hours.get(bucket.hour);
+      if (current) { current.requests += bucket.requests; current.errors += bucket.errors; }
+      else hours.set(bucket.hour, { ...bucket });
+    }
+    next.hourlyBuckets = [...hours.values()].sort((a, b) => a.hour.localeCompare(b.hour)).slice(-720);
+    next.recentRequests = mergeStatsHistory(next.recentRequests, mode === 'merge' ? src.recentRequests : [],
+      r => `${r.ts}|${r.model}`, RECENT_REQ_CAP);
+    next.recentPolicyBlocks = mergeStatsHistory(next.recentPolicyBlocks, mode === 'merge' ? src.recentPolicyBlocks : [],
+      r => `${r.ts}|${r.promptHash}`, Number(process.env.POLICY_BLOCK_RING) || 50);
+    pruneKeyed(next.creditsByHour, 720);
+    pruneKeyed(next.creditsByDay, 90);
+    enforceModelCap(false, next.modelCounts);
+    pruneTokensToModelCounts(Object.keys(next.tokensByModel || {}), next.modelCounts, next.tokensByModel);
+    next = normalizeStatsSnapshot(next); // Also reject numeric overflow from merging.
+  } catch {
+    return { ok: false, error: 'invalid snapshot' };
   }
-  // merge
-  const numKeys = ['totalRequests', 'successCount', 'errorCount', 'creditsTotal', 'policyBlockedCount', 'rateLimitedCount'];
-  for (const k of numKeys) if (typeof src[k] === 'number') _state[k] = (_state[k] || 0) + src[k];
-  for (const mapKey of ['creditsByHour', 'creditsByDay', 'creditsByModel']) {
-    const m = src[mapKey]; if (m && typeof m === 'object') {
-      _state[mapKey] = _state[mapKey] || {};
-      for (const [k, v] of Object.entries(m)) _state[mapKey][k] = (_state[mapKey][k] || 0) + (Number(v) || 0);
-    }
-  }
-  if (Array.isArray(src.recentRequests)) {
-    const seen = new Set((_state.recentRequests || []).map(r => `${r.ts}|${r.model}`));
-    for (const r of src.recentRequests) {
-      const id = `${r.ts}|${r.model}`;
-      if (!seen.has(id)) { _state.recentRequests.push(r); seen.add(id); }
-    }
-    _state.recentRequests.sort((a, b) => a.ts - b.ts);
-    if (_state.recentRequests.length > RECENT_REQ_CAP) {
-      _state.recentRequests.splice(0, _state.recentRequests.length - RECENT_REQ_CAP);
-    }
-  }
-  if (Array.isArray(src.recentPolicyBlocks)) {
-    if (!Array.isArray(_state.recentPolicyBlocks)) _state.recentPolicyBlocks = [];
-    const seen = new Set((_state.recentPolicyBlocks || []).map(r => `${r.ts}|${r.promptHash}`));
-    for (const r of src.recentPolicyBlocks) {
-      const id = `${r.ts}|${r.promptHash}`;
-      if (!seen.has(id)) { _state.recentPolicyBlocks.push(r); seen.add(id); }
-    }
-    _state.recentPolicyBlocks.sort((a, b) => a.ts - b.ts);
-    const CAP = Number(process.env.POLICY_BLOCK_RING) || 50;
-    if (_state.recentPolicyBlocks.length > CAP) {
-      _state.recentPolicyBlocks.splice(0, _state.recentPolicyBlocks.length - CAP);
-    }
-  }
+  Object.assign(_state, next);
+  for (const entry of Object.values(_state.modelCounts)) _touchSeq = Math.max(_touchSeq, entry.lastTs);
+  _curBucket = null;
   scheduleSave();
-  return { ok: true, mode: 'merge' };
+  return { ok: true, mode };
 }
 
 /** Reset all stats. */
@@ -371,8 +855,8 @@ export function resetStats() {
   _state.totalRequests = 0;
   _state.successCount = 0;
   _state.errorCount = 0;
-  _state.modelCounts = {};
-  _state.accountCounts = {};
+  _state.modelCounts = emptyMap();
+  _state.accountCounts = emptyMap();
   _state.hourlyBuckets = [];
   _curBucket = null; // invalidate cached bucket ref (S8) — buckets array replaced
   _state.tokenTotals = {
@@ -380,9 +864,10 @@ export function resetStats() {
     output: 0, total: 0, requests_with_usage: 0,
   };
   _state.creditsTotal = 0;
-  _state.creditsByHour = {};
-  _state.creditsByDay = {};
-  _state.creditsByModel = {};
+  _state.creditsByHour = emptyMap();
+  _state.creditsByDay = emptyMap();
+  _state.creditsByModel = emptyMap();
+  _state.tokensByModel = emptyMap();
   _state.recentRequests = [];
   _state.recentPolicyBlocks = [];
   _state.startedAt = Date.now();
@@ -396,12 +881,14 @@ export function resetStats() {
  *
  * Accepts the OpenAI-shaped usage object that buildUsageBody returns —
  * cascade_breakdown is the authoritative source when present, otherwise
- * fall back to standard fields.
+ * fall back to standard fields. Connect usage (O2) has no cascade_breakdown but
+ * carries `fresh_input_tokens` at the top level, because there prompt_tokens
+ * includes cache_write and `prompt - cached` would book the write as fresh.
  */
-export function recordTokenUsage(usage) {
+export function recordTokenUsage(usage, model = null) {
   if (!usage || typeof usage !== 'object') return;
   const bd = usage.cascade_breakdown || null;
-  const fresh = bd?.fresh_input_tokens ?? Math.max(0, (usage.prompt_tokens || 0) - (usage.prompt_tokens_details?.cached_tokens || usage.cache_read_input_tokens || 0));
+  const fresh = bd?.fresh_input_tokens ?? usage.fresh_input_tokens ?? Math.max(0, (usage.prompt_tokens || 0) - (usage.prompt_tokens_details?.cached_tokens || usage.cache_read_input_tokens || 0));
   const cacheR = bd?.cache_read_tokens ?? (usage.prompt_tokens_details?.cached_tokens || usage.cache_read_input_tokens || 0);
   const cacheW = bd?.cache_write_tokens ?? (usage.cache_creation_input_tokens || 0);
   const output = bd?.output_tokens ?? (usage.completion_tokens || usage.output_tokens || 0);
@@ -415,6 +902,38 @@ export function recordTokenUsage(usage) {
   _state.tokenTotals.output += output;
   _state.tokenTotals.total += fresh + cacheR + cacheW + output;
   _state.tokenTotals.requests_with_usage += 1;
+  // Per-model attribution. Only when the caller KNOWS the model: filing an
+  // unknown request under '(other)' would invent a model row that no client
+  // ever named, and the global totals above already count it. Prototype-shaped
+  // names are unknown by the same rule — rejecting them here also prevents
+  // `tokensByModel['__proto__']` from resolving to Object.prototype.
+  const requested = typeof model === 'string' && model.trim() ? model : null;
+  const key = requested && !isUnsafeModelKey(requested) ? boundedModelKey(requested) : null;
+  if (key) {
+    const tokensByModel = ensureNullProtoMap('tokensByModel');
+    if (!Object.hasOwn(tokensByModel, key)) {
+      tokensByModel[key] = {
+        fresh_input: 0, cache_read: 0, cache_write: 0, output: 0, total: 0, requests_with_usage: 0,
+      };
+    }
+    const tm = tokensByModel[key];
+    tm.fresh_input += fresh;
+    tm.cache_read += cacheR;
+    tm.cache_write += cacheW;
+    tm.output += output;
+    tm.total += fresh + cacheR + cacheW + output;
+    tm.requests_with_usage += 1;
+  }
+  // Per-request attribution. The scope is the only safe join: a concurrent
+  // request for the same model must never inherit these counts. When the usage
+  // arrives before the attempt row (connect non-stream), hold it until
+  // recordRequest creates that row.
+  const scope = _requestScope.getStore();
+  if (scope) {
+    const row = scope.rows[scope.rows.length - 1];
+    if (row) applyUsageToRow(row, usage);
+    else scope.pendingUsage = usage;
+  }
   scheduleSave();
 }
 
@@ -434,4 +953,168 @@ export function recordPolicyBlocked(sample = null) {
 export function recordRateLimited() {
   _state.rateLimitedCount = (_state.rateLimitedCount || 0) + 1;
   scheduleSave();
+}
+
+// ─── Request log query ─────────────────────────────────────────────────
+// Read-only view over the persisted per-request ring (recentRequests). Every
+// number is computed from the rows that pass the filters, so the table and the
+// aggregates below it always share one denominator. Retention is bounded and
+// stated in the response (retention.stored/capacity); the panel labels the
+// window instead of implying full history.
+const LOG_PAGE_MAX = 200;
+
+function logRowView(row) {
+  const ts = Number(row?.ts);
+  const rawStatus = row?.status;
+  const derived = row?.success ? 200 : 500;
+  const status = rawStatus == null || rawStatus === ''
+    ? derived
+    : (Number.isFinite(Number(rawStatus)) ? Number(rawStatus) : derived);
+  return {
+    ts: Number.isFinite(ts) ? ts : 0,
+    model: typeof row?.model === 'string' ? row.model : '',
+    account: normalizeAccountRef(row?.account),
+    status,
+    success: !!row?.success,
+    ms: nonNeg(row?.ms),
+    tokensIn: nonNeg(row?.tokensIn),
+    tokensOut: nonNeg(row?.tokensOut),
+    cacheRead: nonNeg(row?.cacheRead),
+    cacheWrite: nonNeg(row?.cacheWrite),
+    credit: nonNeg(row?.credit),
+  };
+}
+
+function emptyAggregate(extra) {
+  return {
+    ...extra,
+    requests: 0, success: 0, errors: 0,
+    tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, credits: 0, totalMs: 0,
+    _latencies: [],
+  };
+}
+
+function addToAggregate(agg, row) {
+  agg.requests += 1;
+  if (row.success) agg.success += 1;
+  else agg.errors += 1;
+  agg.tokensIn += row.tokensIn;
+  agg.tokensOut += row.tokensOut;
+  agg.cacheRead += row.cacheRead;
+  agg.cacheWrite += row.cacheWrite;
+  agg.credits += row.credit;
+  agg.totalMs += row.ms;
+  if (row.ms > 0) agg._latencies.push(row.ms);
+}
+
+function finishAggregate(agg) {
+  const latencies = agg._latencies || [];
+  agg.avgMs = agg.requests > 0 ? Math.round(agg.totalMs / agg.requests) : 0;
+  agg.p50Ms = percentileOf(latencies, 0.5);
+  agg.p95Ms = percentileOf(latencies, 0.95);
+  delete agg.totalMs;
+  delete agg._latencies;
+  return agg;
+}
+
+/** Nearest-rank percentile over an unsorted sample; 0 when empty. */
+function percentileOf(values, p) {
+  if (!values.length) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+}
+
+/**
+ * Newest-first page of request-log rows plus aggregates over the whole
+ * filtered window (not just the page). Filters: `from`/`to` epoch ms, exact
+ * `model`/`account`, numeric `status`.
+ */
+export function getRequestLog({
+  from = null, to = null, model = null, account = null, status = null,
+  limit = 50, offset = 0,
+} = {}) {
+  const rows = Array.isArray(_state.recentRequests) ? _state.recentRequests : [];
+  const fromNum = from == null || from === '' ? null : Number(from);
+  const toNum = to == null || to === '' ? null : Number(to);
+  const fromMs = Number.isFinite(fromNum) ? fromNum : null;
+  const toMs = Number.isFinite(toNum) ? toNum : null;
+  const statusNum = status == null || status === '' ? null : Number(status);
+  const modelFilter = typeof model === 'string' && model ? model : null;
+  const accountFilter = typeof account === 'string' && account ? account : null;
+
+  const filtered = [];
+  for (const raw of rows) {
+    if (!raw || typeof raw !== 'object') continue;
+    const row = logRowView(raw);
+    if (fromMs != null && row.ts < fromMs) continue;
+    if (toMs != null && row.ts > toMs) continue;
+    if (modelFilter && row.model !== modelFilter) continue;
+    if (accountFilter && row.account !== accountFilter) continue;
+    if (statusNum != null && (!Number.isFinite(statusNum) || row.status !== statusNum)) continue;
+    filtered.push(row);
+  }
+
+  const n = Math.max(1, Math.min(LOG_PAGE_MAX, Number(limit) || 50));
+  const off = Math.max(0, Math.floor(Number(offset) || 0));
+  const newestFirst = filtered.slice().reverse();
+  const items = newestFirst.slice(off, off + n);
+
+  const summary = emptyAggregate({});
+  const byModel = new Map();
+  const byAccount = new Map();
+  const byDay = new Map();
+  const unattributed = emptyAggregate({ account: null });
+  for (const row of filtered) {
+    addToAggregate(summary, row);
+    if (row.model) {
+      const agg = byModel.get(row.model) || emptyAggregate({ model: row.model });
+      addToAggregate(agg, row);
+      byModel.set(row.model, agg);
+    }
+    if (row.account) {
+      const agg = byAccount.get(row.account) || emptyAggregate({ account: row.account });
+      addToAggregate(agg, row);
+      byAccount.set(row.account, agg);
+    } else {
+      addToAggregate(unattributed, row);
+    }
+    const day = new Date(row.ts).toISOString().slice(0, 10);
+    const agg = byDay.get(day) || emptyAggregate({ day });
+    addToAggregate(agg, row);
+    byDay.set(day, agg);
+  }
+  finishAggregate(summary);
+  finishAggregate(unattributed);
+
+  const models = [...byModel.values()]
+    .map(finishAggregate)
+    .sort((a, b) => b.requests - a.requests || a.model.localeCompare(b.model));
+  const accounts = [...byAccount.values()]
+    .map(finishAggregate)
+    .sort((a, b) => b.requests - a.requests || String(a.account).localeCompare(String(b.account)));
+  const days = [...byDay.values()]
+    .map(finishAggregate)
+    .sort((a, b) => a.day.localeCompare(b.day));
+
+  const all = rows.map(logRowView);
+  return {
+    items,
+    total: filtered.length,
+    limit: n,
+    offset: off,
+    hasMore: off + items.length < filtered.length,
+    retention: { stored: all.length, capacity: RECENT_REQ_CAP },
+    filters: {
+      models: [...new Set(all.map(r => r.model).filter(Boolean))].sort(),
+      accounts: [...new Set(all.map(r => r.account).filter(Boolean))].sort(),
+      statuses: [...new Set(all.map(r => r.status).filter(Number.isFinite))].sort((a, b) => a - b),
+    },
+    summary,
+    byModel: models,
+    byAccount: accounts,
+    // Rows with no account id: byAccount + unattributed = summary, so the
+    // account tab can state the remainder instead of silently summing short.
+    unattributed,
+    byDay: days,
+  };
 }

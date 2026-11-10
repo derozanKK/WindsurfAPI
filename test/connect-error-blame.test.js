@@ -59,8 +59,13 @@ describe('request-side failures never evict the account', () => {
   // healthy account in 3 calls. TIMEOUT and DEADLINE_EXCEEDED are upstream stalls
   // (devin-connect.js says so in its own comments); NO_TOKEN is a CONFIGURATION
   // fault, so charging account health for it is doubly wrong.
+  // REQUEST_REJECTED joined when the 4xx-class validator rejection (gRPC
+  // invalid_argument / failed_precondition — unsupported image or malformed tool
+  // history) was separated from UPSTREAM_INTERNAL: the upstream refused the
+  // REQUEST, the token is alive, so a caller looping on an unsupported image must
+  // not walk the pool offline (evidence/AccountMatrix.md §7.1).
   const REQUEST_SIDE = ['UPSTREAM_ERROR', 'CONTENT_BLOCKED', 'MODEL_BLOCKED', 'STREAM_TRUNCATED',
-    'TIMEOUT', 'DEADLINE_EXCEEDED', 'NO_TOKEN'];
+    'TIMEOUT', 'DEADLINE_EXCEEDED', 'NO_TOKEN', 'REQUEST_REJECTED'];
 
   for (const code of REQUEST_SIDE) {
     it(`${code} x3 keeps the account in rotation (fault is in the request)`, () => {
@@ -85,28 +90,64 @@ describe('request-side failures never evict the account', () => {
 });
 
 describe('account-side failures still count against the account', () => {
-  it('an unclassified account fault still evicts after the streak', () => {
+  it('a NAMED account fault (UNAUTHORIZED) still evicts after the streak', () => {
     // Guard against over-correcting: a genuine account error must still be able
-    // to remove a key from rotation.
+    // to remove a key from rotation. The classification is an allow-list, so the
+    // fault has to be named — UNAUTHORIZED is the one code that is positive
+    // evidence about the credential itself.
     const victim = seed('genuine');
     seed('peer-genuine');
-    const after = fail(victim, 'SOME_UNKNOWN_ACCOUNT_FAULT');
+    const after = fail(victim, 'UNAUTHORIZED');
     assert.equal(after.status, 'error',
       'a genuinely faulty account must still be evicted after the error streak');
   });
 });
 
+// The open-ended remainder of the socket error space. Node core `https.request`
+// surfaces the raw error object (devin-connect.js's res/req 'error' handlers), and
+// no enumeration can cover it: `EPROTO` (protocol violation), `HPE_*` (header
+// overflow / parse), and the `ERR_SSL_*` family (TLS handshake failures) are what a
+// corporate proxy, TLS interception, or a misbehaving upstream edge produces
+// routinely. `SOME_UNKNOWN_ACCOUNT_FAULT` stands in for any code that does not
+// exist yet. None of them is positive evidence about the credential, so the
+// deny-by-default fallthrough must treat every one as transport-class: a
+// health-window event (selection still de-prioritizes a genuinely sick account)
+// and NO errorCount.
+describe('unclassified and TLS/parse transport faults never evict the account', () => {
+  const UNCLASSIFIED = [
+    'EPROTO', 'HPE_HEADER_OVERFLOW', 'HPE_INVALID_HEADER_TOKEN',
+    'ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE',
+    'SOME_UNKNOWN_ACCOUNT_FAULT',
+  ];
+
+  for (const code of UNCLASSIFIED) {
+    it(`${code} x4 keeps the account in rotation`, () => {
+      const victim = seed(`u-${code}`);
+      seed(`peer-${code}`); // voids the last-account exemption
+      const after = fail(victim, code, 4);
+      assert.equal(after.status, 'active',
+        `${code} evicted a healthy account — an unclassified code is not evidence about the credential`);
+      assert.equal(after.errorCount, 0,
+        `${code} must not charge the error budget (got ${after.errorCount})`);
+    });
+  }
+});
+
 // ─── 结构守卫 ───────────────────────────────────────────────
 //
 // The bug above happened TWICE for the same structural reason: the classification
-// ends in a bare `else reportError(apiKey)`, so any error code nobody thought about
-// is silently treated as an account fault and evicts healthy accounts. First
-// STREAM_TRUNCATED landed there, then TIMEOUT / DEADLINE_EXCEEDED / NO_TOKEN.
+// ENDED in a bare `else reportError(apiKey)`, so any error code nobody thought
+// about was silently treated as an account fault and evicted healthy accounts.
+// First STREAM_TRUNCATED landed there, then TIMEOUT / DEADLINE_EXCEEDED / NO_TOKEN.
 //
 // A behavioural test cannot catch the NEXT one — the code that will land there
-// hasn't been written yet. So this guard reads both sources and fails when
-// devin-connect.js can emit a code that finalizeConnectAccount does not classify.
-describe('structural guard — every upstream code has an explicit blame decision', () => {
+// hasn't been written yet. The third recurrence was the TLS/parse families
+// (EPROTO / HPE_* / ERR_SSL_*), which Node's own socket layer emits and which no
+// enumeration can cover. The fix is structural: the fallthrough is now
+// deny-by-default (health-window event, no errorCount), so this guard pins that
+// shape instead of trying to enumerate an open-ended vocabulary. It still reads
+// both sources to keep the documented code families meaningful.
+describe('structural guard — the blame fallthrough is deny-by-default', () => {
   const read = (p) => readFileSync(new URL(p, import.meta.url), 'utf8');
 
   // Collect every code that can REACH finalizeConnectAccount, from both sources:
@@ -163,7 +204,7 @@ describe('structural guard — every upstream code has an explicit blame decisio
     return new Set([...constructed, ...propagated, ...passthrough]);
   }
 
-  it('no code reaches the silent `else reportError` fallthrough unclassified', () => {
+  it('the fallthrough is deny-by-default: only a NAMED account fault can charge the budget', () => {
     const connectSrc = read('../src/devin-connect.js');
     const chatSrc = read('../src/handlers/chat.js');
 
@@ -206,13 +247,40 @@ describe('structural guard — every upstream code has an explicit blame decisio
         .matchAll(/'([A-Za-z0-9_-]+)'/g)].map(m => m[1]),
     ]);
 
-    const unclassified = [...emitted].filter(c => !classified.has(c));
-    assert.deepEqual(unclassified, [],
-      'these codes fall through to `else reportError`, which charges the account error '
-      + 'budget and evicts healthy accounts after errorStreakThreshold hits. Decide '
-      + 'explicitly: a real account fault stays in the fallthrough, anything else '
-      + 'belongs in TRANSPORT_FAULT_CODES or its own arm. '
-      + `Unclassified: ${unclassified.join(', ')}`);
+    // The structural invariant is now the DEFAULT, not the enumeration: the
+    // chain is an allow-list of named verdicts and the final `else` is the safe
+    // side. Enumerating every code that can reach here was the previous guard's
+    // job, and it failed twice (STREAM_TRUNCATED, then TIMEOUT/DEADLINE_EXCEEDED/
+    // NO_TOKEN) because the transport's error space is open-ended by
+    // construction — EPROTO, HPE_*, ERR_SSL_* are produced by Node itself and no
+    // literal in devin-connect.js names them. So the guard now pins the shape
+    // that makes enumeration unnecessary:
+    //   - the arm after the transport set must never call reportError;
+    //   - it must still record a health-window event and a counter;
+    //   - the ONE positively classified account fault (UNAUTHORIZED) must keep
+    //     its eviction.
+    const transportAt = body.indexOf('TRANSPORT_FAULT_CODES.has(err.code)');
+    assert.notEqual(transportAt, -1, 'the named transport set must still be consulted');
+    const fallthrough = body.slice(transportAt);
+    assert.doesNotMatch(fallthrough, /reportError\s*\(/,
+      'the final fallthrough calls reportError, so any unclassified code (including the open-ended '
+      + 'EPROTO / HPE_* / ERR_SSL_* socket families) charges the account error budget and evicts '
+      + 'healthy accounts after errorStreakThreshold hits. Deny-by-default instead: only a NAMED '
+      + 'account-fault arm may call reportError.');
+    assert.match(fallthrough, /reportInternalError\s*\(/,
+      'the fallthrough must still record a health-window event — a genuinely sick account must stay '
+      + 'de-prioritized by selection even though it is never evicted');
+    assert.match(fallthrough, /bumpConnect\('unclassified_fault'\)/,
+      'the fallthrough must be visible in the connect metrics; silence is how this class went '
+      + 'unnoticed for three rounds');
+    const unauthorizedAt = body.indexOf("err.code === 'UNAUTHORIZED'");
+    assert.notEqual(unauthorizedAt, -1, 'the UNAUTHORIZED arm must stay explicit');
+    const unauthorizedArm = body.slice(unauthorizedAt, body.indexOf("err.code === 'UPSTREAM_INTERNAL'", unauthorizedAt));
+    assert.match(unauthorizedArm, /reportError\s*\(/,
+      'UNAUTHORIZED is the one positively classified account fault; it must still charge the budget');
+
+    assert.ok(classified.size >= 10,
+      `expected the explicit blame vocabulary to stay meaningful, got ${classified.size}`);
   });
 
   // Behavioural half. The structural check above proves a decision was WRITTEN;

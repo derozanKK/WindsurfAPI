@@ -29,9 +29,15 @@
       "replacement": "    const totalTokens = strictUsageTotal()\n      ? promptTokens + outputTokens + cacheWrite\n      : promptTokens + outputTokens;"
     },
     {
-      "name": "connect: flag ignored, the two paths disagree",
+      "name": "connect: cache-write dropped from prompt_tokens — the O2 under-report returns",
       "file": "src/devin-connect.js",
-      "anchor": "    total_tokens: strictTotal\n      ? promptTokens + completion\n      : promptTokens + completion + cacheWrite,",
+      "anchor": "  const promptTokens = fresh + cacheRead + cacheWrite;",
+      "replacement": "  const promptTokens = fresh + cacheRead;"
+    },
+    {
+      "name": "connect: cache-write added to the total again — double-bills the prefix",
+      "file": "src/devin-connect.js",
+      "anchor": "    total_tokens: promptTokens + completion,",
       "replacement": "    total_tokens: promptTokens + completion + cacheWrite,"
     },
     {

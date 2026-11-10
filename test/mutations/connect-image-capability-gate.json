@@ -1,0 +1,93 @@
+{
+  "tests": [
+    "test/connect-image-capability-gate.test.js",
+    "test/connect-image-capability-account.test.js"
+  ],
+  "expectBaselinePass": 14,
+  "mutations": [
+    {
+      "name": "W4-M1: ignore the explicit supports_images=false bit",
+      "file": "src/handlers/chat.js",
+      "anchor": "    if (imageCapability === false) {",
+      "replacement": "    if (false) {",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M2: read silence as 'no images' and strip unknown models",
+      "file": "src/handlers/chat.js",
+      "anchor": "    if (imageCapability === false) {",
+      "replacement": "    if (imageCapability !== true) {",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M3: strip the images silently without counting them",
+      "file": "src/handlers/chat.js",
+      "anchor": "          bumpConnect('images_dropped_capability', dropped);\n",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M4: strip the images without the operator warn",
+      "file": "src/handlers/chat.js",
+      "anchor": "          log.warn(`Chat[${reqId}]: DEVIN_CONNECT selector ${safeLogValue(selector)} declares supports_images=false for account ${ccAcct ? safeAccountRef(ccAcct) : 'env-token'} in the live catalog — dropped ${dropped} image block(s) before the wire; text preserved (counted in images_dropped_capability)`);\n",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M5: drop the whole content array instead of only image blocks",
+      "file": "src/devin-connect.js",
+      "anchor": "    const kept = msg.content.filter((block) => !isWireImageBlock(block));",
+      "replacement": "    const kept = msg.content.filter(() => false);",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M6: count messages instead of image blocks",
+      "file": "src/devin-connect.js",
+      "anchor": "    dropped += removed;",
+      "replacement": "    dropped += 1;",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M7: leave tool-result images on the wire",
+      "file": "src/devin-connect.js",
+      "anchor": "    if (!msg || msg.role === 'system' || !Array.isArray(msg.content)) continue;\n    const kept = msg.content.filter((block) => !isWireImageBlock(block));",
+      "replacement": "    if (!msg || msg.role === 'system' || msg.role === 'tool' || !Array.isArray(msg.content)) continue;\n    const kept = msg.content.filter((block) => !isWireImageBlock(block));",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M8: lose the capability lookup (always unknown)",
+      "file": "src/devin-connect-models.js",
+      "anchor": "    return typeof row.supportsImages === 'boolean' ? row.supportsImages : null;",
+      "replacement": "    return null;",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M9: serve the emptied image-only turn instead of refusing it (P2-3)",
+      "file": "src/handlers/chat.js",
+      "anchor": "          if (last?.role === 'user' && !hasAnswerableUserContent(last)) {",
+      "replacement": "          if (false) {",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M12: refuse on ANY emptied user turn, breaking tool-result continuations (P2-3)",
+      "file": "src/handlers/chat.js",
+      "anchor": "          const convo = wireMessages.filter(m => m?.role !== 'system');\n          const last = convo[convo.length - 1];\n          if (last?.role === 'user' && !hasAnswerableUserContent(last)) {",
+      "replacement": "          const lastUser = wireMessages.filter(m => m?.role === 'user').pop();\n          if (lastUser && !hasAnswerableUserContent(lastUser)) {",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M10: gate on the pool union instead of the serving account (P2-2)",
+      "file": "src/handlers/chat.js",
+      "anchor": "        ? getConnectSelectorImageCapabilityForAccount(ccAcct.id, selector)\n        : getConnectSelectorImageCapability(selector);",
+      "replacement": "        ? getConnectSelectorImageCapability(selector)\n        : getConnectSelectorImageCapability(selector);",
+      "expectCaught": true
+    },
+    {
+      "name": "W4-M11: per-account lookup falls back to the union row (P2-2)",
+      "file": "src/auth.js",
+      "anchor": "  const rows = _connectCatalogRowsByAccount.get(accountId);\n  if (!Array.isArray(rows) || rows.length === 0) return null;",
+      "replacement": "  const rows = _connectCatalogRowsByAccount.get(accountId) || unionConnectCatalogRows();\n  if (!Array.isArray(rows) || rows.length === 0) return null;",
+      "expectCaught": true
+    }
+  ]
+}

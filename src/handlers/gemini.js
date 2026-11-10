@@ -25,6 +25,11 @@
 
 import { handleChatCompletions, connectErrorToHttp } from './chat.js';
 import { log } from '../config.js';
+import { createBoundedWriter, resolveMaxDrainWaitMs } from '../stream-writer.js';
+import { SseFramer } from '../sse-framer.js';
+import { buildToolNameMap, restoreToolName, sanitizeToolName } from '../tool-names.js';
+import { createToolIdAllocator, normalizeToolIdsInMessages, sanitizeToolId, toolHygieneEnabled } from '../tool-ids.js';
+import { normalizeHistoryTail } from '../history-normalize.js';
 
 // ─── finish_reason mapping (OpenAI → Gemini) ────────────────────
 // Gemini has no dedicated finishReason for function calls — a turn that
@@ -145,7 +150,7 @@ function mapGeminiToolChoice(toolConfig) {
 // wire has no per-call id historically, so we mint one and FIFO-match by name;
 // modern v1beta parts may carry an explicit `id`, which we prefer when present.
 function callIdFor(name, seq) {
-  return `call_${(name || 'fn').replace(/[^a-zA-Z0-9_]/g, '_')}_${seq}`;
+  return sanitizeToolId(`call_${sanitizeToolName(name || 'fn')}_${seq}`);
 }
 
 // ─── Gemini → OpenAI request translation ────────────────────────
@@ -161,6 +166,29 @@ export function geminiToOpenAI(body, modelFromPath) {
   // multiple times in parallel in one turn (the old "last id per name" Map
   // misrouted every same-name response to the FINAL call, orphaning the earlier
   // ones and duplicating a tool_call_id → upstream 400 / mis-fed tool results).
+  const historyNames = [];
+  for (const c of (body?.contents || [])) {
+    for (const part of (Array.isArray(c?.parts) ? c.parts : [])) {
+      if (typeof part?.functionCall?.name === 'string' && part.functionCall.name) historyNames.push(part.functionCall.name);
+      if (typeof part?.functionResponse?.name === 'string' && part.functionResponse.name) historyNames.push(part.functionResponse.name);
+    }
+  }
+  const declaredNames = [];
+  for (const t of (body?.tools || [])) {
+    for (const fd of (t?.functionDeclarations || [])) {
+      if (typeof fd?.name === 'string' && fd.name) declaredNames.push(fd.name);
+    }
+  }
+  const allowedNames = Array.isArray(body?.toolConfig?.functionCallingConfig?.allowedFunctionNames)
+    ? body.toolConfig.functionCallingConfig.allowedFunctionNames.filter((n) => typeof n === 'string' && n)
+    : [];
+  const toolNameMap = toolHygieneEnabled()
+    ? buildToolNameMap([...declaredNames, ...historyNames, ...allowedNames])
+    : null;
+  const hasNameRewrites = toolNameMap
+    ? [...toolNameMap.toUpstream].some(([client, wire]) => client !== wire)
+    : false;
+
   const pendingIdsByName = new Map();
   let callSeq = 0;
 
@@ -202,26 +230,38 @@ export function geminiToOpenAI(body, modelFromPath) {
           image_url: { url: part.fileData.fileUri },
         });
       } else if (part.functionCall) {
-        const name = part.functionCall.name || 'unknown';
-        // Prefer Gemini's own call id when present (v1beta parallel calls carry
-        // one); otherwise mint a deterministic one and enqueue it for FIFO pairing.
-        const id = part.functionCall.id || callIdFor(name, callSeq++);
-        if (!part.functionCall.id) {
-          if (!pendingIdsByName.has(name)) pendingIdsByName.set(name, []);
-          pendingIdsByName.get(name).push(id);
-        }
+        const seq = callSeq++;
+        const clientName = part.functionCall.name || 'unknown';
+        const wireName = toolNameMap?.toUpstream.get(clientName) ?? clientName;
+        const explicitId = part.functionCall.id == null || part.functionCall.id === ''
+          ? ''
+          : (toolHygieneEnabled() ? sanitizeToolId(String(part.functionCall.id)) : String(part.functionCall.id));
+        const id = explicitId || callIdFor(wireName, seq);
+        // Enqueue every call: a functionResponse may legally omit `id`, and FIFO
+        // must pair to this call instead of minting a second id.
+        if (!pendingIdsByName.has(clientName)) pendingIdsByName.set(clientName, []);
+        pendingIdsByName.get(clientName).push(id);
         toolCalls.push({
           id,
           type: 'function',
-          function: { name, arguments: JSON.stringify(part.functionCall.args ?? {}) },
+          function: { name: wireName, arguments: JSON.stringify(part.functionCall.args ?? {}) },
         });
       } else if (part.functionResponse) {
         const name = part.functionResponse.name || 'unknown';
-        // Prefer the response's own id; else dequeue the oldest unmatched call of
-        // this name (FIFO) so parallel same-name calls pair in issue order.
+        const explicitId = part.functionResponse.id == null || part.functionResponse.id === ''
+          ? ''
+          : (toolHygieneEnabled() ? sanitizeToolId(String(part.functionResponse.id)) : String(part.functionResponse.id));
         const queue = pendingIdsByName.get(name);
-        const id = part.functionResponse.id
-          || (queue && queue.length ? queue.shift() : callIdFor(name, 0));
+        let id;
+        if (explicitId) {
+          id = explicitId;
+          const at = queue ? queue.indexOf(explicitId) : -1;
+          if (at !== -1) queue.splice(at, 1);
+        } else if (queue && queue.length) {
+          id = queue.shift();
+        } else {
+          id = callIdFor(toolNameMap?.toUpstream.get(name) ?? name, callSeq++);
+        }
         const resp = part.functionResponse.response;
         const content = typeof resp === 'string' ? resp : JSON.stringify(resp ?? {});
         functionResponses.push({ role: 'tool', tool_call_id: id, content });
@@ -259,7 +299,7 @@ export function geminiToOpenAI(body, modelFromPath) {
         tools.push({
           type: 'function',
           function: {
-            name: fd.name,
+            name: toolNameMap?.toUpstream.get(fd.name) ?? fd.name,
             description: fd.description || '',
             // `parametersJsonSchema` is already JSON-Schema (lowercase by
             // definition); `parameters` is Gemini's Schema with UPPERCASE type
@@ -309,7 +349,10 @@ export function geminiToOpenAI(body, modelFromPath) {
     }
   }
 
-  const toolChoice = mapGeminiToolChoice(body?.toolConfig);
+  const mappedToolChoice = mapGeminiToolChoice(body?.toolConfig);
+  const toolChoice = mappedToolChoice?.type === 'function'
+    ? { ...mappedToolChoice, function: { ...mappedToolChoice.function, name: toolNameMap?.toUpstream.get(mappedToolChoice.function.name) ?? mappedToolChoice.function.name } }
+    : mappedToolChoice;
 
   return {
     model: modelFromPath || body?.model || 'gemini-2.5-pro',
@@ -320,10 +363,17 @@ export function geminiToOpenAI(body, modelFromPath) {
     ...(tools.length ? { tools } : {}),
     ...(gc.temperature != null ? { temperature: gc.temperature } : {}),
     ...(gc.topP != null ? { top_p: gc.topP } : {}),
+    // F5 (DataAuditTools): `topK` is Gemini's flagship sampling knob and the
+    // chat DEVIN_CONNECT path consumes the internal `top_k` into
+    // CompletionConfig.topK — /v1/messages already forwards the same field.
+    // Dropping it here made the caller's determinism/quality setting a silent
+    // no-op on the one surface that names it topK.
+    ...(gc.topK != null ? { top_k: gc.topK } : {}),
     ...(Array.isArray(gc.stopSequences) && gc.stopSequences.length ? { stop: gc.stopSequences } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
     ...(thinking ? { thinking } : {}),
     ...(responseFormat ? { response_format: responseFormat } : {}),
+    ...(hasNameRewrites ? { __toolNameMap: toolNameMap } : {}),
   };
 }
 
@@ -359,7 +409,7 @@ function buildUsageMetadata(usage) {
 }
 
 // ─── OpenAI → Gemini non-stream response translation ────────────
-export function openAIToGemini(result, model) {
+export function openAIToGemini(result, model, toolNameMap = null) {
   const choice = result?.choices?.[0];
   const msg = choice?.message || {};
   const parts = [];
@@ -370,9 +420,15 @@ export function openAIToGemini(result, model) {
   }
   if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
     if (msg.content) parts.push({ text: msg.content });
+    // Upstream may reuse one call id for two distinct calls; the client must
+    // never see the same functionCall id twice (GFProtocol Q1-04).
+    const allocateToolId = toolHygieneEnabled() ? createToolIdAllocator() : (id) => id || '';
     for (const tc of msg.tool_calls) {
-      const args = parseToolArgs(tc.function?.arguments, tc.function?.name);
-      parts.push({ functionCall: { name: tc.function?.name || 'unknown', args } });
+      const name = restoreToolName(tc.function?.name, toolNameMap) || 'unknown';
+      const args = parseToolArgs(tc.function?.arguments, name);
+      const functionCall = { name, args };
+      if (tc.id) functionCall.id = allocateToolId(tc.id);
+      parts.push({ functionCall });
     }
   } else {
     parts.push({ text: msg.content || '' });
@@ -401,15 +457,20 @@ export function openAIToGemini(result, model) {
 // Mode 'array' → frames streamed inside a JSON array: `[`, frame, `,frame`, `]`
 //                (the default :streamGenerateContent wire format).
 class GeminiStreamTranslator {
-  constructor(res, model, { mode = 'sse' } = {}) {
+  constructor(res, model, { mode = 'sse', toolNameMap = null } = {}) {
     this.res = res;
     this.model = model;
     this.mode = mode;
-    this.toolCallBufs = new Map(); // index → { id, name, argsBuffered }
+    this.toolNameMap = toolNameMap;
+    this.toolCallBufs = new Map(); // index → { id, rawId, name, argsBuffered }
+    // Egress id allocator: upstream may reuse one call id for two distinct
+    // calls, but the client must never see the same functionCall id twice
+    // (GFProtocol Q1-04). First-seen id wins; duplicates get a stable suffix.
+    this.allocateToolId = toolHygieneEnabled() ? createToolIdAllocator() : (id) => id || '';
     this.finalUsage = null;
     this.finishReason = 'STOP';
     this.finished = false;
-    this.pendingSseBuf = '';
+    this.sseFramer = new SseFramer({ onFrame: (frame) => this.handleSseFrame(frame) });
     this.frameCount = 0;
     // True once a terminal signal is seen: choice.finish_reason, an upstream
     // error chunk, or the `[DONE]` sentinel. finish() relies on this to tell a
@@ -418,21 +479,42 @@ class GeminiStreamTranslator {
     // True when the ONLY finish frame seen was one chat.js fabricated to close a
     // stream that died mid-answer. It suppresses the `[DONE]` shortcut above, since
     // chat.js emits `[DONE]` on that path too — so both signals must be discounted
-    // together or the guard stays defeated.
+    // together or BUG1's guard stays defeated.
     this.sawSyntheticFinish = false;
+    // V-08/D8: one abort-aware bounded writer for this egress. `res` is the REAL
+    // response; the Chat producer writes into `createCaptureRes`, which reports
+    // THIS writer's pressure back to it. Without the wait the translator consumed
+    // `res.write()`'s false verdict itself, so the Cascade/Connect producer was
+    // never held and a slow reader bought unbounded upstream production.
+    const maxWaitMs = resolveMaxDrainWaitMs();
+    this.writer = createBoundedWriter({
+      res,
+      maxWaitMs,
+      onTimeout: () => {
+        // Teardown belongs to chat.js's own bounded writer (it writes the typed
+        // DRAIN_TIMEOUT frame and aborts the upstream turn). Log only: ending the
+        // response here would race that stage and strip the error frame.
+        log.warn(`Gemini: no drain for ${maxWaitMs}ms — the client stopped reading`);
+      },
+    });
+  }
+
+  /** True while the client's socket has not accepted the bytes we handed it. */
+  get egressOk() {
+    return !this.writer.pending;
   }
 
   // Write one Gemini frame (a GenerateContentResponse) in the active mode.
   writeFrame(obj) {
-    if (this.res.writableEnded) return;
+    if (this.res.writableEnded) return true;
     const json = JSON.stringify(obj);
-    if (this.mode === 'sse') {
-      this.res.write(`data: ${json}\r\n\r\n`);
-    } else {
+    const text = this.mode === 'sse'
+      ? `data: ${json}\r\n\r\n`
       // JSON array: open bracket on first frame, comma-separate the rest.
-      this.res.write(this.frameCount === 0 ? `[${json}` : `,${json}`);
-    }
+      : (this.frameCount === 0 ? `[${json}` : `,${json}`);
     this.frameCount++;
+    // V-08/D8: the real verdict, so a pressured socket holds the producer.
+    return this.writer.write(text);
   }
 
   // Emit a candidate frame carrying a single part (text or functionCall).
@@ -455,11 +537,28 @@ class GeminiStreamTranslator {
     const idx = tc.index ?? 0;
     let existing = this.toolCallBufs.get(idx);
     if (!existing) {
-      existing = { id: tc.id, name: tc.function?.name, argsBuffered: '' };
+      existing = {
+        id: tc.id ? this.allocateToolId(tc.id) : null,
+        rawId: tc.id || null,
+        wireName: '',
+        name: '',
+        argsBuffered: '',
+      };
       this.toolCallBufs.set(idx, existing);
-    } else {
-      if (tc.id) existing.id = tc.id;
-      if (tc.function?.name) existing.name = tc.function.name;
+    } else if (tc.id && tc.id !== existing.rawId) {
+      // The id is delivered once, possibly on a later delta than the first. A
+      // repeated id is the same call and must not be allocated twice.
+      existing.rawId = tc.id;
+      existing.id = this.allocateToolId(tc.id);
+    }
+    const rawName = tc.function?.name;
+    if (rawName) {
+      // function.name may be split across deltas. Accumulate idempotently: a
+      // repeated full name replaces the prefix, a prefix does not duplicate.
+      if (!existing.wireName) existing.wireName = rawName;
+      else if (rawName === existing.wireName || rawName.startsWith(existing.wireName)) existing.wireName = rawName;
+      else if (!existing.wireName.startsWith(rawName)) existing.wireName += rawName;
+      existing.name = restoreToolName(existing.wireName, this.toolNameMap) || existing.wireName;
     }
     if (tc.function?.arguments) existing.argsBuffered += tc.function.arguments;
   }
@@ -471,10 +570,13 @@ class GeminiStreamTranslator {
     const bufs = [...this.toolCallBufs.values()];
     if (!bufs.length) return false;
     bufs.forEach((buf, i) => {
-      const args = parseToolArgs(buf.argsBuffered, buf.name);
+      const name = restoreToolName(buf.name, this.toolNameMap) || 'unknown';
+      const args = parseToolArgs(buf.argsBuffered, name);
       const isLast = i === bufs.length - 1;
+      const functionCall = { name, args };
+      if (buf.id) functionCall.id = buf.id;
       this.emitPart(
-        { functionCall: { name: buf.name || 'unknown', args } },
+        { functionCall },
         isLast ? { finishReason, usageMetadata } : {},
       );
     });
@@ -528,7 +630,7 @@ class GeminiStreamTranslator {
         // the truncation guard in finish() — verified: a mid-stream death returned
         // finishReason:'STOP' with no error frame, telling the client the answer
         // was complete. Same guard as messages.js and responses.js.
-        if (chunk.__synthetic_finish) this.sawSyntheticFinish = true;
+        if (chunk.__synthetic_finish || chunk.__windsurf_end_reason === 'upstream_truncated') this.sawSyntheticFinish = true;
         else this.sawTerminalSignal = true;
         this.finishReason = mapFinishReason(choice.finish_reason);
       }
@@ -537,6 +639,8 @@ class GeminiStreamTranslator {
   }
 
   finish() {
+    if (this.finished) return;
+    this.sseFramer.end();
     if (this.finished) return;
     // An abnormally cut-off stream (network drop, upstream abort, hung-stream
     // deadline) reaches finish() with NO terminal signal — no choice.finish_reason,
@@ -581,7 +685,7 @@ class GeminiStreamTranslator {
     }
     if (this.mode === 'array') {
       // Close the JSON array. If no frame ever wrote, still emit `[]`.
-      if (!this.res.writableEnded) this.res.write(this.frameCount === 0 ? '[]' : ']');
+      if (!this.res.writableEnded) this.writer.write(this.frameCount === 0 ? '[]' : ']');
     }
   }
 
@@ -596,11 +700,18 @@ class GeminiStreamTranslator {
     // Emit the error as a frame, then terminate. Gemini surfaces a mid-stream
     // error as a GenerateContentResponse-shaped object carrying `error`.
     if (!this.res.writableEnded) {
-      const json = JSON.stringify(mapped.body);
+      const body = err?.code
+        ? { ...mapped.body, error: {
+          ...mapped.body.error,
+          __upstream_code: err.code,
+          ...(Number.isFinite(Number(err.retry_after_ms)) ? { retry_after_ms: Number(err.retry_after_ms) } : {}),
+        } }
+        : mapped.body;
+      const json = JSON.stringify(body);
       if (this.mode === 'sse') {
-        this.res.write(`data: ${json}\r\n\r\n`);
+        this.writer.write(`data: ${json}\r\n\r\n`);
       } else {
-        this.res.write(this.frameCount === 0 ? `[${json}]` : `,${json}]`);
+        this.writer.write(this.frameCount === 0 ? `[${json}]` : `,${json}]`);
       }
       this.frameCount++;
     }
@@ -608,28 +719,30 @@ class GeminiStreamTranslator {
   }
 
   // SSE parser — handleChatCompletions writes `data: {...}\n\n` frames.
+  // SseFramer owns CRLF, split UTF-8, multi-line data and EOF flush.
   feed(rawChunk) {
-    this.pendingSseBuf += typeof rawChunk === 'string' ? rawChunk : rawChunk.toString('utf8');
-    let idx;
-    while ((idx = this.pendingSseBuf.indexOf('\n\n')) !== -1) {
-      const frame = this.pendingSseBuf.slice(0, idx);
-      this.pendingSseBuf = this.pendingSseBuf.slice(idx + 2);
-      const lines = frame.split('\n');
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const payload = line.slice(6);
-        // `[DONE]` is the OpenAI stream's terminator, but it is NOT proof the turn
-        // completed: chat.js writes it on the truncated path too (right after the
-        // synthetic finish frame). Treating it as authoritative is the SECOND way
-        // the truncation guard was defeated — plugging only the finish-frame check
-        // above leaves this one open, which is why both are needed.
-        if (payload === '[DONE]') { if (!this.sawSyntheticFinish) this.sawTerminalSignal = true; continue; }
-        try {
-          this.processChunk(JSON.parse(payload));
-        } catch (e) {
-          log.warn(`Gemini SSE parse error: ${e.message}`);
-        }
-      }
+    this.sseFramer.push(rawChunk);
+    // V-08/D8: the verdict the Chat producer reads. `push` dispatches every frame
+    // synchronously, so `egressOk` is the state AFTER this chunk was emitted —
+    // false means the socket reported backpressure and has not drained yet.
+    return this.egressOk;
+  }
+
+  handleSseFrame({ data }) {
+    if (!data) return;
+    // `[DONE]` is the OpenAI stream's terminator, but it is NOT proof the turn
+    // completed: chat.js writes it on the truncated path too (right after the
+    // synthetic finish frame). Treating it as authoritative is the SECOND way
+    // the truncation guard was defeated — plugging only the finish-frame check
+    // above leaves this one open, which is why both are needed.
+    if (data === '[DONE]') {
+      if (!this.sawSyntheticFinish) this.sawTerminalSignal = true;
+      return;
+    }
+    try {
+      this.processChunk(JSON.parse(data));
+    } catch (e) {
+      log.warn(`Gemini SSE parse error: ${e.message}`);
     }
   }
 }
@@ -645,6 +758,14 @@ function createCaptureRes(translator, realRes) {
     const cbs = listeners.get(event) || [];
     for (const cb of cbs) { try { cb(); } catch {} }
   };
+  // V-08/D8: the producer (chat.js) waits for 'drain' on THIS fake response. The
+  // translator's bounded writer owns the wait on the real socket, and the real
+  // socket's drain is the only one that exists — without this forward the chat
+  // writer would park on a signal that can never arrive (the 120s half-fix).
+  if (realRes?.on) {
+    realRes.on('drain', () => fire('drain'));
+    realRes.on('error', () => fire('error'));
+  }
   return {
     writableEnded: false,
     headersSent: false,
@@ -656,7 +777,10 @@ function createCaptureRes(translator, realRes) {
       // translator only consumes `data:` lines). First-token latency is
       // unaffected because real content frames pass straight through.
       translator.feed(chunk);
-      return true;
+      // V-08/D8: return the REAL socket's verdict (via the translator's bounded
+      // writer). A constant `true` kept chat.js's bounded writer permanently
+      // disarmed on this route, so the Cascade producer never paused.
+      return translator.egressOk;
     },
     end(chunk) {
       if (this.writableEnded) return;
@@ -665,7 +789,13 @@ function createCaptureRes(translator, realRes) {
       this.writableEnded = true;
       fire('close');
     },
-    _clientDisconnected() { fire('close'); },
+    _clientDisconnected() {
+      // V-08/D8: settle the translator's outstanding drain wait and refuse any
+      // further byte — a terminal frame must not be written into a socket that is
+      // already gone. (The chat writer's own wait settles through fire('close').)
+      translator.writer.dispose();
+      fire('close');
+    },
     on(event, cb) {
       if (!listeners.has(event)) listeners.set(event, []);
       listeners.get(event).push(cb);
@@ -764,7 +894,30 @@ export function geminiError(status, internalType, message) {
 // opts.alt    : 'sse' → SSE wire format; otherwise JSON-array wire format
 export async function handleGemini(model, body, context = {}, { stream = false, alt = null } = {}) {
   const requestedModel = model || body?.model || 'gemini-2.5-pro';
+  // F2 (DataAuditTools): `generationConfig.candidateCount` is the Gemini
+  // spelling of OpenAI's `n`, and the chat route already refuses n>1 because
+  // the upstream returns exactly one choice (chat.js "O2"). geminiToOpenAI
+  // never read the field, so that gate was unreachable from this surface: a
+  // caller sampling/voting across candidates got a 200 with a single candidate
+  // and read `candidates[1..]` as undefined — a subtler failure than a 400.
+  // Mirror the chat gate in Gemini vocabulary, before any model turn.
+  const candidateCount = body?.generationConfig?.candidateCount;
+  if (candidateCount != null && candidateCount !== 1) {
+    return geminiError(
+      400,
+      null,
+      'This proxy only supports candidateCount=1. The upstream backend returns a single candidate per request; set generationConfig.candidateCount to 1 (or omit it).',
+    );
+  }
   const openaiBody = geminiToOpenAI(body, requestedModel);
+  const toolNameMap = openaiBody.__toolNameMap || null;
+  delete openaiBody.__toolNameMap;
+  if (toolHygieneEnabled()) {
+    openaiBody.messages = normalizeHistoryTail(
+      normalizeToolIdsInMessages(openaiBody.messages, { seed: requestedModel }),
+      { fold: true },
+    );
+  }
   const chatHandler = context.handleChatCompletions || handleChatCompletions;
 
   if (!stream) {
@@ -772,7 +925,7 @@ export async function handleGemini(model, body, context = {}, { stream = false, 
     if (result.status !== 200) {
       return withUpstreamHeaders(geminiError(result.status, result.body?.error?.type, result.body?.error?.message), result.headers);
     }
-    return { status: 200, body: openAIToGemini(result.body, requestedModel) };
+    return { status: 200, body: openAIToGemini(result.body, requestedModel, toolNameMap) };
   }
 
   // Streaming path — ask handleChatCompletions for its streaming handler and
@@ -813,7 +966,7 @@ export async function handleGemini(model, body, context = {}, { stream = false, 
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new GeminiStreamTranslator(realRes, requestedModel, { mode });
+      const translator = new GeminiStreamTranslator(realRes, requestedModel, { mode, toolNameMap });
       const captureRes = createCaptureRes(translator, realRes);
 
       // Forward client disconnect so the upstream is cancelled. Don't call

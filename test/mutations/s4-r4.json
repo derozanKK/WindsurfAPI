@@ -4,10 +4,10 @@
   ],
   "mutations": [
     {
-      "name": "Independent DONE stage is disabled",
+      "name": "Partial failure error frame is omitted",
       "file": "src/handlers/chat.js",
-      "anchor": "        failureStage('done', () => {\n          if (!res.writableEnded) res.write('data: [DONE]\\n\\n');\n        });",
-      "replacement": "        failureStage('done', () => {\n          // Mutant: omit terminal sentinel.\n        });",
+      "anchor": "              return finishPartialStreamAfterError({ id, created, model, send, res: null,",
+      "replacement": "              return undefined;",
       "expectCaught": true
     },
     {
@@ -32,12 +32,12 @@
       "expectCaught": true
     },
     {
-      "name": "Synthetic finish also writes DONE and duplicates the terminal marker",
+      "name": "Partial failure claims a clean DONE",
       "file": "src/handlers/chat.js",
-      "anchor": "            finishPartialStreamAfterError({ id, created, model, send, res: null,",
-      "replacement": "            finishPartialStreamAfterError({ id, created, model, send, res,",
+      "anchor": "          if (emittedClientPayload && !claimLost && cascadeTerminal?.kind === 'truncated') {",
+      "replacement": "          if (emittedClientPayload && !claimLost) {",
       "expectCaught": true
     }
   ],
-  "expectBaselinePass": 9
+  "expectBaselinePass": 10
 }

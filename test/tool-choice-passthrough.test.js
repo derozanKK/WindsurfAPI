@@ -20,7 +20,7 @@ import {
   getToolChoiceTags,
   isToolChoicePassthroughEnabled,
 } from '../src/devin-connect.js';
-import { parseFields, getField } from '../src/proto.js';
+import { parseFields, getField, writeStringField } from '../src/proto.js';
 
 const ON = { DEVIN_CONNECT_TOOL_CHOICE: '1' };
 
@@ -90,15 +90,26 @@ describe('buildToolChoice', () => {
     }
   });
 
-  it('encodes option_name in field 1 and tool_name in field 2', () => {
-    const forced = parseFields(buildToolChoice({ function: { name: 'get_weather' } }, ON));
-    assert.equal(str(forced, 1), 'function');
+  it('encodes exactly one oneof member: tool_name for a forced tool, option_name otherwise', () => {
+    // ChatToolChoice is `oneof choice { option_name = 1; tool_name = 2; }`.
+    // Emitting BOTH (as this did) is a schema violation: a conformant decoder
+    // keeps only the last member, so the forced name and the "function" option
+    // overwrote each other depending on decode order.
+    const forcedBuf = buildToolChoice({ function: { name: 'get_weather' } }, ON);
+    const forced = parseFields(forcedBuf);
     assert.equal(str(forced, 2), 'get_weather');
+    assert.equal(forced.some((f) => f.field === 1), false,
+      'a named tool must NOT also carry option_name (#1)');
+    assert.deepEqual(forcedBuf, writeStringField(2, 'get_weather'),
+      'the encoded bytes are exactly one tool_name member');
 
-    const required = parseFields(buildToolChoice('required', ON));
+    const requiredBuf = buildToolChoice('required', ON);
+    const required = parseFields(requiredBuf);
     assert.equal(str(required, 1), 'required');
     assert.equal(required.some((f) => f.field === 2), false,
       'a non-forced choice must not carry an empty tool_name');
+    assert.deepEqual(requiredBuf, writeStringField(1, 'required'),
+      'the encoded bytes are exactly one option_name member');
   });
 });
 

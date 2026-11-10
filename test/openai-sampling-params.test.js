@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleChatCompletions } from '../src/handlers/chat.js';
+import { handleChatCompletions, __setConnectDeps, __resetConnectDeps } from '../src/handlers/chat.js';
 
 // T1 (Grok audit): seed / presence_penalty / frequency_penalty / logit_bias are
 // accepted by the OpenAI request schema but the Devin/Windsurf upstream ignores
@@ -57,8 +57,31 @@ describe('T1 unsupported sampling params rejected', () => {
     assert.ok(passedSamplingGate(r), `neutral defaults must not be rejected as a sampling param: ${JSON.stringify(r?.body)}`);
   });
 
-  it('allows a request with only temperature/top_p (no unsupported params)', async () => {
-    const r = await handleChatCompletions(baseReq({ temperature: 0.7, top_p: 0.9 }));
-    assert.ok(passedSamplingGate(r), JSON.stringify(r?.body));
+  it('temperature/top_p: honoured by Connect, refused by Cascade (V-14)', async () => {
+    // V-14: the Cascade planner config carries no sampling field, so accepting
+    // these and dropping them was a success that lied about the request. The
+    // Devin Connect backend does honour them — same body, different backend.
+    const cascade = await handleChatCompletions(baseReq({ temperature: 0.7, top_p: 0.9 }));
+    assert.ok(rejectedFor(cascade, 'temperature'), JSON.stringify(cascade?.body));
+
+    const prev = process.env.DEVIN_CONNECT;
+    process.env.DEVIN_CONNECT = '1';
+    try {
+      __setConnectDeps({
+        toChatCompletion: async () => ({
+          status: 200,
+          body: {
+            id: 'x', object: 'chat.completion', created: 1, model: 'claude-sonnet-4.6',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          },
+        }),
+      });
+      const connect = await handleChatCompletions(baseReq({ temperature: 0.7, top_p: 0.9 }));
+      assert.equal(connect.status, 200, JSON.stringify(connect?.body));
+    } finally {
+      __resetConnectDeps();
+      if (prev === undefined) delete process.env.DEVIN_CONNECT;
+      else process.env.DEVIN_CONNECT = prev;
+    }
   });
 });

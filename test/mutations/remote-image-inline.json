@@ -1,0 +1,27 @@
+{
+  "tests": [
+    "test/connect-remote-images.test.js",
+    "test/image-http-gate.test.js"
+  ],
+  "expectBaselinePass": 28,
+  "mutations": [
+    {
+      "name": "a failed fetch is treated as 'nothing changed' — the remote URL is returned to the builder, which drops it, so the image is lost again and the only trace is the later unresolved warning instead of the fetch error that actually happened",
+      "file": "src/devin-connect.js",
+      "anchor": "        log.warn(`DEVIN_CONNECT: remote image_url fetch failed (${imageUrlHost(url)}): ${err.message} — image dropped, text preserved`);\n        bumpConnect('remote_image_fetch_failed');\n        changed = true;",
+      "replacement": "        log.warn(`DEVIN_CONNECT: remote image_url fetch failed (${imageUrlHost(url)}): ${err.message} — image dropped, text preserved`);\n        bumpConnect('remote_image_fetch_failed');"
+    },
+    {
+      "name": "the result-side content-type check is dropped — an injected/regressed fetcher can put text/html bytes into a data URL that the wire builder then drops silently",
+      "file": "src/devin-connect.js",
+      "anchor": "      if (!data || !IMAGE_MIME_ALLOWLIST.has(mime)) {",
+      "replacement": "      if (!data) {"
+    },
+    {
+      "name": "streamChat stops resolving remote images — the production call site goes back to the silent drop this whole path exists to fix, while the helper's own tests stay green",
+      "file": "src/devin-connect.js",
+      "anchor": "  const wireMessages = imageTag\n    ? await inlineRemoteImages(messages, { signal })\n    : messages;",
+      "replacement": "  const wireMessages = messages;"
+    }
+  ]
+}

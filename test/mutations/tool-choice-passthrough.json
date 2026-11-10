@@ -25,8 +25,8 @@
     {
       "name": "a forced tool_choice loses its tool name — the request says 'call a function' without saying which, so the upstream is free to call the wrong one",
       "file": "src/devin-connect.js",
-      "anchor": "  if (norm.toolName) parts.push(writeStringField(2, norm.toolName));",
-      "replacement": "  if (false) parts.push(writeStringField(2, norm.toolName));"
+      "anchor": "    ? [writeStringField(2, norm.toolName)]",
+      "replacement": "    ? [writeStringField(1, norm.optionName)]"
     },
     {
       "name": "#11 is emitted whenever parallel_tool_calls is not exactly false — so the DEFAULT (true, or absent) also sends disable_parallel_tool_calls=1, inverting the caller's intent and disabling parallel calls for everyone who never asked",

@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 
 function load() {
   const source = readFileSync(new URL('../src/handlers/chat.js', import.meta.url), 'utf8');
-  const head = /(?:async )?function acquireConnectFailover\(triedKeys, signal, callerKey, selector = null\) \{/;
+  const head = /(?:async )?function acquireConnectFailover\(triedKeys, signal, callerKey, selector = null(?:, budget = null)?\) \{/;
   const start = source.search(head), end = source.indexOf('\n}', start) + 2;
   assert.ok(start >= 0 && end > start);
   let now = 0, serial = 0, calls = 0;
@@ -51,7 +51,7 @@ test('R5 both existing streaming failover arms still await the same choke point'
   const fallbackStart = start >= 0 ? start : source.indexOf("              if (r.kind === 'error') {");
   const end = source.indexOf('            if (leakTraceEnabled()) {', fallbackStart);
   const loop = source.slice(fallbackStart, end);
-  assert.equal((loop.match(/await acquireConnectFailover\(triedKeys, abortController.signal, callerKey, selector\)/g) || []).length, 2);
+  assert.equal((loop.match(/await acquireConnectFailover\(triedKeys, abortController\.signal, callerKey, selector(?:, context\.budget \|\| null)?\)/g) || []).length, 2);
   assert.match(loop, /isAccountFailoverError\(r.err.code\) && !emitted && hops < maxHops/);
   assert.match(loop, /hops >= maxHops \|\| emitted/);
 });

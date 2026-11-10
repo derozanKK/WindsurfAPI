@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveConnectSelector, __testing, FREE_TIER_SELECTOR } from '../src/devin-connect-models.js';
 import { handleChatCompletions } from '../src/handlers/chat.js';
+import { buildConnectReachability } from '../src/handlers/models.js';
 
 // The cap Main approved: at most 1,024 retained entries, oldest insertion evicted.
 const MAX_ENTRIES = 1024;
@@ -184,6 +185,23 @@ describe('DEVIN_CONNECT degrade-warning cache is bounded (D-SCALE-001)', () => {
     assert.equal(
       __testing.degradeWarned.size, sizeAfterFirst,
       'a repeat rejected request adds no cache entry',
+    );
+  });
+});
+
+describe('read-only discovery must not consume the degrade warning', () => {
+  it('a later real request still warns once after discovery', () => {
+    const name = 'zzscale-discovery-ghost';
+    const reach = buildConnectReachability({ ...process.env, DEVIN_CONNECT: '1' });
+    reach(name);
+    assert.equal(
+      degradeWarnsFor(name), 0,
+      'catalog discovery is not a paid request and must not spend the one-time warning',
+    );
+    resolveConnectSelector(name);
+    assert.equal(
+      degradeWarnsFor(name), 1,
+      'the first real request after discovery must still warn exactly once',
     );
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { accountState, classifyTransition, collapse, createPoolEventDetector } from '../src/dashboard/pool-events.js';
+import { accountState, classifyTransition, cooldownState, collapse, createPoolEventDetector } from '../src/dashboard/pool-events.js';
 
 const acc = (id, over = {}) => ({ id, ref: id, status: 'active', rateLimited: false, capacityThrottled: false, quotaCooled: false, ...over });
 
@@ -12,11 +12,17 @@ describe('accountState', () => {
     assert.equal(accountState(acc('a', { quotaCooled: true })), 'quota');
     assert.equal(accountState(acc('a', { status: 'disabled' })), 'disabled');
     assert.equal(accountState(acc('a', { status: 'error' })), 'error');
+    assert.equal(accountState(acc('a', { status: 'reauth' })), 'reauth');
   });
   it('rate-limit outranks capacity; quota outranks rate-limit; disabled wins all', () => {
     assert.equal(accountState(acc('a', { rateLimited: true, capacityThrottled: true })), 'rate_limited');
     assert.equal(accountState(acc('a', { quotaCooled: true, rateLimited: true })), 'quota');
     assert.equal(accountState(acc('a', { status: 'disabled', quotaCooled: true })), 'disabled');
+  });
+  it('reauth is terminal: it outranks every self-healing cooldown', () => {
+    assert.equal(accountState(acc('a', { status: 'reauth', quotaCooled: true, rateLimited: true, capacityThrottled: true })), 'reauth');
+    assert.equal(accountState(acc('a', { status: 'banned' })), 'banned');
+    assert.equal(accountState(acc('a', { status: 'disabled' })), 'disabled');
   });
 });
 
@@ -32,6 +38,10 @@ describe('classifyTransition', () => {
     assert.equal(classifyTransition('active', 'quota').severity, 'error');
     assert.equal(classifyTransition('active', 'capacity').severity, 'warn');
     assert.equal(classifyTransition('active', 'rate_limited').severity, 'warn');
+  });
+  it('→reauth is an error (it never self-heals), and →active from it is a recovery', () => {
+    assert.deepEqual(classifyTransition('active', 'reauth'), { kind: 'reauth', severity: 'error' });
+    assert.deepEqual(classifyTransition('reauth', 'active'), { kind: 'recovered', severity: 'success' });
   });
 });
 
@@ -126,5 +136,71 @@ describe('createPoolEventDetector', () => {
     d.push([], 1000);
     const ev = d.push([acc('a')], 2000);
     assert.deepEqual(ev, [], 're-added account re-baselines silently');
+  });
+});
+
+describe('cooldownState', () => {
+  const now = 1_000_000;
+
+  it('uses a strict deadline boundary: now-1 and now are not cooling, now+1 is', () => {
+    const before = cooldownState({ rateLimitedUntil: now - 1, now });
+    assert.equal(before.rateLimited, false);
+    assert.equal(before.cooldownUntil, null);
+    assert.equal(before.cooldownRemainingMs, 0);
+
+    const at = cooldownState({ rateLimitedUntil: now, now });
+    assert.equal(at.rateLimited, false);
+    assert.equal(at.cooldownUntil, null);
+
+    const after = cooldownState({ rateLimitedUntil: now + 1, now });
+    assert.equal(after.rateLimited, true);
+    assert.equal(after.cooldownUntil, now + 1);
+    assert.equal(after.cooldownRemainingMs, 1);
+  });
+
+  it('quota outranks rate_limit and the deadline is the later one', () => {
+    const out = cooldownState({
+      rateLimitedUntil: now + 60_000,
+      quotaResetAt: now + 120_000,
+      capacityThrottled: true,
+      now,
+    });
+    assert.equal(out.cooldownReason, 'quota');
+    assert.equal(out.cooldownUntil, now + 120_000);
+    assert.equal(out.cooldownRemainingMs, 120_000);
+    assert.equal(out.quotaCooled, true);
+    assert.equal(out.rateLimited, true);
+  });
+
+  it('rate_limit outranks capacity', () => {
+    const out = cooldownState({
+      rateLimitedUntil: now + 90_000,
+      quotaResetAt: 0,
+      capacityThrottled: true,
+      now,
+    });
+    assert.equal(out.cooldownReason, 'rate_limit');
+    assert.equal(out.cooldownUntil, now + 90_000);
+  });
+
+  it('capacity alone has no account-wide deadline', () => {
+    const out = cooldownState({ capacityThrottled: true, now });
+    assert.equal(out.cooldownReason, 'capacity');
+    assert.equal(out.cooldownUntil, null);
+    assert.equal(out.cooldownRemainingMs, 0);
+  });
+
+  it('an expired deadline reports null, not a stale timestamp', () => {
+    const out = cooldownState({ rateLimitedUntil: now - 5_000, quotaResetAt: now - 1, now });
+    assert.equal(out.cooldownUntil, null);
+    assert.equal(out.cooldownReason, null);
+    assert.equal(out.cooldownRemainingMs, 0);
+  });
+
+  it('feeds accountState with the same strict boundary rule', () => {
+    const expired = cooldownState({ rateLimitedUntil: now - 1, now });
+    assert.equal(accountState(acc('a', expired)), 'active');
+    const active = cooldownState({ rateLimitedUntil: now + 1, now });
+    assert.equal(accountState(acc('a', active)), 'rate_limited');
   });
 });

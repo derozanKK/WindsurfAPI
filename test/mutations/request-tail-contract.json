@@ -1,0 +1,52 @@
+{
+  "_baseline_provenance": "MEASURED 2026-10-07 on the author's Windows box, Node v24.19.0, worktree .claude/worktrees/tail-contract at master df9d429 (uncommitted additions). Declared value 17. Exact command: `node --import ./scripts/mutation-network-deny.mjs --import ./test/setup-env.mjs --test --test-reporter=tap --test-force-exit test/request-tail-contract.test.js` -> `# tests 17 / # pass 17 / # fail 0 / # skipped 0 / # todo 0`. Re-measured with the harness's OWN counting semantics: `node scripts/spec-baseline-check.mjs request-tail-contract.json` -> `ok request-tail-contract.json: 17 pass + 0 approved skips = 17 [MEASURED_NO_SKIPS]`. Every mutation below was applied by hand in this worktree with its own anchor -> replacement bytes and redded this file's suite; the mutation harness itself cannot EXECUTE on this host (`scripts/mutation-harness-utils.mjs` requires git at a trusted absolute POSIX path), so the sweep runs on the Linux bench. Mutant 7 re-anchored 2026-10-07 at master 8d0fb10: a2d8d07 moved message arrays onto the part loop, making the old `if (false)` replacement behaviour-equivalent; the bytes now restore the stringify path for untyped arrays (dropping the zero-length early return), which reds the empty-array 400 case by hand (17 ran / 1 fail) and leaves the suite green after restore.",
+  "_scope_note": "The request-tail policy (docs/REQUEST-TAIL-CONTRACT.md, PR #274): both 400s live in one shared block in chat.js (_handleChatCompletionsInner), the Anthropic/Gemini converters drop turns that yield no text/image/tool BEFORE delegating there, and /v1/responses must reach the same guard (its converter keeps a zero-length content array empty instead of stringifying it to \"[]\"). Each mutation below removes one half of that contract; the pinned tests must red. Chat-surface assertions drive the REAL handleChatCompletions (a mock would bypass the guard); the converter assertions drive the real converters with a recording chat handler, because what they pin is what the converter forwards (drop → served, kept-with-text → the shared 400 re-enveloped).",
+  "tests": [
+    "test/request-tail-contract.test.js"
+  ],
+  "expectBaselinePass": 17,
+  "mutations": [
+    {
+      "name": "predicate A disabled — an unanswerable tail (assistant-terminated, the Anthropic prefill shape) sails through to backend/account selection instead of the measured 400: the upstream answers UPSTREAM_INTERNAL and two consecutive of those quarantine the account for 120s",
+      "file": "src/handlers/chat.js",
+      "anchor": "    if (!last || !ANSWERABLE_ROLES.has(last.role)) {",
+      "replacement": "    if (false) {"
+    },
+    {
+      "name": "predicate B disabled — an empty newest user turn is forwarded: 79cd990 (fix #28, OpenClaw probe scenario #14) measured that the model then answers against the system prompt as if it were the prompt, and the class check exists because the upstream rejects such requests as UPSTREAM_INTERNAL",
+      "file": "src/handlers/chat.js",
+      "anchor": "      if (trimmedBytes === 0) {",
+      "replacement": "      if (false) {"
+    },
+    {
+      "name": "the two predicates swapped — predicate B is evaluated before A, so a conversation violating both (an empty newest user turn behind an assistant tail) reports the empty-content 400 instead of the assistant-tail one: 'which 400 wins' stops being the decision the code states, which is the ordering the contract pins",
+      "file": "src/handlers/chat.js",
+      "anchor": "    if (!last || !ANSWERABLE_ROLES.has(last.role)) {\n      return {\n        status: 400,\n        body: {\n          error: {\n            message: 'The conversation must end with a user message or a tool result. '\n              + 'Provide at least one user turn to respond to.',\n            type: 'invalid_request_error',\n            param: 'messages',\n          },\n        },\n      };\n    }\n    const lastUser = (messages || []).filter(m => m?.role === 'user').pop();\n    if (lastUser) {\n      const c = lastUser.content;\n      let trimmedBytes = 0;\n      if (typeof c === 'string') trimmedBytes = c.trim().length;\n      else if (Array.isArray(c)) trimmedBytes = c.reduce((n, p) => {\n        if (typeof p?.text === 'string') return n + p.text.trim().length;\n        // Non-text parts (image_url / input_audio / file / etc.) count as\n        // non-empty content \u2014 only pure-text empties trigger the 400.\n        if (p && typeof p === 'object' && p.type && p.type !== 'text') return n + 1;\n        return n;\n      }, 0);\n      if (trimmedBytes === 0) {\n        return {\n          status: 400,\n          body: {\n            error: {\n              message: 'The last user message has empty content. Provide a non-empty user prompt.',\n              type: 'invalid_request_error',\n              param: 'messages',\n            },\n          },\n        };\n      }\n    }\n  }",
+      "replacement": "    const lastUser = (messages || []).filter(m => m?.role === 'user').pop();\n    if (lastUser) {\n      const c = lastUser.content;\n      let trimmedBytes = 0;\n      if (typeof c === 'string') trimmedBytes = c.trim().length;\n      else if (Array.isArray(c)) trimmedBytes = c.reduce((n, p) => {\n        if (typeof p?.text === 'string') return n + p.text.trim().length;\n        // Non-text parts (image_url / input_audio / file / etc.) count as\n        // non-empty content \u2014 only pure-text empties trigger the 400.\n        if (p && typeof p === 'object' && p.type && p.type !== 'text') return n + 1;\n        return n;\n      }, 0);\n      if (trimmedBytes === 0) {\n        return {\n          status: 400,\n          body: {\n            error: {\n              message: 'The last user message has empty content. Provide a non-empty user prompt.',\n              type: 'invalid_request_error',\n              param: 'messages',\n            },\n          },\n        };\n      }\n    }\n    if (!last || !ANSWERABLE_ROLES.has(last.role)) {\n      return {\n        status: 400,\n        body: {\n          error: {\n            message: 'The conversation must end with a user message or a tool result. '\n              + 'Provide at least one user turn to respond to.',\n            type: 'invalid_request_error',\n            param: 'messages',\n          },\n        },\n      };\n    }\n  }"
+    },
+    {
+      "name": "non-text parts stop counting as content — an image-only (or file/audio-only) user turn is reclassified as empty and rejected by predicate B, breaking every media-carrying turn 79cd990 deliberately kept legal ('pure-text empties only')",
+      "file": "src/handlers/chat.js",
+      "anchor": "        if (p && typeof p === 'object' && p.type && p.type !== 'text') return n + 1;",
+      "replacement": "        if (false) return n + 1;"
+    },
+    {
+      "name": "the Anthropic converter stops dropping turns that yield no text/image/tool — a textless turn becomes an empty-content message, so the shared guard now sees an assistant-terminated conversation (or an empty user turn) that the documented difference says is served, and the surface's answer flips from 200 to 400",
+      "file": "src/handlers/messages.js",
+      "anchor": "      } else if (textParts.length) {",
+      "replacement": "      } else if (true) {"
+    },
+    {
+      "name": "the Gemini converter stops dropping turns that yield no text/image/tool — same flip as the Anthropic side: textless user/model turns materialise as empty-content messages and the request that was served becomes a 400 INVALID_ARGUMENT",
+      "file": "src/handlers/gemini.js",
+      "anchor": "    } else if (textParts.length) {",
+      "replacement": "    } else {"
+    },
+    {
+      "name": "the Responses converter stringifies a zero-length content array again — the two-character junk string \"[]\" reaches the upstream and the shared empty-user 400 is bypassed, which is the hole the 2026-10-07 review found (predicate B is supposed to be the single place this is decided)",
+      "file": "src/handlers/responses.js",
+      "anchor": "  if (content.length === 0) return '';\n\n  const hasContentBlock = content.some(part => part && typeof part === 'object' && typeof part.type === 'string');\n  if (!hasContentBlock && toolOutput) {",
+      "replacement": "  const hasContentBlock = content.some(part => part && typeof part === 'object' && typeof part.type === 'string');\n  if (!hasContentBlock) {"
+    }
+  ]
+}

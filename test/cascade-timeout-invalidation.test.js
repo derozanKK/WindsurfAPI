@@ -49,7 +49,11 @@ describe('upstream-timeout cascade invalidation (#101)', () => {
     // exists there — without it, non-stream callers (some Cherry Studio
     // configurations, Anthropic SDK with stream=false) would still
     // restore the broken cascade.
-    const m = CHAT_JS.match(/if \(result\.reuseEntryInvalid\) reuseEntryDead = true;[\s\S]{0,800}?lastErr = result;/);
+    // The health classification now runs BEFORE the client-abort return (a 504
+    // that raced a disconnect must still be marked dead and never restored), so
+    // anchor on the classifier's own locals instead of the old
+    // abort→classify→lastErr order.
+    const m = CHAT_JS.match(/const _resultError = result\.body\?\.error \|\| \{\};[\s\S]{0,900}?reuseEntryDead = true;/);
     assert.ok(m, 'non-stream invalidation region not found — refactor may have changed shape');
     const region = m[0];
     assert.match(region, /isUpstreamDeadlineExceeded\(_resultMsg\)/,

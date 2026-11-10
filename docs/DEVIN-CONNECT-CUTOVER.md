@@ -43,8 +43,29 @@ API_KEY=sk-REDACTED        # existing downstream proxy key — unchanged
 # accounts.json already holds the free session token(s) — nothing else required
 ```
 
-That is the whole minimum. The pool supplies tokens; free-tier accounts resolve
-only `swe-1-6-slow`.
+That is the whole minimum. The pool supplies tokens. Which connect selectors are
+FREE is **derived from the live catalog, not from a fixed name**:
+
+1. `modelCostTier` + `promoStatus` on the account's `GetCascadeModelConfigs` rows
+   (per account, promo-aware). Measured on a Pro account 2026-10-22: exactly
+   `swe-2-medium` / `swe-2-high` / `swe-2-max`, `MODEL_COST_TIER_FREE`, promo
+   active until **2026-11-01T06:59:59Z**.
+2. A `rate === 0` entry in the account's paired credit rate table (rolling
+   promotions that are not encoded as a cost tier).
+3. `FREE_REACHABLE_SELECTORS` (`swe-1-6-slow`) — a documented **fallback only**
+   for a deployment with no live cost-tier data and no rate table (cold start).
+   It is also unpaid-tier ENTITLEMENT, so a free account is still admitted to it
+   when the live catalog has not been fetched. Do not treat it as "the free
+   list": on the measured Pro deployment it is absent from the 240-selector live
+   catalog and the upstream answers it with `failed_precondition` /
+   "Your daily usage quota has been exhausted".
+
+`GET /dashboard/api/models` exposes the derivation per row: `costTier`,
+`promoEndsAt`, `freeNow` (tri-state), `freeReason`
+(`cost_tier_free` | `rate_zero` | `fallback_whitelist`) and `quotaState`
+(`free` | `blocked_daily` | `blocked_weekly` | `not_in_catalog` | `unknown`).
+A selector absent from a non-empty live catalog is reported as
+`not_in_catalog` rather than reachable+free.
 
 A model name the catalog does not know is **rejected with `400 model_not_found`**,
 not degraded. This sentence used to say the opposite ("any other model name
@@ -54,6 +75,15 @@ free selector changes both the output and the billing semantics of an explicitly
 requested paid model, so it fails loudly instead. Setting
 `WINDSURFAPI_STRICT_MODEL=0` restores the legacy silent degrade — see the env
 reference for why that is a footgun rather than a workaround.
+
+That opt-out degrades **only to a selector that is callable**: the live free
+selectors above, restricted to what the account's catalog actually exposes. It
+used to target the frozen `swe-1-6-slow` unconditionally, which on a live-catalog
+deployment is absent and answers with "Your daily usage quota has been
+exhausted" — so a typo came back as a quota error that looked like an account
+fault. When no live free selector qualifies, the request is answered
+`400 model_not_found` even with the opt-out set; the static `swe-1-6-slow` floor
+now applies only while no live catalog has arrived (cold start).
 
 ## 2. Recommended hardening adds (optional, all default-off)
 
@@ -68,7 +98,7 @@ added by raw token (the current pooled free account, id `70da7667`) has none, so
 it can fail over to other pool members but cannot self-heal its own token. To
 enable self-heal, re-add the account through the email/password login path with
 `DEVIN_CONNECT_CRED_KEY` set — the password is then auto-stored encrypted
-(`src/auth.js:514-515`). See §5.
+(`src/auth.js:1981`). See §5.
 
 ## 3. Deploy steps (operator runs on homecloud)
 
@@ -152,14 +182,28 @@ free-tier behavior; a sustained spike means the upstream is genuinely saturated
 ## 7. What's NOT covered (known limits)
 
 - **Paid models** (claude-*/gpt-*/gemini-*) need a paid entitlement on a pooled
-  account — unverified, blocked on a paid token. Free deploy serves
-  `swe-1-6-slow` only. See §8 for the one-command verification.
+  account — unverified, blocked on a paid token. A free deployment's serveable
+  set is the live catalog's cost-tier-FREE rows, with `swe-1-6-slow` as the
+  cold-start fallback (see §1). See §8 for the one-command verification.
 - **Vision/images**: native `ChatMessagePrompt.images #10` is verified by the
   extracted Devin schema and a successful SWE-1.7 image request. It is enabled
   by default; set `DEVIN_CONNECT_IMAGE_TAG=0` only for an emergency rollback.
+  Images only reach the model on **user** turns: measured 2026-10-21, the same
+  image on an assistant turn is accepted on the wire but ignored upstream (the
+  model reports no image), so an image-only assistant turn is dropped before
+  encoding. That drop is logged and counted (`assistant_images_dropped` on
+  `/dashboard/api/connect-metrics`); move the image to a user turn.
 - **Router models** (`adaptive`, `arena-*`): resolution via AssignModel is built
   but gated OFF (`DEVIN_CONNECT_ASSIGN_MODEL` unset) because the wire tags are
   inferred, not yet calibrated on a paid round-trip. §8 has the enable path.
+- **Sequential tool calls** (`parallel_tool_calls:false`, or Anthropic's
+  `tool_choice.disable_parallel_tool_use`): the request is always SERVED — the
+  field is a preference and never a 400 (Codex 0.164 sends it on every request;
+  the old refusal made the CLI unusable) — but the hint is only forwarded upstream
+  when `DEVIN_CONNECT_TOOL_CHOICE=1` (unconfirmed `#11` tag). Otherwise the model
+  may return several calls in one turn; the drop is logged once per process
+  (`event=parallel_tool_calls_hint_ignored`) and counted per request as
+  `parallel_tool_calls_hint_ignored` on `/dashboard/api/connect-metrics`.
 - **Billing passthrough**: cache token tags `5`/`4` ship ON by default.
   `committed_acu_cost` is descriptor-verified as top-level **double field 22**
   (`leookun/devin-2api` extract) but stays **opt-in** until a paid frame
@@ -248,8 +292,12 @@ Conclusions:
   here.** The PR's mechanism conclusion (rotating accounts re-pays for context)
   still holds — it is demonstrated by the Claude row above — but the GPT numbers
   in that table should not be treated as calibration data.
-- `prompt_tokens` excludes both cached and created tokens (Claude reports
-  `prompt=3` while 2268 ride the cache fields), consistent with #118.
+- **Historic note, superseded by O2 (2026-10-25):** at calibration time
+  `prompt_tokens` excluded both cached and created tokens (Claude reported
+  `prompt=3` while 2268 rode the cache fields), matching #118. That made a
+  cache-WRITE turn report the tiny fresh tail as the prompt; it now reports
+  `fresh + cache_read + cache_write`. The raw counters in the table above are
+  unchanged — only the wire mapping changed (see §8.6).
 
 **`actual_model_uid` (#47) — independently re-confirmed.** The dump shows
 `sub #7.9 string="claude-sonnet-4-6"`, i.e. the concrete model rides the #7
@@ -276,6 +324,19 @@ the transport — so `CALIBRATE_MODEL=claude-sonnet-4.6` (dotted alias) produced
 which is precisely the state a paid calibration run is trying to diagnose. Two paid
 runs were burned on this. `scripts/devin-connect-calibrate.mjs` now resolves the
 alias itself and logs `resolved alias X -> selector Y`, so either form works.
+
+**Alias vs selector on the client surface (O1, measured 2026-10-25).** Two
+spellings that look like the same model select DIFFERENT upstream variants:
+
+| Client asks for | Upstream selector | Notes |
+|---|---|---|
+| `claude-sonnet-4.6` (dotted) | `claude-sonnet-4-6-thinking` | curated alias default; thinking tokens, credit 6 |
+| `claude-sonnet-4-6` (dashed) | `claude-sonnet-4-6` | base catalog selector; no reasoning_content, credit 4 |
+
+Both resolve `mapped:true`; the alias is deliberate (only the dotted family carries
+the `-thinking` default) and must not be "fixed". A client that wants the base model
+has to use the dashed catalog spelling — omp 18.12.6 asks for the dotted name, so
+every omp turn on the windsurf group runs the thinking variant.
 
 ### 8.1 Verify paid selectors are actually reachable (#15/#28)
 
@@ -320,12 +381,20 @@ GetChatMessage rejects the bare router uid. Turn the hop on:
 ```sh
 # .env:
 DEVIN_CONNECT_ASSIGN_MODEL=1
-# If a real AssignModel round-trip shows different tags than our inferred
-# defaults (req_model_uid=2, resp_assignment=1, asg_model_uid=1, asg_jwt=2,
-# asg_harness=3), pin them:
-DEVIN_CONNECT_ASSIGN_TAGS="req_model_uid=2,resp_assignment=1,asg_model_uid=1,asg_jwt=2,asg_harness=3"
+# If a real AssignModel round-trip shows different tags than our defaults
+# (req_model_uid=2, req_cascade_id=3, resp_assignment=1, asg_model_uid=2,
+# asg_jwt=1, asg_harness=3), pin them:
+DEVIN_CONNECT_ASSIGN_TAGS="req_model_uid=2,req_cascade_id=3,resp_assignment=1,asg_model_uid=2,asg_jwt=1,asg_harness=3"
 # Extra router names/prefixes:  DEVIN_CONNECT_ROUTER_MODELS="auto,smart-*"
 ```
+
+The defaults above are the post-`86d5543` set (2026-10-15), read from
+`ASSIGN_TAGS_DEFAULT` (`src/devin-connect-catalog.js:521-527`): the request now carries
+`cascade_id` (#3, the schema marks it required) and `ModelAssignment`'s `model_uid` /
+assignment-blob numbers were corrected (they had been swapped). An `.env` that pinned the
+old set — `req_model_uid=2,resp_assignment=1,asg_model_uid=1,asg_jwt=2,asg_harness=3` — must
+be re-pinned or dropped; it would re-point `asg_model_uid` at the JWT field and omit
+`cascade_id` entirely.
 
 A failed/empty resolve degrades gracefully to the original selector and bumps
 the `assign_model_failed` counter on `/connect-metrics` — it never fails the
@@ -381,9 +450,20 @@ instead of billing:
 DEVIN_CONNECT_BILLING_TAGS=cache_read_tokens=5,cache_write_tokens=4
 ```
 
-`usage` then gains `prompt_tokens_details.cached_tokens` (from cache_read) and
-`cache_creation_input_tokens` (from cache_write). Unset = the cache-only default.
-Set `off` = neither cache key present.
+`usage` then gains `prompt_tokens_details.cached_tokens` (from cache_read),
+`fresh_input_tokens` (from prompt) and `cache_creation_input_tokens` (from
+cache_write). Unset = the cache-only default. Set `off` = no cache counters
+decoded; `prompt_tokens_details.cached_tokens: 0` and `fresh_input_tokens` still
+come from the prompt/completion fields, which are always decoded.
+
+**`prompt_tokens` is the full input on this path** (O2, measured 2026-10-25):
+`fresh + cache_read + cache_write`, so a cache-WRITE turn no longer reports the
+tiny fresh remainder as the prompt (omp showed "3 in" for an 11.5k prompt on 2/7
+turns — exactly the two prefix-miss turns). `total_tokens = prompt_tokens +
+completion_tokens` always; `WINDSURFAPI_STRICT_USAGE_TOTAL` is a no-op here. The
+Cascade path keeps the #118 split (cache_write outside `prompt_tokens`), which is
+why consumers must read `fresh_input_tokens` instead of re-deriving
+`prompt_tokens - cached_tokens`.
 
 ### 8.7 finish_reason calibration (already live, free-tier safe)
 
@@ -397,13 +477,37 @@ capture that contradicts them:**
 | `2` | `stop` | free-tier normal completion (verified) |
 | `4` | `stop` | **paid teams** normal completion, calibrated 2026-07-27 — three probes on claude-sonnet-4.6 (`max_tokens` 300 / 8 / 40) all returned 4, and the `max_tokens=300` one answered "HI" (2 chars, unambiguously complete) |
 
-Every OTHER value maps to `stop`. The earlier best-effort guesses (`3 → length`,
-`5 → content_filter`), inferred from the variant NAME order, have been **retired**:
-value 4 proved that method wrong, and the cost of a wrong guess is asymmetric.
-A spurious `length` or `content_filter` closes a `/v1/responses` turn as
-`response.incomplete` (a whole-turn hard failure for Codex-style clients), and
-`content_filter` additionally surfaces on `/v1/messages` as Anthropic
-`stop_reason:'refusal'` — reporting a completed answer as the model refusing.
+`mapFinishReason` reads the descriptor-backed `STOP_REASON_DEFAULT` table
+(`src/devin-connect.js:2884-2899`) and applies `DEVIN_CONNECT_STOP_REASON_MAP`
+overrides on top (`:2920-2938`). The shipped map is:
+
+| value | maps to | note |
+|---|---|---|
+| `0` | `stop` | `STOP_REASON_UNSPECIFIED` |
+| `1` | `length` | `INCOMPLETE` |
+| `2` | `stop` | **live-anchored** free-tier normal completion (verified) |
+| `3` | `length` | `MAX_TOKENS` |
+| `4` | `stop` | **live-anchored** paid teams normal completion, calibrated 2026-07-27 — three probes on claude-sonnet-4.6 (`max_tokens` 300 / 8 / 40) all returned 4, and the `max_tokens=300` one answered "HI" (2 chars, unambiguously complete) |
+| `5` | `length` | `MAX_NEWLINES` |
+| `6` | `stop` | `EXIT_SCOPE` |
+| `7` | `stop` | `NONFINITE_LOGIT_OR_PROB` |
+| `8` | `stop` | `FIRST_NON_WHITESPACE_LINE` |
+| `9` | `length` | `PARTIAL` |
+| `10` | `tool_calls` | `FUNCTION_CALL` |
+| `11` | `content_filter` | `CONTENT_FILTER` |
+| `12` | `stop` | `NON_INSERTION` |
+| `13` | `error` | `ERROR` |
+
+Only values **outside 0–13** (or non-numeric) fall back to `stop`
+(`src/devin-connect.js:2994-3002`, logged once per distinct value). The earlier
+wording — "every other value maps to
+`stop`", with `3 → length` and `5 → content_filter` described as retired guesses —
+was wrong: `3 → length` and `5 → length` are live, and `5` is `MAX_NEWLINES`, not
+`CONTENT_FILTER` (`11`). A spurious `length` or `content_filter` closes a
+`/v1/responses` turn as `response.incomplete` (a whole-turn hard failure for
+Codex-style clients), and `content_filter` additionally surfaces on `/v1/messages`
+as Anthropic `stop_reason:'refusal'` — reporting a completed answer as the model
+refusing.
 
 **Truncation is detected from usage, not from the enum.** `resolveFinishReason`
 reports `length` when `completion_tokens` lands exactly on the cap the caller
@@ -414,20 +518,27 @@ as truncated is the more harmful error: clients that auto-continue on `length`
 would loop on a finished response.
 
 An operator with a real capture is a better authority than either mechanism and
-can override the whole table — an explicit override for a value also takes
-precedence over the usage inference:
+can override any integer — the value must be one of `stop` / `length` /
+`tool_calls` / `content_filter` (`src/devin-connect.js:2927`) — and an explicit
+override for a value also takes precedence over the usage inference:
 
 ```sh
-DEVIN_CONNECT_STOP_REASON_MAP="1=stop,2=stop,3=length,5=content_filter"
+# Example: treat INCOMPLETE (1) and ERROR (13) as clean stops.
+DEVIN_CONNECT_STOP_REASON_MAP="1=stop,13=stop"
 ```
+
+The old example `"1=stop,2=stop,3=length,5=content_filter"` was wrong twice: it
+mapped `5` (`MAX_NEWLINES`) to `content_filter`, and it presented default entries
+as if they were calibrations. `11` is `CONTENT_FILTER`; `8` is
+`FIRST_NON_WHITESPACE_LINE → stop`.
 
 Unknown values always fall back to `stop` so a finished stream is never an error.
 Note: both historical probes (free tier 16 vs 1000, paid 16 vs 4096) saw the cap
 ignored — but BOTH ran while the encoder had `max_tokens` on the wrong field (#3,
 which is `max_newlines`; corrected 2026-08-09, see §8.9). Neither probe therefore
 measured `max_tokens` at all. Re-run them before concluding anything about upstream
-enforcement, and note that a genuinely truncated turn is still what pinning 3/5
-requires.
+enforcement, and note that a genuinely truncated turn is what the `3 → length` /
+`5 → length` entries describe; change them only from a real capture.
 
 ### 8.8 Live re-login recovery check (real credentials, zero-billable)
 
@@ -515,12 +626,13 @@ prompt via emulation, which works on every model. The request builder forwards
 To enable after a paid capture (§8.5) reveals the ToolDef inner tags:
 
 ```sh
-DEVIN_CONNECT_TOOL_DEF_TAGS="10,1,2,3"   # outer,name,description,schema
+DEVIN_CONNECT_TOOL_DEF_TAGS="outer=10,name=1,description=2,parameters=3"
 ```
 
-Order: outer repeated tag (verified =10), then the name/description/schema
-subfield tags. Malformed or wrong-arity → fails closed to emulation (never a
-broken frame). Live-verified: forwarding tools with the gate OFF produces an
+Named form (the supported one; the legacy positional `10,1,2,3` is back-compat
+only and must be exactly four numbers). Order: outer repeated tag (verified =10),
+then the name/description/schema subfield tags. Malformed or wrong-arity → fails
+closed to emulation (never a broken frame). Live-verified: forwarding tools with the gate OFF produces an
 identical, working request (zero regression). Response-side `ChatToolCall`
 decoding (`arguments_json`/`id`/`invalid_json_str`) still needs a paid capture
 and is tracked separately under #49.
@@ -539,3 +651,42 @@ carries `toolCalls: [{ id, name, arguments }]`. Off (default) → `toolCalls` is
 null and prompt emulation (`parseToolCallsFromText`) owns tool calls on every
 model, exactly as today. The decode is a pure read; an uncalibrated or absent tag
 map has zero behavioral effect.
+
+### 8.11 Session continuity (`DEVIN_CONNECT_SESSION_REUSE`) — default OFF
+
+Every DEVIN_CONNECT request carries a protobuf session id in field `#16`. With
+the switch unset (the shipped default), the handler mints a fresh `randomUUID()`
+per call, so one multi-turn dialog looks like N brand-new sessions to the
+upstream velocity limiter and prompt-cache reuse depends on prefix luck.
+
+Measured 2026-10-25 (omp 18.12.6, 7 requests, 3 conversations): **7/7 distinct
+session ids**, including three consecutive turns of one conversation. That is
+the documented default behaviour, not a lost client path — the client never
+sends a session id.
+
+With reuse ON, `src/session-continuity.js` derives a stable id from the
+conversation's own completed request/response pair chain (never from
+requestId/IP/timestamp); parallel dialogs on the same key stay independent.
+In-memory only, 30-minute TTL, 500 tracked dialogs by default:
+
+```sh
+DEVIN_CONNECT_SESSION_REUSE=1
+# Optional features — both require the main gate:
+DEVIN_CONNECT_MODEL_CONFIG_STABLE=0     # stable #15.1 + monotonic #15.2
+DEVIN_CONNECT_SESSION_REASONING_INJECT=0
+# Store sizing (only meaningful while reuse is on):
+DEVIN_CONNECT_SESSION_TTL_MS=1800000
+DEVIN_CONNECT_SESSION_MAX_STATES=500
+```
+
+Turning it on is a POLICY change, not a bug fix: the upstream session-limit
+behaviour behind it is why the default stayed off. The 2026-10-25 capture did
+NOT run with the gate on, so its effect on cache-hit rate and velocity limiting
+is `[INFERENCE]` from the code path, not a measurement.
+
+**Observability (added with O2/O3).** The handler now always names the source:
+reuse ON logs `DEVIN_CONNECT session reuse active → session_id=… acct=…`; reuse
+OFF logs `DEVIN_CONNECT session_id source=fresh-per-request
+(DEVIN_CONNECT_SESSION_REUSE off …)` once at info and per request at debug. A
+default deployment can therefore tell "continuity is off" from "reuse was
+expected but missed".

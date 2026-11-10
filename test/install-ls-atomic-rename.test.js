@@ -22,25 +22,25 @@ const SCRIPT = readFileSync(join(__dirname, '..', 'install-ls.sh'), 'utf8');
 
 describe('install-ls.sh atomic rename (LS file-busy fix)', () => {
   test('writes to a tmp sibling instead of the target directly', () => {
-    // The downloads (curl -o) and copies (cp -f) all need to go to
-    // the .new sibling, never directly to $TARGET.
     assert.match(SCRIPT, /TMP_TARGET="\$\{TARGET\}\.new\.\$\$"/,
       'must define TMP_TARGET as $TARGET.new.$$');
-    // Every curl -o invocation should target $TMP_TARGET, not $TARGET.
-    const curlMatches = SCRIPT.match(/curl [^\n]*--progress-bar[^\n]*-o "([^"]+)"/g) || [];
-    assert.ok(curlMatches.length > 0, 'expected at least one curl -o call');
-    for (const c of curlMatches) {
-      assert.match(c, /\$TMP_TARGET/,
-        `curl invocation must write to $TMP_TARGET, not $TARGET — found: ${c}`);
-    }
-    assert.match(SCRIPT, /curl -fsL -o "\$checksums_file" "\$checksums_url"/,
-      'checksum downloads should write to the separate checksum tmp file');
-    // cp -f branches likewise.
-    const cpMatches = SCRIPT.match(/cp -f "[^"]+" "([^"]+)"/g) || [];
-    for (const c of cpMatches) {
-      assert.match(c, /\$TMP_TARGET/,
-        `cp invocation must target $TMP_TARGET — found: ${c}`);
-    }
+
+    // Manual modes write to the tmp target.
+    assert.match(SCRIPT, /cp -f "\$INPUT_FILE" "\$TMP_TARGET"/,
+      '--file must copy into $TMP_TARGET');
+    assert.match(SCRIPT, /download "\$INPUT_URL" "\$TMP_TARGET"/,
+      '--url must download into $TMP_TARGET');
+
+    // Manifest mode downloads the archive to its own temp path, then
+    // extracts the member into $TMP_TARGET.
+    assert.match(SCRIPT, /download "\$URL" "\$TMP_ARCHIVE"/,
+      'manifest mode must download the archive to $TMP_ARCHIVE');
+    assert.match(SCRIPT, /> "\$TMP_TARGET"/,
+      'extraction must write into $TMP_TARGET');
+
+    // No download or copy may write the live target path.
+    assert.doesNotMatch(SCRIPT, /(?:curl|cp|download)[^\n]*\s"\$TARGET"(?:\s|$)/,
+      'no download/copy may write $TARGET directly');
   });
 
   test('atomic mv finalizes the install, after chmod', () => {
@@ -51,15 +51,19 @@ describe('install-ls.sh atomic rename (LS file-busy fix)', () => {
       'must chmod the tmp file then mv it onto $TARGET in that order');
   });
 
-  test('cleans up the tmp file if the script aborts mid-run', () => {
-    // trap the EXIT pseudo-signal so a curl failure doesn't strand
-    // a half-downloaded $TARGET.new.$$ in the install dir. Then
-    // disable the trap after the successful mv so we don't try to
-    // delete a path that's now $TARGET (different inode but same name
-    // would have surprising side effects if the trap chain fires later).
-    assert.match(SCRIPT, /trap 'rm -f "\$TMP_TARGET" "\$TMP_CHECKSUMS"' EXIT/,
-      'must register a trap to clean up tmp files on abort');
+  test('cleans up the tmp files if the script aborts mid-run', () => {
+    assert.match(SCRIPT, /trap cleanup EXIT/,
+      'must register the cleanup trap on EXIT');
+    assert.match(SCRIPT, /rm -f "\$TMP_TARGET" "\$TMP_SIDECAR" "\$TMP_ARCHIVE"/,
+      'cleanup must remove the tmp binary, sidecar and archive');
     assert.match(SCRIPT, /trap - EXIT/,
-      'must clear the trap after the successful mv');
+      'must clear the trap after the successful install');
+  });
+
+  test('dry-run exits before creating the install directory', () => {
+    const dryRunAt = SCRIPT.lastIndexOf('echo "install_path=$TARGET"');
+    assert.ok(dryRunAt > 0, 'dry-run must print the plan');
+    const mkdirAt = SCRIPT.indexOf('mkdir -p "$(dirname "$TARGET")"', dryRunAt);
+    assert.ok(mkdirAt > dryRunAt, 'dry-run must return before mkdir');
   });
 });

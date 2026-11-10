@@ -140,4 +140,21 @@ describe('setRuntimeDashboardPassword / getEffectiveDashboardPasswordStored', ()
     assert.equal(stored, 'env-password');
     assert.equal(verifyPassword('env-password', stored), true);
   });
+
+  // SEC-04: the setter is the last line of defence — every caller (dashboard
+  // route, tests, future CLI) must hash the trimmed value, otherwise a stray
+  // space in the input becomes a password the trimmed login header can never
+  // reproduce.
+  it('trims surrounding whitespace before hashing', () => {
+    setRuntimeDashboardPassword('  padded-password  ');
+    const stored = getEffectiveDashboardPasswordStored();
+    assert.equal(verifyPassword('padded-password', stored), true);
+    assert.equal(verifyPassword('  padded-password  ', stored), false);
+  });
+
+  it('whitespace-only input clears the runtime override like an empty string', () => {
+    config.dashboardPassword = 'env-password';
+    setRuntimeDashboardPassword('   ');
+    assert.equal(getEffectiveDashboardPasswordStored(), 'env-password');
+  });
 });

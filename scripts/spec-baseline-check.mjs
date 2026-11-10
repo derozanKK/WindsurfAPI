@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Measure selected mutation baselines from structured runner events, never display text.
 // Approved Windows skips establish count compatibility only, not executed assertions.
-// --all measures every spec; --base <ref> scopes changes; named specs are also supported.
+// --all measures every spec (the RELEASE gate); the default is change-scoped to the
+// specs whose own test files moved (the INCREMENTAL gate); named specs are supported.
+// --base <ref> sets the diff base.
 // Exit 0: measured count-compatible, 1: drift, 2: incomplete/untrustworthy evidence.
 import { readdirSync, readFileSync } from 'node:fs';
 import { spawnSync, execFileSync } from 'node:child_process';
@@ -67,10 +69,20 @@ function selectSpecs(specs, options, env) {
     ...git(['diff', '--name-only', '-z', 'HEAD']).split('\0'),
     ...git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0'),
   ].filter(Boolean));
-  // Source, helper or runner changes may affect dynamic test registration indirectly.
-  // A synchronized checkout is also measurable; it is not a diff-infrastructure error.
-  if (!changed.size || [...changed].some(f => f.startsWith('src/') || f.startsWith('scripts/')
-      || f === 'test/setup-env.mjs' || (f.startsWith('test/') && !f.startsWith('test/mutations/') && !f.endsWith('.test.js')))) return specs;
+  // A synchronized checkout has no diff to scope by, and measuring everything is
+  // the only honest answer there. That is the tag/release shape.
+  if (!changed.size) return specs;
+  // Otherwise measure exactly the specs this diff can have moved: the spec file
+  // itself, or one of the test files it pins. A pin drifts when its own covered
+  // tests gain or lose assertions, so this is the selection that sees drift.
+  //
+  // This used to ALSO measure every spec whenever any src/, scripts/ or test
+  // helper changed — a guard against tests registered dynamically from source.
+  // It made the incremental gate pay the full-set cost (~100s) on nearly every
+  // branch and still did not make the fast path correct for the failure it was
+  // written for: a stale pin is a property of the spec's own test list. FULL
+  // coverage belongs to the release gate, which runs this script with --all (the
+  // release workflow passes it) — see the header comment.
   return specs.filter(s => changed.has(`test/mutations/${s.name}`) || s.tests.some(f => changed.has(f)));
 }
 
@@ -102,7 +114,15 @@ export function main(argv = process.argv.slice(2)) {
     const value = measured.value;
     if (value.total !== spec.expectBaselinePass) {
       drift++;
-      console.log(`DRIFT ${spec.name}: expected=${spec.expectBaselinePass}, measured=${value.pass} pass + ${value.skipped} approved skips = ${value.total}; inspect changes before editing the pin`);
+      // The mutation harness refuses a run with this exact sentence
+      // (scripts/mutate-verify.mjs): a pin that no longer matches its suite means
+      // the suite moved under it, and both readers must name the two numbers the
+      // same way. The approved-skip breakdown is appended only when this platform
+      // skipped something, because the harness measures no skips at all.
+      console.log(`DRIFT ${spec.name}: baseline pass=${value.total} but spec expects ${spec.expectBaselinePass}. `
+        + 'Either the suite changed or the spec is stale — both are worth knowing before '
+        + 'trusting any verdict below.'
+        + (value.skipped ? ` [${value.pass} pass + ${value.skipped} approved skips]` : ''));
     } else {
       console.log(`ok ${spec.name}: ${value.pass} pass + ${value.skipped} approved skips = ${value.total} [${value.disposition}]`);
     }

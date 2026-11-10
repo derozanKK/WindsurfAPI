@@ -33,21 +33,19 @@ describe('stop reason mapping (paid calibration 2026-07-27)', () => {
     assert.equal(mapFinishReason(2, {}), 'stop', '2 is the verified free-tier clean stop');
   });
 
-  it('still reports a genuine truncation — but from usage, not from the enum', () => {
-    // 3 and 5 were name-order guesses like 4 was, so they no longer claim
-    // length/content_filter on their own: the same reasoning that retired the 4 guess
-    // applies to them, and a spurious 'incomplete' is a hard failure on
-    // /v1/responses (and a fabricated 'refusal' on /v1/messages).
-    assert.equal(mapFinishReason(3, {}), 'stop');
-    assert.equal(mapFinishReason(5, {}), 'stop');
-    // Real truncation is still reported — corroborated by completion_tokens landing
-    // on the cap the caller asked for, which does not depend on the un-pinned
-    // integers at all.
+  it('reports genuine truncation from the descriptor-pinned enum AND from usage', () => {
+    // 3 and 5 are no longer name-order guesses: the binary descriptor set pins
+    // 3 = MAX_TOKENS and 5 = MAX_NEWLINES, so the enum itself reports 'length'.
+    // (4 remains 'stop' — the paid capture outranks its MIN_LOG_PROB name.)
+    assert.equal(mapFinishReason(3, {}), 'length');
+    assert.equal(mapFinishReason(5, {}), 'length');
+    // The usage-based inference still covers an enum that only says 'stop'
+    // (e.g. 2/4) when completion_tokens lands on the caller's cap.
     assert.equal(resolveFinishReason(3, { completion_tokens: 128 }, 128, {}), 'length',
       'a turn that used its entire output budget is a genuine truncation');
     assert.equal(resolveFinishReason(2, { completion_tokens: 128 }, 128, {}), 'length');
-    // And an operator with a real capture can restore the enum mapping outright.
-    assert.equal(mapFinishReason(3, { DEVIN_CONNECT_STOP_REASON_MAP: '3=length' }), 'length');
+    // And an operator with a real capture can override the enum mapping outright.
+    assert.equal(mapFinishReason(3, { DEVIN_CONNECT_STOP_REASON_MAP: '3=stop' }), 'stop');
     assert.equal(mapFinishReason(5, { DEVIN_CONNECT_STOP_REASON_MAP: '5=content_filter' }),
       'content_filter');
   });
@@ -85,31 +83,38 @@ describe('usage subset invariant on the connect path', () => {
   it('cached_tokens is a SUBSET of prompt_tokens on a cache-hit turn', () => {
     // The measured live shape before the fix: fresh=3, cache_read=1765.
     const u = normalize({ prompt: 3, completion: 155, cache_read_tokens: 1765, cache_write_tokens: 6 });
-    assert.equal(u.prompt_tokens, 1768, 'prompt_tokens must include the cache read');
+    assert.equal(u.prompt_tokens, 3 + 1765 + 6,
+      'prompt_tokens must include BOTH cache read and cache write');
     assert.ok(u.prompt_tokens_details.cached_tokens <= u.prompt_tokens,
       `cached_tokens ${u.prompt_tokens_details.cached_tokens} must not exceed prompt_tokens ${u.prompt_tokens}`);
   });
 
-  it('total_tokens accounts for the full cost including cache writes', () => {
+  it('total_tokens is the full billable cost, counted once', () => {
     const u = normalize({ prompt: 3, completion: 155, cache_read_tokens: 1765, cache_write_tokens: 6 });
-    assert.equal(u.total_tokens, 1768 + 155 + 6);
-    assert.ok(u.total_tokens >= u.prompt_tokens + u.completion_tokens,
-      'total must never be less than its own components');
+    assert.equal(u.total_tokens, 3 + 1765 + 6 + 155,
+      'cache_write is already inside prompt_tokens, so the total must not add it again');
+    assert.equal(u.total_tokens, u.prompt_tokens + u.completion_tokens,
+      'OpenAI arithmetic identity holds by construction');
   });
 
-  it('a cache-write turn (first call) reports the write separately from prompt', () => {
+  it('a cache-write turn (first call) reports the write as INPUT, not as a side cost', () => {
+    // O2 (evidence/ClientSandboxes.md §5.3): omp saw prompt_tokens=3 for an ~11.5k
+    // prompt on exactly the two cache-WRITE turns. A write is input the model
+    // processed (the prefix was read to be cached), so it belongs in prompt_tokens;
+    // #118's "generation-side" framing only ever described the Cascade bucket split.
     const u = normalize({ prompt: 3, completion: 210, cache_write_tokens: 1771 });
-    assert.equal(u.prompt_tokens, 3, 'cache_write is generation-side, not prompt input (#118)');
-    assert.equal(u.cache_creation_input_tokens, 1771);
-    assert.equal(u.total_tokens, 3 + 210 + 1771, 'but the grand total still reflects it');
+    assert.equal(u.prompt_tokens, 3 + 1771, 'fresh + cache_write is the real input count');
+    assert.equal(u.cache_creation_input_tokens, 1771, 'the write stays visible on the Anthropic field');
+    assert.equal(u.total_tokens, 3 + 1771 + 210);
   });
 
-  it('an uncached turn omits the cache keys entirely', () => {
+  it('an uncached turn still carries the OpenAI detail object (zero cached)', () => {
     const u = normalize({ prompt: 400, completion: 20 });
     assert.equal(u.prompt_tokens, 400);
     assert.equal(u.total_tokens, 420);
-    assert.equal('prompt_tokens_details' in u, false, 'no cache fields when the tier does not cache');
-    assert.equal('cache_creation_input_tokens' in u, false);
+    assert.deepEqual(u.prompt_tokens_details, { cached_tokens: 0 },
+      'omitting the detail object made the cache breakdown disappear on write turns (O2)');
+    assert.equal('cache_creation_input_tokens' in u, false, 'no write counter was reported');
   });
 
   it('holds for arbitrary combinations (property check)', () => {
@@ -122,7 +127,8 @@ describe('usage subset invariant on the connect path', () => {
       });
       const cached = u.prompt_tokens_details?.cached_tokens ?? 0;
       assert.ok(cached <= u.prompt_tokens, 'cached_tokens must always be a subset');
-      assert.ok(u.total_tokens >= u.prompt_tokens + u.completion_tokens, 'total must cover its parts');
+      assert.equal(u.total_tokens, u.prompt_tokens + u.completion_tokens,
+        'the OpenAI identity must hold for every combination, not just the measured ones');
     }
   });
 });

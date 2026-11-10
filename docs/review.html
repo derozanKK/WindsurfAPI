@@ -168,7 +168,7 @@ footer{padding:2rem 0;color:var(--muted);font-size:.9rem}
 <header class="hero">
   <div class="wrap hero-grid">
     <div>
-      <div class="kicker">Architecture Review · 2026-06-17</div>
+      <div class="kicker">Architecture Review · 2026-06-17 · counts refreshed 2026-10-26</div>
       <h1>从启动入口读完整个 WindsurfAPI</h1>
       <p class="lede">这页把项目按运行路径拆开：Node 入口、HTTP 路由、OpenAI/Anthropic 兼容层、Windsurf Cascade 协议桥、账号池、LangServer 池、工具调用、Dashboard、部署与测试。它不是发布公告，而是给维护者和代码阅读者看的项目地图。</p>
     </div>
@@ -177,8 +177,8 @@ footer{padding:2rem 0;color:var(--muted);font-size:.9rem}
       <div class="facts">
         <div class="fact"><b>0</b><span>runtime npm dependencies</span></div>
         <div class="fact"><b>3</b><span>SDK-compatible API families</span></div>
-        <div class="fact"><b>145</b><span>active model catalog entries</span></div>
-        <div class="fact"><b>114</b><span>root tests run by npm test</span></div>
+        <div class="fact"><b>283</b><span>active model catalog entries</span></div>
+        <div class="fact"><b>593</b><span>root tests run by npm test</span></div>
       </div>
     </aside>
   </div>
@@ -443,7 +443,7 @@ footer{padding:2rem 0;color:var(--muted);font-size:.9rem}
     <div class="wrap">
       <div class="kicker">Test Coverage</div>
       <h2>测试覆盖地图</h2>
-      <p class="sub"><code>npm test</code> 当前覆盖根层 <code>test/*.test.js</code> 的 114 个测试文件，集中覆盖 handler/tool/native/account/dashboard 等风险面。下面按文件名归类，实际 CI 以 <code>npm test</code> 和 <code>npm run test:release</code> 为准。</p>
+      <p class="sub"><code>npm test</code> 当前覆盖根层 <code>test/*.test.js</code> 的 593 个测试文件（2026-10-26 最终树实测），集中覆盖 handler/tool/native/account/dashboard 等风险面。下面按文件名归类的是 2026-06-17 的 114 文件样本，实际 CI 以 <code>npm test</code> 和 <code>npm run test:release</code> 为准。</p>
       <div class="test-map" style="margin-top:1rem">
         <div class="test-box"><b>22</b><span>API handlers, stream, cache, tools</span></div>
         <div class="test-box"><b>18</b><span>auth, accounts, rate limits</span></div>
@@ -453,6 +453,7 @@ footer{padding:2rem 0;color:var(--muted);font-size:.9rem}
         <div class="test-box"><b>5</b><span>explicit security tests</span></div>
         <div class="test-box"><b>36</b><span>compatibility and regressions</span></div>
       </div>
+      <div class="note" style="margin-top:.75rem">分类框保留 2026-06-17 的 114 文件快照；当前根层测试文件为 593（2026-10-26 最终树实测）。</div>
       <div class="grid two" style="margin-top:1rem">
         <div class="card"><h3>Release gate</h3><p><code>npm run test:release</code> focuses on cache, dashboard API/syntax, native bridge docs, proto trace, secret scan, shard script, release workflow and version checks.</p></div>
         <div class="card"><h3>Broad gate</h3><p><code>npm test</code> runs the test files under <code>test/*.test.js</code> with Node's built-in test runner and force-exit behavior for long-running handles.</p></div>

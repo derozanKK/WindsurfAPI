@@ -1,0 +1,15 @@
+# repo-kit · 本仓库的 banner 规格
+# 改这个文件，workflow 会重新渲染 docs/assets/banner*.svg 与 README 区块
+# 生成器：https://github.com/dwgx/DWGX/tree/main/repo-kit
+owner = "dwgx"
+
+[[repo]]
+name = "WindsurfAPI"
+style = "pipe"
+tagline = "把 Windsurf/Devin 云端 100+ 模型变成 OpenAI / Anthropic / Gemini 三套兼容 API"
+install = "git clone https://github.com/dwgx/WindsurfAPI.git && cd WindsurfAPI && bash setup.sh && node src/index.js"
+lang = "JavaScript"
+license = "MIT"
+stages = ["ingest", "auth", "route", "adapt", "serve"]
+topics = ["anthropic-compatible", "api-gateway", "claude", "self-hosted"]
+links = [{ label = "docs", url = "https://dwgx.github.io/WindsurfAPI/" }, { label = "releases", url = "https://github.com/dwgx/WindsurfAPI/releases" }, { label = "issues", url = "https://github.com/dwgx/WindsurfAPI/issues" }]

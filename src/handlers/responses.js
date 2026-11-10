@@ -7,9 +7,23 @@
 
 import { randomUUID } from 'crypto';
 import { handleChatCompletions, normalizeOpenAIErrorType, connectErrorToHttp, hasPerUserScope } from './chat.js';
+import { selectBackend } from '../backend-router.js';
+import { findFilePartInMessages, unsupportedFilePartError } from '../devin-connect.js';
 import { getResponse, putResponse, deleteResponse, isResponseStoreEnabled, wantsPersistence } from '../response-store.js';
 import { safeLogValue } from '../log-safety.js';
 import { log } from '../config.js';
+import { SseFramer } from '../sse-framer.js';
+import { createBoundedWriter, resolveMaxDrainWaitMs } from '../stream-writer.js';
+import { buildToolNameMap, restoreToolName } from '../tool-names.js';
+import { createToolIdAllocator, normalizeToolIdsInMessages, sanitizeToolId, toolHygieneEnabled } from '../tool-ids.js';
+import { normalizeHistoryTail } from '../history-normalize.js';
+import {
+  forEachTool,
+  hostedSearchUnsupported,
+  isHostedSearchType,
+  isServerSideToolType,
+  serverSideToolUnsupported,
+} from '../server-side-tools.js';
 
 function genResponseId() {
   return 'resp_' + randomUUID().replace(/-/g, '').slice(0, 24);
@@ -34,12 +48,34 @@ function safeJsonParse(value) {
   try { return JSON.parse(value); } catch { return null; }
 }
 
-function normalizeMessageContent(content) {
+// `toolOutput` — tool results (function_call_output / custom_tool_call_output
+// `output`) are JSON payloads: an array with no typed content block keeps the
+// pre-061d32f JSON rendering. Message content must NOT take that path —
+// stringifying `[{text:'hi'}]` into the literal `'[{"text":"hi"}]'` fed the
+// model JSON junk instead of the text, and stringifying `[{}]` / `[null]`
+// masked an empty turn from the shared tail guard that already 400s those
+// shapes on /v1/chat/completions. Message arrays run through the part loop
+// below instead, whose own rule is: string parts and `{text}` parts become
+// text parts, nulls are skipped, and a textless array falls through to the
+// guard as an empty turn. The string case is a deliberate divergence from the
+// chat surface — its empty-content guard counts only `p.text` and typed
+// non-text parts (chat.js:3016-3019), so a newest-turn `["hi"]` answers 400
+// there while this converter materialises it as text. The `{text}` case does
+// match the chat layer (the guard counts it; the cascade flattener reads it,
+// client.js:133-134). Unify only with a measurement, not by editing a pin.
+function normalizeMessageContent(content, { toolOutput = false } = {}) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return stringifyMaybe(content);
 
+  // A zero-length content array means "no content", not the two-character
+  // string "[]". JSON.stringify([]) used to send that literal junk upstream
+  // and slip past the shared empty-user 400 (predicate B); the Responses
+  // surface must reach the same guard as the chat surface.
+  // See docs/REQUEST-TAIL-CONTRACT.md.
+  if (content.length === 0) return '';
+
   const hasContentBlock = content.some(part => part && typeof part === 'object' && typeof part.type === 'string');
-  if (!hasContentBlock) {
+  if (!hasContentBlock && toolOutput) {
     return stringifyMaybe(content);
   }
 
@@ -72,6 +108,33 @@ function normalizeMessageContent(content) {
       } else {
         out.push(part);
       }
+    } else if (part.type === 'input_file' || part.type === 'file' || part.type === 'document') {
+      // P-03: keep the typed file/document block intact. Cascade's
+      // image.js:extractImages turns PDF data URLs into model-visible text;
+      // the Devin Connect path has no attachment field, so responsesToChat
+      // rejects the request below when that backend is selected instead of
+      // letting messageText() flatten the block to ''. Never drop it here:
+      // that would also hide the block from Cascade.
+      //
+      // Responses `input_file` puts `file_data` / `filename` at the TOP level;
+      // Chat Completions nests them under `file`, which is the only shape
+      // image.js:extractImages reads. Normalise the Responses shape so Cascade
+      // does not skip the canonical payload.
+      if (!part.file && (part.file_data || part.file_id || part.filename)) {
+        const file = {};
+        if (part.filename) file.filename = part.filename;
+        if (part.file_data) file.file_data = part.file_data;
+        if (part.file_id) file.file_id = part.file_id;
+        out.push({ ...part, file });
+      } else {
+        out.push(part);
+      }
+    } else if (typeof part.type !== 'string' && typeof part.text === 'string') {
+      // Untyped part carrying text. The shared chat layer already coerces this
+      // shape (its guard counts `p.text`; the wire builder reads it), but
+      // normalise it to a real text part here so typed-only downstream steps —
+      // identity neutralisation (identity-neutralize.js:346) — still see it.
+      out.push({ type: 'text', text: part.text });
     } else {
       out.push(part);
     }
@@ -79,20 +142,133 @@ function normalizeMessageContent(content) {
   return out.length ? out : '';
 }
 
-// Codex SDK exposes server-side tools (file_search, computer_use_preview,
-// mcp) where execution lives on OpenAI's side, not the model's. The proxy
-// can't bridge these — each needs its own service implementation — so
-// drop them silently rather than 500-ing the whole request.
-//
-// `web_search` / `web_search_preview` are NOT in this set: they get
-// translated by flattenResponseTool below into a regular function tool
-// with a `query` param so the model can still drive the search loop
-// through normal function calls.
-const UNBRIDGED_SERVER_SIDE_TYPES = new Set([
-  'file_search',
-  'computer_use_preview',
-  'mcp',
-]);
+// The tool-type predicates and refusal messages live in ../server-side-tools.js
+// so /v1/chat/completions decides with the exact same set (F3).
+
+/**
+ * Walk a tool list (namespaces included) and refuse hosted search.
+ * Called for `body.tools` and for every `additional_tools` input item.
+ */
+function assertNoHostedSearchTools(tools, param = 'tools') {
+  forEachTool(tools, tool => {
+    if (isHostedSearchType(tool.type)) throw hostedSearchUnsupported(param);
+  });
+}
+
+/**
+ * Scan the RAW request. `collectResponseTools` filters `additional_tools`
+ * through responseLiteClientTool, which drops unknown types — a hosted search
+ * hidden there must still be rejected, not silently discarded.
+ */
+function assertNoHostedSearchInRequest(body) {
+  assertNoHostedSearchTools(body?.tools);
+  if (!Array.isArray(body?.input)) return;
+  for (const item of body.input) {
+    if (item?.type === 'additional_tools') assertNoHostedSearchTools(item.tools, 'input');
+  }
+}
+
+/**
+ * Walk a tool list (namespaces included) and refuse server-executed tools.
+ * Called for `body.tools` and for every `additional_tools` input item.
+ */
+function assertNoServerSideTools(tools, param = 'tools') {
+  forEachTool(tools, tool => {
+    if (isServerSideToolType(tool.type)) throw serverSideToolUnsupported(tool.type, param);
+  });
+}
+
+/**
+ * Scan the RAW request for the same reason as assertNoHostedSearchInRequest:
+ * `responseLiteClientTool` discards any non-function/custom/namespace entry
+ * before the flatten step, so a server-executed tool hidden in
+ * `additional_tools` would otherwise vanish without the 400.
+ */
+function assertNoServerSideToolsInRequest(body) {
+  assertNoServerSideTools(body?.tools);
+  if (!Array.isArray(body?.input)) return;
+  for (const item of body.input) {
+    if (item?.type === 'additional_tools') assertNoServerSideTools(item.tools, 'input');
+  }
+}
+
+/**
+ * A `tool_choice` naming a tool this proxy cannot execute is a 400, never a
+ * silent downgrade: dropping the choice (or the tool) leaves the caller unable
+ * to tell its forced tool was discarded.
+ */
+function assertSupportedToolChoice(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== 'object') return;
+  if (isHostedSearchType(toolChoice.type)) throw hostedSearchUnsupported('tool_choice');
+  if (isServerSideToolType(toolChoice.type)) {
+    throw serverSideToolUnsupported(toolChoice.type, 'tool_choice');
+  }
+}
+
+// OpenAI's metadata contract. Kept next to the validator rather than in the store
+// so the HTTP boundary and the store's defence-in-depth caps can be read together.
+const METADATA_MAX_KEYS = 16;
+const METADATA_MAX_KEY_CHARS = 64;
+const METADATA_MAX_VALUE_CHARS = 512;
+
+function invalidMetadata(detail) {
+  const error = new Error(`Invalid 'metadata': ${detail}.`);
+  error.type = 'invalid_request_error';
+  error.param = 'metadata';
+  error.code = 'invalid_metadata';
+  return error;
+}
+
+/**
+ * Validate and copy the request's `metadata` map (DataAuditTools F4).
+ *
+ * `metadata` is a top-level Responses parameter whose only purpose is the ECHO: a
+ * client tags a request (trace id, tenant) and reads the tag back off the response
+ * object, including from a later GET. Nothing on this route read it, so the tag
+ * vanished behind a 200 with no signal — the exact silent-drop failure this file
+ * refuses elsewhere for tools and tool_choice.
+ *
+ * Validated rather than normalized, because the OpenAI contract is explicit (a
+ * flat map of at most 16 string pairs, keys <= 64 chars, values <= 512 chars) and
+ * coercing or truncating would change the caller's data while still claiming to
+ * echo it. `undefined`/`null` mean "no metadata": absence stays absent on the
+ * response object.
+ *
+ * Values are never logged. The error messages name the rule and the field, never
+ * the payload.
+ */
+export function normalizeResponseMetadata(metadata) {
+  if (metadata == null) return undefined;
+  if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw invalidMetadata('expected an object mapping string keys to string values');
+  }
+  const keys = Object.keys(metadata);
+  if (keys.length > METADATA_MAX_KEYS) {
+    throw invalidMetadata(`at most ${METADATA_MAX_KEYS} key-value pairs are allowed, got ${keys.length}`);
+  }
+  // An EMPTY map is not a tag. Reporting it as absent keeps the POST and the later
+  // GET identical (the store has no slot for zero entries) instead of echoing `{}`
+  // once and omitting it the next time the same response is read.
+  if (!keys.length) return undefined;
+  const out = {};
+  for (const key of keys) {
+    if (!key) throw invalidMetadata('keys must be non-empty strings');
+    if (key.length > METADATA_MAX_KEY_CHARS) {
+      throw invalidMetadata(`keys must be at most ${METADATA_MAX_KEY_CHARS} characters`);
+    }
+    const value = metadata[key];
+    if (typeof value !== 'string') {
+      throw invalidMetadata(`the value for '${key}' must be a string`);
+    }
+    if (value.length > METADATA_MAX_VALUE_CHARS) {
+      throw invalidMetadata(`values must be at most ${METADATA_MAX_VALUE_CHARS} characters`);
+    }
+    // defineProperty, not assignment: a key literally named `__proto__` is an own
+    // data property here instead of a prototype write.
+    Object.defineProperty(out, key, { value, enumerable: true, configurable: true, writable: true });
+  }
+  return out;
+}
 
 function encodeToolName(name, namespace = '') {
   const toolName = name || 'unknown';
@@ -157,32 +333,6 @@ function flattenResponseTool(tool, inheritedNamespace = '') {
     }];
   }
 
-  if (tool.type === 'web_search' || tool.type === 'web_search_preview') {
-    return [{
-      type: 'function',
-      function: {
-        name: encodeToolName('web_search', inheritedNamespace),
-        description: tool.description || 'Search the web.',
-        parameters: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            query: {
-              type: 'string',
-              description: 'Search query.',
-            },
-          },
-          required: ['query'],
-        },
-      },
-      __response_tool: {
-        type: 'web_search',
-        namespace: inheritedNamespace || '',
-        originalName: 'web_search',
-      },
-    }];
-  }
-
   if (tool.type === 'tool_search') {
     return [{
       type: 'function',
@@ -208,10 +358,10 @@ function flattenResponseTool(tool, inheritedNamespace = '') {
     }];
   }
 
-  // file_search / computer_use_preview / mcp — known server-side tools
-  // we can't bridge. Drop silently so Codex requests with these enabled
-  // don't 500; the model keeps whatever real function tools it has.
-  if (UNBRIDGED_SERVER_SIDE_TYPES.has(tool.type)) return [];
+  // Every server-executed type was refused up front (assertNoServerSideTools),
+  // so anything reaching here is genuinely unknown to this bridge. Keep the
+  // historical leniency — warn, drop, no 500 — but never pretend it was
+  // forwarded.
   log.warn(`responses: dropping unknown tool type "${tool.type}"`);
   return [];
 }
@@ -282,14 +432,15 @@ function collectResponseTools(body) {
   return tools;
 }
 
-function responseItemToolName(item) {
-  return encodeToolName(item.name || item.function?.name || 'unknown', item.namespace || '');
+function responseItemToolName(item, toolNameMap = null) {
+  const encoded = encodeToolName(item.name || item.function?.name || 'unknown', item.namespace || '');
+  return toolNameMap?.toUpstream?.get(encoded) ?? encoded;
 }
 function normalizeResponseToolChoice(toolChoice) {
   if (toolChoice == null) return toolChoice;
   if (toolChoice === 'auto' || toolChoice === 'required' || toolChoice === 'none') return toolChoice;
   if (typeof toolChoice !== 'object') return toolChoice;
-  if (toolChoice.type === 'web_search' || toolChoice.type === 'tool_search') return 'auto';
+  if (toolChoice.type === 'tool_search') return 'auto';
   if (toolChoice.type === 'function' && (toolChoice.function?.name || toolChoice.name)) {
     return {
       type: 'function',
@@ -317,7 +468,6 @@ function requestedResponseToolChoiceName(toolChoice) {
   if (toolChoice.type === 'custom' || toolChoice.type === 'namespace') {
     return encodeToolName(toolChoice.name || toolChoice.function?.name || '', toolChoice.namespace || toolChoice.function?.namespace || '');
   }
-  if (toolChoice.type === 'web_search' || toolChoice.type === 'web_search_preview') return 'web_search';
   if (toolChoice.type === 'tool_search') return 'tool_search';
   return toolChoice.name || toolChoice.function?.name || toolChoice.type || '';
 }
@@ -325,21 +475,36 @@ function requestedResponseToolChoiceName(toolChoice) {
 function pruneResponseToolChoice(toolChoice, forwardedTools) {
   const normalized = normalizeResponseToolChoice(toolChoice);
   if (normalized == null) return undefined;
-  if (normalized === 'auto' || normalized === 'required' || normalized === 'none') return normalized;
+  const forwardedCount = Array.isArray(forwardedTools) ? forwardedTools.length : 0;
+  if (normalized === 'none') return normalized;
+  if (normalized === 'auto') return forwardedCount ? normalized : undefined;
+  if (normalized === 'required') {
+    if (!forwardedCount) {
+      const err = new Error("Invalid 'tool_choice': tool_choice 'required' cannot be satisfied because no executable tools remain.");
+      err.param = 'tool_choice';
+      err.code = 'tool_choice_tool_not_declared';
+      throw err;
+    }
+    return normalized;
+  }
 
   const requested = requestedResponseToolChoiceName(toolChoice);
   const availableNames = new Set((forwardedTools || []).map(t => t.function?.name || t.name).filter(Boolean));
   const forcedName = normalized.function?.name || '';
   if (forcedName) {
     if (availableNames.has(forcedName)) return normalized;
-    log.warn(`responses: dropped forced tool_choice "${requested || forcedName}" because the matching tool was not forwarded (available=[${[...availableNames].join(',') || 'none'}])`);
-    return undefined;
+    // A07/KH-003: never drop a forced choice. The caller asked for a specific
+    // tool; continuing auto would hide that the tool was unavailable.
+    const err = new Error(`Invalid 'tool_choice': function '${requested || forcedName}' not found in 'tools'.`);
+    err.param = 'tool_choice';
+    err.code = 'tool_choice_tool_not_declared';
+    throw err;
   }
 
-  if (toolChoice && typeof toolChoice === 'object' && UNBRIDGED_SERVER_SIDE_TYPES.has(toolChoice.type)) {
-    log.warn(`responses: dropped forced server-side tool_choice "${toolChoice.type}" because this proxy does not bridge that tool type`);
-    return undefined;
-  }
+  // A forced server-executed tool_choice never reaches this point:
+  // responsesToChat throws `unsupported_server_side_tool` for it up front, since
+  // silently dropping the choice left the model free to answer as if the client
+  // had not asked for that tool at all.
   return normalized;
 }
 
@@ -365,6 +530,27 @@ function normalizeResponseTextFormat(format) {
 
 export function responsesToChat(body) {
   const messages = [];
+  // Validated here, where every other request field is read, and carried on the
+  // result as an internal field: `metadata` is not forwarded upstream (the chat
+  // surface has no such parameter), so the response object is the only place it
+  // can survive.
+  const metadata = normalizeResponseMetadata(body.metadata);
+  const requestedTools = collectResponseTools(body);
+  // No hosted-search or server-executed executor exists on this route (see
+  // ../server-side-tools.js). Refuse BEFORE calling the model: letting the turn
+  // run and then reporting the proposal as a completed search is exactly the
+  // false execution receipt this gate removes, and letting it run with the tool
+  // silently dropped is the same failure without the receipt.
+  assertNoHostedSearchInRequest(body);
+  assertNoServerSideToolsInRequest(body);
+  assertSupportedToolChoice(body.tool_choice);
+  const tools = flattenResponseTools(requestedTools);
+  const toolNameMap = toolHygieneEnabled()
+    ? buildToolNameMap(tools.map((t) => t.function?.name || t.name).filter(Boolean))
+    : null;
+  const hasNameRewrites = toolNameMap
+    ? [...toolNameMap.toUpstream].some(([client, wire]) => client !== wire)
+    : false;
   // How many LEADING messages came from the request-level `instructions` field
   // (as opposed to an `input` conversation item). Reported on the result rather
   // than tagged onto the message objects: those get deep-compared in tests and
@@ -378,7 +564,7 @@ export function responsesToChat(body) {
           id: item.call_id || item.id || `call_${randomUUID().slice(0, 8)}`,
           type: 'function',
           function: {
-            name: responseItemToolName(item),
+            name: responseItemToolName(item, toolNameMap),
             arguments: stringifyMaybe(item.arguments ?? item.function?.arguments ?? ''),
           },
         });
@@ -426,6 +612,13 @@ export function responsesToChat(body) {
           role,
           content: normalizeMessageContent(item.content),
         });
+      } else if (item.type === 'input_file' || item.type === 'file' || item.type === 'document') {
+        // P-03: a file item sent at the top level of `input` (instead of inside
+        // a message's content array) used to fall through every branch and
+        // vanish before the backend saw it. Materialise it as a user content
+        // part so Cascade can extract it and the Connect guard can reject it.
+        flushToolCalls.flush();
+        messages.push({ role: 'user', content: normalizeMessageContent([item]) });
       } else if (item.type === 'function_call') {
         flushToolCalls.add(item);
       } else if (item.type === 'function_call_output') {
@@ -433,7 +626,7 @@ export function responsesToChat(body) {
         messages.push({
           role: 'tool',
           tool_call_id: item.call_id || item.id,
-          content: normalizeMessageContent(item.output ?? ''),
+          content: normalizeMessageContent(item.output ?? '', { toolOutput: true }),
         });
       } else if (item.type === 'custom_tool_call') {
         flushToolCalls.add({
@@ -447,18 +640,30 @@ export function responsesToChat(body) {
         messages.push({
           role: 'tool',
           tool_call_id: item.call_id || item.id,
-          content: normalizeMessageContent(item.output ?? ''),
+          content: normalizeMessageContent(item.output ?? '', { toolOutput: true }),
         });
       }
     }
     flushToolCalls.flush();
   }
 
-  const tools = flattenResponseTools(collectResponseTools(body));
+  for (const t of tools) {
+    if (t?.function?.name) t.function.name = toolNameMap?.toUpstream.get(t.function.name) ?? t.function.name;
+  }
   const responseFormat = normalizeResponseTextFormat(body.text?.format);
-  const forwardedToolChoice = body.tool_choice != null
+  let forwardedToolChoice = body.tool_choice != null
     ? pruneResponseToolChoice(body.tool_choice, tools)
     : undefined;
+  if (forwardedToolChoice?.type === 'function' && forwardedToolChoice.function?.name) {
+    forwardedToolChoice = {
+      ...forwardedToolChoice,
+      function: {
+        ...forwardedToolChoice.function,
+        name: toolNameMap?.toUpstream.get(forwardedToolChoice.function.name) ?? forwardedToolChoice.function.name,
+      },
+    };
+  }
+
   return {
     model: body.model || 'claude-sonnet-4.6',
     messages,
@@ -468,10 +673,20 @@ export function responsesToChat(body) {
     ...(tools.length ? { tools } : {}),
     ...(body.temperature != null ? { temperature: body.temperature } : {}),
     ...(body.top_p != null ? { top_p: body.top_p } : {}),
+    // F1 (DataAuditTools): `parallel_tool_calls` is a first-class Responses
+    // parameter and a caller preference ("prefer one tool call per turn"). This
+    // allow-list never read it, so the chat handler's decision — honour it when
+    // DEVIN_CONNECT_TOOL_CHOICE=1, otherwise serve the request and count the drop —
+    // was unreachable from this surface. Forward the caller's value; the chat
+    // handler owns the decision and never refuses it (Codex 0.164 sends it on every
+    // request, and a 400 there made the CLI unusable — evidence/CodexParallelFix.md).
+    ...(body.parallel_tool_calls != null ? { parallel_tool_calls: body.parallel_tool_calls } : {}),
     ...(forwardedToolChoice != null ? { tool_choice: forwardedToolChoice } : {}),
     ...(responseFormat ? { response_format: responseFormat } : {}),
     // Internal, stripped before the upstream call (same convention as __route).
     ...(instructionsLead ? { __instructionsLead: instructionsLead } : {}),
+    ...(hasNameRewrites && toolNameMap ? { __toolNameMap: toolNameMap } : {}),
+    ...(metadata ? { __responseMetadata: metadata } : {}),
   };
 }
 
@@ -533,13 +748,25 @@ function reasoningItem(id, text, status = 'completed') {
   };
 }
 
-function functionCallItem(toolCall, status = 'completed', requestedTools = []) {
-  const name = toolCall.function?.name || 'unknown';
+function clientToolId(id) {
+  return toolHygieneEnabled() ? sanitizeToolId(id) : (id || '');
+}
+
+function functionCallItem(toolCall, status = 'completed', requestedTools = [], toolNameMap = null, allocateId = null) {
+  const wireName = toolCall.function?.name || 'unknown';
+  const name = restoreToolName(wireName, toolNameMap) || wireName;
   const argsText = toolCall.function?.arguments || '';
   const requestedTool = Array.isArray(requestedTools)
-    ? requestedTools.find(t => (t?.function?.name || t?.name || (t?.__response_tool?.type === 'web_search' ? 'web_search' : null)) === name)
+    ? requestedTools.find(t => (t?.function?.name || t?.name) === wireName)
     : null;
   const responseTool = requestedTool?.__response_tool || null;
+  // Upstream may reuse one call id for two distinct calls; the client must
+  // never see the same call_id twice (GFProtocol Q1-04). The allocator keeps
+  // the first id and suffixes later duplicates deterministically. An absent id
+  // keeps this surface's historical generated fallback (per item type below).
+  const callId = toolCall.id
+    ? (allocateId ? allocateId(toolCall.id) : clientToolId(toolCall.id))
+    : '';
   if (responseTool?.type === 'custom') {
     const parsed = safeJsonParse(argsText);
     const input = parsed && typeof parsed === 'object' && parsed.input != null
@@ -547,42 +774,21 @@ function functionCallItem(toolCall, status = 'completed', requestedTools = []) {
       : argsText;
     return {
       type: 'custom_tool_call',
-      call_id: toolCall.id || `call_${randomUUID().slice(0, 8)}`,
+      call_id: callId || `call_${randomUUID().slice(0, 8)}`,
       name: responseTool.originalName || name,
       ...(responseTool.namespace ? { namespace: responseTool.namespace } : {}),
       input,
       status,
     };
   }
-  if (responseTool?.type === 'web_search' || responseTool?.type === 'tool_search') {
-    const parsed = safeJsonParse(argsText) || {};
-    return {
-      type: responseTool.type === 'web_search' ? 'web_search_call' : 'function_call',
-      ...(responseTool.type === 'web_search'
-        ? { id: toolCall.id || `ws_${randomUUID().replace(/-/g, '').slice(0, 24)}` }
-        : {
-            id: genFunctionCallId(),
-            call_id: toolCall.id || `call_${randomUUID().slice(0, 8)}`,
-            name: responseTool.originalName || name,
-            ...(responseTool.namespace ? { namespace: responseTool.namespace } : {}),
-          }),
-      status,
-      ...(responseTool.type === 'web_search'
-        ? {
-            action: {
-              type: 'search',
-              query: typeof parsed.query === 'string' ? parsed.query : argsText,
-            },
-          }
-        : {
-            arguments: argsText,
-          }),
-    };
-  }
+  // Hosted web_search is rejected in responsesToChat, so `__response_tool` with
+  // type 'web_search' is never produced. If an older shape ever reaches here,
+  // it falls through to the generic function_call below: a client-executed call
+  // is truthful, a `web_search_call` claiming a completed search is not.
   return {
     type: 'function_call',
     id: genFunctionCallId(),
-    call_id: toolCall.id || `call_${randomUUID().slice(0, 8)}`,
+    call_id: callId || `call_${randomUUID().slice(0, 8)}`,
     name: responseTool?.originalName || name,
     ...(responseTool?.namespace ? { namespace: responseTool.namespace } : {}),
     arguments: argsText,
@@ -590,7 +796,7 @@ function functionCallItem(toolCall, status = 'completed', requestedTools = []) {
   };
 }
 
-export function chatToResponse(chatBody, requestedModel, responseId = genResponseId(), msgId = genMessageId(), requestedTools = []) {
+export function chatToResponse(chatBody, requestedModel, responseId = genResponseId(), msgId = genMessageId(), requestedTools = [], toolNameMap = null, metadata = null) {
   const choice = chatBody.choices?.[0] || {};
   const message = choice.message || {};
   const finishReason = choice.finish_reason || 'stop';
@@ -598,7 +804,9 @@ export function chatToResponse(chatBody, requestedModel, responseId = genRespons
   const output = [];
   if (message.reasoning_content) output.push(reasoningItem('rs_' + msgId.slice(4), message.reasoning_content));
   if (text) output.push(textMessageItem(msgId, text));
-  for (const tc of (message.tool_calls || [])) output.push(functionCallItem(tc, 'completed', requestedTools));
+  // One allocator per turn: duplicate upstream call ids become distinct wire ids.
+  const allocateCallId = toolHygieneEnabled() ? createToolIdAllocator() : null;
+  for (const tc of (message.tool_calls || [])) output.push(functionCallItem(tc, 'completed', requestedTools, toolNameMap, allocateCallId));
 
   // A turn that ends by emitting function calls is `completed` in the OpenAI
   // Responses API — `incomplete` is reserved for truncation (length /
@@ -608,14 +816,39 @@ export function chatToResponse(chatBody, requestedModel, responseId = genRespons
   // incomplete. Verified after aligning them: a tool-call turn still closes as
   // `completed` on both paths, and only length / content_filter yields
   // `incomplete`.
-  const truncated = finishReason === 'length' || finishReason === 'content_filter';
+  //
+  // A06/KH-018: chat.js marks a Cascade poll truncation with
+  // `_windsurf_end_reason:'upstream_truncated'`. That is NOT a caller-imposed
+  // output cap — it means the upstream never finished the turn — so it must
+  // report `upstream_incomplete` (not max_output_tokens) and must not be
+  // committed to the response store (see commit() below).
+  const upstreamTruncated = choice._windsurf_end_reason === 'upstream_truncated';
+  const truncated = upstreamTruncated || finishReason === 'length' || finishReason === 'content_filter';
   return {
     id: responseId,
     object: 'response',
     created_at: chatBody.created || Math.floor(Date.now() / 1000),
     status: truncated ? 'incomplete' : 'completed',
-    ...(truncated ? { incomplete_details: { reason: finishReason === 'length' ? 'max_output_tokens' : 'content_filter' } } : {}),
-    model: requestedModel || chatBody.model,
+    ...(truncated ? {
+      incomplete_details: {
+        reason: upstreamTruncated
+          ? 'upstream_incomplete'
+          : (finishReason === 'length' ? 'max_output_tokens' : 'content_filter'),
+      },
+    } : {}),
+    // The SERVED name wins over the requested one, matching /v1/messages
+    // (messages.js `result.model || model`). chat.js reports what actually ran —
+    // the requested name for a mapped alias, the real selector when a request
+    // degrades, and the authoritative tier when the caller named one — so
+    // deferring to it is what makes this route honest. Before this, the
+    // non-stream path echoed the raw request string, which MASKED the F1 tier
+    // downgrade (requested gpt-6-luna-max, served gpt-6-luna-medium, body said
+    // max) while the stream path adopted the served name from the chunk. The
+    // fallback still covers a result with no model field at all.
+    model: chatBody.model || requestedModel,
+    // Echoed only when the caller sent it: absence stays absent rather than
+    // becoming `{}`, which would claim the caller attached an empty tag set.
+    ...(metadata ? { metadata } : {}),
     output,
     // Omitted, not zeroed, when the upstream reported nothing. `input_tokens: 0` is
     // an ASSERTION that the turn consumed no prompt tokens, which is false for any
@@ -630,14 +863,19 @@ export function chatToResponse(chatBody, requestedModel, responseId = genRespons
 }
 
 class ResponsesStreamTranslator {
-  constructor(res, responseId, model, requestedTools = []) {
+  constructor(res, responseId, model, requestedTools = [], toolNameMap = null, metadata = null) {
     this.res = res;
     this.responseId = responseId;
     this.model = model;
+    // Same echo contract as the non-stream path: present on every response object
+    // the stream publishes (created / in_progress / completed / failed) when the
+    // caller sent it, absent otherwise.
+    this.metadata = metadata;
     this.requestedTools = Array.isArray(requestedTools) ? requestedTools : [];
+    this.toolNameMap = toolNameMap;
     this.createdAt = Math.floor(Date.now() / 1000);
     this.msgId = genMessageId();
-    this.pendingSseBuf = '';
+    this.sseFramer = new SseFramer({ onFrame: (frame) => this.handleSseFrame(frame) });
     this.createdSent = false;
     this.finished = false;
     // TWO accumulators, deliberately:
@@ -665,6 +903,14 @@ class ResponsesStreamTranslator {
     this.nextOutputIndex = 0;
     this.outputItems = [];
     this.toolCalls = new Map();
+    // Egress id allocator: upstream may reuse one call id for two distinct
+    // calls, but the client must never see the same call_id twice
+    // (GFProtocol Q1-04). First-seen id wins; duplicates get a stable suffix.
+    this.allocateCallId = toolHygieneEnabled() ? createToolIdAllocator() : (id) => id || '';
+    // Tool events buffered until a split function.name is settled. Without this,
+    // output_item.added publishes the first fragment (e.g. "get_") and the name
+    // cannot be corrected in the Responses event contract.
+    this.deferred = null;
     this.finalUsage = {};
     this.sequenceNumber = 0;
     // Did the upstream stream ever deliver a terminal chunk? Every real success
@@ -673,13 +919,110 @@ class ResponsesStreamTranslator {
     // separate from streamFinishReason because `null` there is ambiguous: it is also
     // what a stream that is still running looks like.
     this.sawTerminalChunk = false;
+    // V-08: one abort-aware bounded writer for this egress. `res` here is the
+    // real response (the Chat handler writes into `createCaptureRes`, which
+    // reports THIS writer's pressure back to it), so a slow Responses client now
+    // holds the upstream producer instead of letting frames pile up in the
+    // socket. Half-open clients are bounded and tear the turn down.
+    this.clientGone = false;
+    const maxWaitMs = resolveMaxDrainWaitMs();
+    this.writer = createBoundedWriter({
+      res,
+      maxWaitMs,
+      onTimeout: () => {
+        this.clientGone = true;
+        log.warn(`Responses: no drain for ${maxWaitMs}ms — client stopped reading, ending the stream`);
+        try { if (!res.writableEnded) res.end(); } catch { /* best effort */ }
+      },
+    });
+  }
+
+  /** True while the client's socket has not accepted the bytes we handed it. */
+  get egressOk() {
+    return !this.writer.pending;
+  }
+
+  /** Write one raw SSE frame through the shared writer (returns the real verdict). */
+  writeRaw(text) {
+    return this.writer.write(text);
+  }
+
+  /** Wait out an outstanding drain before a terminal frame. Never throws. */
+  settleEgress() {
+    return this.writer.settle();
+  }
+
+  _write(event, data) {
+    if (!this.res.writableEnded) {
+      const payload = { type: event, sequence_number: this.sequenceNumber++, ...data };
+      // V-08: the verdict is the caller's backpressure signal. It is returned
+      // (via send/feed → createCaptureRes.write) rather than discarded.
+      return this.writer.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    }
+    return true;
   }
 
   send(event, data) {
-    if (!this.res.writableEnded) {
-      const payload = { type: event, sequence_number: this.sequenceNumber++, ...data };
-      this.res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    if (this.deferred) {
+      // ONE ordered buffer. The previous split into `events` and `text` replayed
+      // every non-text event first, which moved a later call's output_item.done
+      // ahead of the text item that had opened before it (measured: done oi=3
+      // before oi=2). Arrival order is the only order that keeps output_index and
+      // emission order in agreement.
+      this.deferred.entries.push({ event, data });
+      return true;
     }
+    return this._write(event, data);
+  }
+
+  /**
+   * End the deferral: publish the deferred call, then replay the buffered entries
+   * in arrival order.
+   *
+   * Deferral exists for exactly one reason — `output_item.added` cannot be
+   * corrected, so a split `function.name` must not be published as its first
+   * fragment. It must therefore end the moment the name is final, not at
+   * `finish()`. The old code only consulted `knownToolName` while `!this.deferred`,
+   * so once a fragment set the flag the item could never open: the rest of the
+   * stream was buffered and replayed at the end. Measured on text A -> split-name
+   * call -> text B -> call 2 -> text C: bytes flat from the first fragment through
+   * finish (1834), done oi=3 before oi=2, and B/C merged into one message item
+   * because the seal that belongs between them never ran.
+   *
+   * Every caller proves the deferred call's name is final: its name completed, its
+   * arguments started, or the stream ended. Text does NOT prove it (upstream can
+   * send name -> text -> name), so text is held instead — see emitTextDelta.
+   */
+  resolveDeferred() {
+    if (!this.deferred) return;
+    const { entries, tool: pendingTool } = this.deferred;
+    this.deferred = null;
+    // The call began before anything in the buffer, so its item is published
+    // first. Every buffered entry arrived after the delta that started the
+    // deferral, and the pre-tool message was already sealed there.
+    //
+    // A different call is published only when its own name is already known —
+    // publishing a fragment is the uncorrectable event this mechanism exists to
+    // avoid.
+    for (const tc of [...this.toolCalls.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
+      if (tc.item || !tc.wireName) continue;
+      if (tc === pendingTool || this.knownToolName(tc.wireName)) this.openToolItem(tc);
+    }
+    for (const entry of entries) {
+      // Held text goes through the normal path, so it accumulates into the item
+      // that follows the call and keeps its arrival position among the events.
+      if (entry.text !== undefined) this.emitTextDelta(entry.text);
+      else this._write(entry.event, entry.data);
+    }
+  }
+
+  knownToolName(name) {
+    if (!name) return false;
+    if (this.toolNameMap?.toClient?.has(name)) return true;
+    return this.requestedTools.some((t) => {
+      const n = t?.function?.name || t?.name;
+      return n === name;
+    });
   }
 
   responseBase(status, output = []) {
@@ -689,12 +1032,13 @@ class ResponsesStreamTranslator {
       created_at: this.createdAt,
       status,
       model: this.model,
+      ...(this.metadata ? { metadata: this.metadata } : {}),
       output,
     };
   }
 
   resolveRequestedTool(name) {
-    return this.requestedTools.find(t => (t?.function?.name || t?.name || (t?.__response_tool?.type === 'web_search' ? 'web_search' : null)) === name) || null;
+    return this.requestedTools.find(t => (t?.function?.name || t?.name) === name) || null;
   }
 
   start() {
@@ -738,7 +1082,12 @@ class ResponsesStreamTranslator {
       // cancel, provider deadline, ECONNRESET).
       if (choice.finish_reason) {
         this.streamFinishReason = choice.finish_reason;
-        if (!chunk.__synthetic_finish) this.sawTerminalChunk = true;
+        // A06: an upstream-truncated length terminal is fabricated too; the
+        // namespaced marker covers builds/routes that do not carry the private
+        // __synthetic_finish flag.
+        if (!chunk.__synthetic_finish && chunk.__windsurf_end_reason !== 'upstream_truncated') {
+          this.sawTerminalChunk = true;
+        }
       }
       const delta = choice.delta || {};
       if (delta.reasoning_content) this.emitReasoningDelta(delta.reasoning_content);
@@ -802,6 +1151,10 @@ class ResponsesStreamTranslator {
    * Anthropic on identical frames opens content_block index=2 for the second text,
    * which is the shape this brings the Responses exit in line with.
    */
+  closeTextBeforeTool() {
+    this.sealMessageSegment();
+  }
+
   sealMessageSegment() {
     if (!this.messageStarted || this.messageDone) return;
     this.finishMessage();
@@ -829,6 +1182,15 @@ class ResponsesStreamTranslator {
 
   emitTextDelta(text) {
     if (!text) return;
+    if (this.deferred) {
+      // A text delta does NOT prove the call's name is final: upstream can send
+      // name:"get_" -> text -> name:"time", and publishing "get_" is uncorrectable.
+      // Emitting the text now would also put it ahead of a call that started
+      // first. Hold it in arrival order; resolveDeferred replays it through this
+      // same method once the item is published.
+      this.deferred.entries.push({ text });
+      return;
+    }
     this.ensureTextPart();
     this.text += text;
     this.segmentText += text;
@@ -838,6 +1200,58 @@ class ResponsesStreamTranslator {
       content_index: 0,
       delta: text,
     });
+  }
+
+  /**
+   * Publish `output_item.added` for a call whose name is final. The caller
+   * guarantees `tc.item` is still null.
+   */
+  openToolItem(tc, { seal = true } = {}) {
+    if (tc.item) return;
+    // A tool item is about to open, so any text already streamed belongs to a
+    // message item that ENDED before it. Sealing here — at the point the tool
+    // item is created, not in finish() — is what gives the post-tool text its own
+    // item and keeps output_index ascending in emission order. `finishToolCalls`
+    // opts out: it only reaches a nameless call after the stream ended, and
+    // sealing there would close a message that opened after that call.
+    if (seal) this.sealMessageSegment();
+    const wireName = tc.wireName || tc.toolName || 'unknown';
+    const clientName = restoreToolName(wireName, this.toolNameMap) || wireName;
+    const responseTool = tc.responseTool;
+    const item = responseTool?.type === 'custom'
+      ? {
+          type: 'custom_tool_call',
+          call_id: tc.callId || `call_${randomUUID().slice(0, 8)}`,
+          name: responseTool.originalName || clientName,
+          ...(responseTool.namespace ? { namespace: responseTool.namespace } : {}),
+          input: '',
+          status: 'in_progress',
+        }
+      : {
+          type: 'function_call',
+          id: genFunctionCallId(),
+          call_id: tc.callId || `call_${randomUUID().slice(0, 8)}`,
+          name: responseTool?.originalName || clientName,
+          ...(responseTool?.namespace ? { namespace: responseTool.namespace } : {}),
+          arguments: '',
+          status: 'in_progress',
+        };
+    tc.item = item;
+    this.send('response.output_item.added', { output_index: tc.outputIndex, item });
+    // Arguments buffered while the name was unsettled belong to this item. Emit
+    // them now in their original chunk boundaries and mark them sent, or
+    // finishToolCalls would replay the same deltas a second time.
+    if (!tc.custom && !tc.suppressArgDeltas && tc.pendingArgDeltas?.length) {
+      for (const delta of tc.pendingArgDeltas) {
+        this.send('response.function_call_arguments.delta', {
+          item_id: item.id,
+          output_index: tc.outputIndex,
+          delta,
+        });
+      }
+      tc.pendingArgDeltas = [];
+      tc.emittedArgsLength = tc.argChunks.join('').length;
+    }
   }
 
   emitToolCallDelta(toolCall) {
@@ -851,77 +1265,81 @@ class ResponsesStreamTranslator {
         emittedArgsLength: 0,
         done: false,
         custom: false,
-        webSearch: false,
+        suppressArgDeltas: false,
         responseTool: null,
-        callId: toolCall.id || null,
+        callId: toolCall.id ? this.allocateCallId(toolCall.id) : null,
+        rawId: toolCall.id || null,
+        wireName: null,
         toolName: null,
+        pendingArgDeltas: [],
       };
       this.toolCalls.set(idx, existing);
     }
 
-    const ensureItem = (name, responseTool) => {
-      if (existing.item) return;
-      // A tool item is about to open, so any text already streamed belongs to a
-      // message item that ENDED before it. Sealing here — at the point the tool
-      // item is created, not in finish() — is what gives the post-tool text its own
-      // item and keeps output_index ascending in emission order.
-      this.sealMessageSegment();
-      const item = responseTool?.type === 'custom'
-        ? {
-            type: 'custom_tool_call',
-            call_id: existing.callId || `call_${randomUUID().slice(0, 8)}`,
-            name: responseTool.originalName || name,
-            ...(responseTool.namespace ? { namespace: responseTool.namespace } : {}),
-            input: '',
-            status: 'in_progress',
-          }
-        : responseTool?.type === 'web_search'
-          ? {
-              type: 'web_search_call',
-              id: existing.callId || `ws_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
-              status: 'in_progress',
-              action: { type: 'search', query: '' },
-            }
-          : {
-              type: 'function_call',
-              id: genFunctionCallId(),
-              call_id: existing.callId || `call_${randomUUID().slice(0, 8)}`,
-              name: responseTool?.originalName || name,
-              ...(responseTool?.namespace ? { namespace: responseTool.namespace } : {}),
-              arguments: '',
-              status: 'in_progress',
-            };
-      existing.item = item;
-      this.send('response.output_item.added', { output_index: existing.outputIndex, item });
-    };
-
-    if (toolCall.id) existing.callId = toolCall.id;
-    if (toolCall.function?.name) {
-      existing.toolName = toolCall.function.name;
-      const requestedTool = this.resolveRequestedTool(toolCall.function.name);
+    if (toolCall.id && toolCall.id !== existing.rawId) {
+      // The id is delivered once, possibly on a later delta than the first. A
+      // repeated id is the same call and must not be allocated twice.
+      existing.rawId = toolCall.id;
+      existing.callId = this.allocateCallId(toolCall.id) || existing.callId;
+    }
+    const nameFragment = toolCall.function?.name;
+    if (nameFragment) {
+      const rawName = nameFragment;
+      // function.name may be split across deltas. Accumulate idempotently: a
+      // repeated full name replaces the prefix, a prefix does not duplicate.
+      if (!existing.wireName) existing.wireName = rawName;
+      else if (rawName === existing.wireName || rawName.startsWith(existing.wireName)) existing.wireName = rawName;
+      else if (!existing.wireName.startsWith(rawName)) existing.wireName += rawName;
+      const wireName = existing.wireName;
+      const clientName = restoreToolName(wireName, this.toolNameMap) || wireName;
+      existing.toolName = clientName;
+      const requestedTool = this.resolveRequestedTool(wireName);
       const responseTool = requestedTool?.__response_tool || null;
       if (responseTool) {
         existing.responseTool = responseTool;
         existing.custom = responseTool.type === 'custom';
-        existing.webSearch = responseTool.type === 'web_search' || responseTool.type === 'tool_search';
+        // Only tool_search suppresses argument deltas. Hosted web_search never
+        // reaches the translator any more (rejected in responsesToChat).
+        existing.suppressArgDeltas = responseTool.type === 'tool_search';
       }
-      ensureItem(toolCall.function.name, existing.responseTool);
-      existing.item.name = existing.responseTool?.originalName || toolCall.function.name;
-      if (existing.responseTool?.namespace) existing.item.namespace = existing.responseTool.namespace;
+      if (this.knownToolName(wireName)) {
+        // The name is final: publish now. When an earlier fragment deferred the
+        // stream, this is the moment it ends — that is the whole point of the
+        // deferral, and leaving it until finish() froze the wire. A different
+        // call settling does NOT prove the deferred call's name is final, so it
+        // is published on its own (into the buffer, at its arrival position).
+        if (!this.deferred) this.openToolItem(existing);
+        else if (existing === this.deferred.tool) this.resolveDeferred();
+        else this.openToolItem(existing);
+      } else if (!this.deferred && !existing.item) {
+        // An unknown fragment must wait: publishing output_item.added with the
+        // fragment would be uncorrectable. Only the ITEM is deferred.
+        this.closeTextBeforeTool();
+        this.deferred = { entries: [], tool: existing };
+      }
     }
 
     const argsChunk = toolCall.function?.arguments ?? '';
-    if (argsChunk !== '') existing.argChunks.push(stringifyMaybe(argsChunk));
-    if (!existing.item && !existing.toolName) return;
-    ensureItem(existing.toolName || 'unknown', existing.responseTool);
-
-    if (existing.item.type === 'web_search_call') {
-      if (existing.callId) existing.item.id = existing.callId;
-    } else if (existing.callId) {
-      existing.item.call_id = existing.callId;
+    if (argsChunk !== '') {
+      const chunk = stringifyMaybe(argsChunk);
+      existing.argChunks.push(chunk);
+      // Only an UNPUBLISHED item needs its arguments held; a published one can
+      // take them into the buffer in arrival order.
+      if (this.deferred && !existing.item) existing.pendingArgDeltas.push(chunk);
     }
+    // Arguments never arrive before the name is complete, so an args-only delta
+    // proves the accumulated name is final even when it matches no declared tool.
+    // Without this, an undeclared split name would still freeze until finish().
+    if (this.deferred && !nameFragment && existing === this.deferred.tool) this.resolveDeferred();
+    // A delta that only added a name fragment leaves the name pending: the item
+    // must not be published yet. Anything it carried was buffered above.
+    if (this.deferred && !existing.item) return;
+    if (!existing.item && !existing.toolName) return;
+    if (!existing.item) this.openToolItem(existing);
 
-    if (!existing.custom && !existing.webSearch) {
+    if (existing.callId) existing.item.call_id = existing.callId;
+
+    if (!existing.custom && !existing.suppressArgDeltas) {
       const allArgs = existing.argChunks.join('');
       const pendingArgs = allArgs.slice(existing.emittedArgsLength);
       if (pendingArgs) {
@@ -940,17 +1358,10 @@ class ResponsesStreamTranslator {
     for (const tc of sorted) {
       if (tc.done) continue;
       tc.done = true;
-      if (!tc.item) {
-        tc.item = {
-          type: 'function_call',
-          id: genFunctionCallId(),
-          call_id: tc.callId || `call_${randomUUID().slice(0, 8)}`,
-          name: tc.toolName || 'unknown',
-          arguments: '',
-          status: 'in_progress',
-        };
-        this.send('response.output_item.added', { output_index: tc.outputIndex, item: tc.item });
-      }
+      // A call with no name at all reaches here (every named call is published by
+      // resolveDeferred before this). `tc.callId` was sanitized when the id
+      // arrived, so no second clientToolId pass is needed.
+      if (!tc.item) this.openToolItem(tc, { seal: false });
       const args = tc.argChunks.join('');
       if (tc.custom) {
         const parsed = safeJsonParse(args);
@@ -962,25 +1373,33 @@ class ResponsesStreamTranslator {
         this.outputItems[tc.outputIndex] = complete;
         continue;
       }
-      if (tc.item.type === 'web_search_call') {
-        const parsed = safeJsonParse(args) || {};
-        const complete = {
-          ...tc.item,
-          status: 'completed',
-          action: {
-            type: 'search',
-            query: typeof parsed.query === 'string' ? parsed.query : args,
-          },
-        };
-        this.send('response.output_item.done', { output_index: tc.outputIndex, item: complete });
-        this.outputItems[tc.outputIndex] = complete;
-        continue;
-      }
       if (tc.item.type === 'function_call' && tc.item.name === 'tool_search') {
         const complete = { ...tc.item, arguments: args, status: 'completed' };
         this.send('response.output_item.done', { output_index: tc.outputIndex, item: complete });
         this.outputItems[tc.outputIndex] = complete;
         continue;
+      }
+      const pendingDeltas = tc.pendingArgDeltas || [];
+      if (pendingDeltas.length) {
+        for (const delta of pendingDeltas) {
+          this.send('response.function_call_arguments.delta', {
+            item_id: tc.item.id,
+            output_index: tc.outputIndex,
+            delta,
+          });
+        }
+        tc.pendingArgDeltas = [];
+        tc.emittedArgsLength = args.length;
+      } else {
+        const pendingArgs = args.slice(tc.emittedArgsLength || 0);
+        if (pendingArgs) {
+          this.send('response.function_call_arguments.delta', {
+            item_id: tc.item.id,
+            output_index: tc.outputIndex,
+            delta: pendingArgs,
+          });
+          tc.emittedArgsLength = args.length;
+        }
       }
       this.send('response.function_call_arguments.done', {
         item_id: tc.item.id,
@@ -1019,9 +1438,25 @@ class ResponsesStreamTranslator {
   }
 
   /**
+   * V-12: the exact ordered output items this turn published, ready to persist.
+   *
+   * This is what the response store keeps so GET can replay the SAME items
+   * (ids, types, call_ids, custom inputs, namespaces) instead of regenerating
+   * them from a lossy chat-shaped summary, and so the next chained turn can be
+   * rebuilt in the order the client actually received.
+   */
+  get committedItems() {
+    return this.outputItems.filter(Boolean).map(item => ({ ...item }));
+  }
+
+  /**
    * Completed tool calls in OpenAI chat shape, for the response store: the next
    * turn must see the same assistant tool_calls the client did, or the chained
    * conversation loses the call/result pairing.
+   *
+   * V-12: kept for the LEGACY flat fallback only. New commits use
+   * `historyFromResponseItems(committedItems)`, which also carries custom calls,
+   * their order, and the wire name.
    */
   get committedToolCalls() {
     return this.outputItems.filter(Boolean)
@@ -1035,11 +1470,20 @@ class ResponsesStreamTranslator {
 
   finish() {
     if (this.finished) return;
+    this.sseFramer.end();
+    if (this.finished) return;
     this.finished = true;
     this.start();
+    // A name that never settled (no args, no text, no second fragment) is still
+    // final at end of stream. Publish it here so its `added` precedes its `done`
+    // and the buffered events keep their arrival order.
+    this.resolveDeferred();
     this.finishReasoning();
     this.finishToolCalls();
-    if (this.messageStarted || this.text) this.finishMessage();
+    // `segmentText`, not `text`: the whole-turn accumulator is non-empty after any
+    // pre-tool narration, so this gate closed an EMPTY trailing message item on
+    // every turn that narrated and then called a tool.
+    if (this.messageStarted || this.segmentText) this.finishMessage();
     // Same truncation rule as the non-streaming path (see chatToResponse):
     // 'incomplete' is reserved for length / content_filter, everything else closes
     // as 'completed'.
@@ -1089,6 +1533,7 @@ class ResponsesStreamTranslator {
     // Marks the turn as NOT committable to the response store: a failed stream
     // has no complete assistant reply to chain from.
     this.failed = true;
+    this.deferred = null;
     this.start();
     // Resolve the authoritative {status,type} from the DEVIN_CONNECT classification
     // first, exactly like messages.js and gemini.js do. Reading only err.type
@@ -1107,35 +1552,100 @@ class ResponsesStreamTranslator {
           // 就地归一化内部词到官方 OpenAI type。
           type: normalizeOpenAIErrorType(http.type, http.status),
           code: err?.code || null,
+          ...(Number.isFinite(Number(err?.retry_after_ms)) ? { retry_after_ms: Number(err.retry_after_ms) } : {}),
         },
       },
     });
   }
 
   feed(rawChunk) {
-    this.pendingSseBuf += typeof rawChunk === 'string' ? rawChunk : rawChunk.toString('utf8');
-    let idx;
-    while ((idx = this.pendingSseBuf.indexOf('\n\n')) !== -1) {
-      const frame = this.pendingSseBuf.slice(0, idx);
-      this.pendingSseBuf = this.pendingSseBuf.slice(idx + 2);
-      const lines = frame.split('\n');
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const payload = line.slice(6);
-        if (payload === '[DONE]') continue;
-        try {
-          const parsed = JSON.parse(payload);
-          if (parsed.error) {
-            this.error(parsed.error);
-          } else {
-            this.processChunk(parsed);
-          }
-        } catch (e) {
-          log.warn(`Responses SSE parse error: ${e.message}`);
-        }
+    this.sseFramer.push(rawChunk);
+    // V-08: the verdict the Chat producer reads. `push` dispatches every frame
+    // synchronously, so `egressOk` is the state AFTER this chunk was emitted —
+    // false means the socket reported backpressure and has not drained yet.
+    return this.egressOk;
+  }
+
+  handleSseFrame({ data }) {
+    if (!data || data === '[DONE]') return;
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.error) {
+        this.error(parsed.error);
+      } else {
+        this.processChunk(parsed);
       }
+    } catch (e) {
+      log.warn(`Responses SSE parse error: ${e.message}`);
     }
   }
+}
+
+/**
+ * V-12 (KH-009/KH-020/KH-045): rebuild the internal Chat history from the
+ * response's OWN ordered items.
+ *
+ * The old commit flattened a streamed turn into ONE assistant message whose
+ * `content` was every text segment concatenated and whose `tool_calls` came
+ * last. A turn that produced text → call → text therefore reached the next
+ * chained request as "BEFORE AFTER" followed by the call, i.e. in an order the
+ * client never saw. Custom calls were dropped entirely (the getter only kept
+ * `function_call`), and namespaced calls were stored under the CLIENT name while
+ * `tools[]` declared the WIRE name — so the upstream saw a call to a tool it had
+ * never been offered.
+ *
+ * This walks the items in output order and emits one assistant message per run:
+ * text runs keep their position, each call keeps its own call_id and its WIRE
+ * name. Consecutive text-only assistant messages are merged by the Connect
+ * encoder (and concatenated by Cascade), so the wire shape for the ordinary
+ * single-text turn is unchanged.
+ */
+export function historyFromResponseItems(items, toolNameMap = null) {
+  const out = [];
+  let textRun = '';
+  let pendingCalls = [];
+  const flushText = () => {
+    if (!textRun) return;
+    out.push({ role: 'assistant', content: textRun });
+    textRun = '';
+  };
+  const flushCalls = () => {
+    if (!pendingCalls.length) return;
+    // Consecutive calls are ONE assistant turn with several tool_calls — the
+    // OpenAI shape for parallel calls, and the shape the flat commit always
+    // produced. Splitting them into one message per call would build a longer
+    // same-source run than the upstream validator tolerates.
+    out.push({ role: 'assistant', content: null, tool_calls: pendingCalls });
+    pendingCalls = [];
+  };
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'message') {
+      flushCalls();
+      textRun += responseItemText(item);
+      continue;
+    }
+    if (item.type !== 'function_call' && item.type !== 'custom_tool_call') continue;
+    flushText();
+    const args = item.type === 'custom_tool_call'
+      ? JSON.stringify({ input: item.input ?? '' })
+      : (item.arguments || '');
+    pendingCalls.push({
+      id: item.call_id || item.id || `call_${out.length}`,
+      type: 'function',
+      function: { name: responseItemToolName(item, toolNameMap), arguments: args },
+    });
+  }
+  flushText();
+  flushCalls();
+  return out;
+}
+
+/** Concatenated visible text of one message item (Responses `content` parts). */
+function responseItemText(item) {
+  if (typeof item?.text === 'string') return item.text;
+  if (!Array.isArray(item?.content)) return '';
+  return item.content.map(part => (typeof part === 'string' ? part : (part?.text || ''))).join('');
 }
 
 function createCaptureRes(translator, realRes) {
@@ -1144,6 +1654,13 @@ function createCaptureRes(translator, realRes) {
     const cbs = listeners.get(event) || [];
     for (const cb of cbs) { try { cb(); } catch {} }
   };
+  // V-08: the producer (chat.js) waits for 'drain' on THIS fake response. Without
+  // the forward, its bounded writer would park on a signal that can never arrive
+  // — the real socket's drain is the only one that exists.
+  if (realRes?.on) {
+    realRes.on('drain', () => fire('drain'));
+    realRes.on('error', () => fire('error'));
+  }
   return {
     writableEnded: false,
     headersSent: false,
@@ -1154,7 +1671,9 @@ function createCaptureRes(translator, realRes) {
         try { realRes.write(str); } catch {}
       }
       translator.feed(chunk);
-      return true;
+      // Return the REAL socket's verdict. A constant `true` (the old shape) kept
+      // chat.js's bounded writer permanently disarmed on every translated route.
+      return translator.egressOk;
     },
     end(chunk) {
       if (this.writableEnded) return;
@@ -1293,6 +1812,27 @@ function assistantAnsweringLastUserTurn(messages) {
 
 function storedResponseBody(responseId, entry) {
   const assistant = assistantAnsweringLastUserTurn(entry.messages) || null;
+  // V-12 (KH-045): when the creating turn persisted its exact ordered items,
+  // replay THOSE. Rebuilding from the flat chat message re-typed custom calls as
+  // `function_call`, dropped namespaces, and minted fresh item ids on every read
+  // — a GET that did not match the POST it was retrieving.
+  const persistedItems = Array.isArray(assistant?.__responses_items) && assistant.__responses_items.length
+    ? assistant.__responses_items
+    : null;
+  if (persistedItems) {
+    const output = persistedItems.map(item => ({ ...item }));
+    return {
+      object: 'response',
+      id: responseId,
+      created_at: Math.floor((entry.createdAt || Date.now()) / 1000),
+      status: entry.status || 'completed',
+      ...(entry.incompleteReason ? { incomplete_details: { reason: entry.incompleteReason } } : {}),
+      model: entry.model || null,
+      ...(entry.metadata ? { metadata: entry.metadata } : {}),
+      output,
+      output_text: output.filter(i => i.type === 'message').map(responseItemText).join(''),
+    };
+  }
   // The store holds Chat-shaped messages, whose content may be a PARTS ARRAY (the
   // Responses `input` items are normalized that way). Passing an array straight into
   // output_text produced a structurally invalid body — `text` held an array instead
@@ -1312,7 +1852,10 @@ function storedResponseBody(responseId, entry) {
   const answer = text.replace(/^\[\.\.\. \d+ earlier message\(s\) dropped by the response store[^\]]*\]\n\n/, '');
   const output = [];
   if (answer) output.push(textMessageItem(genMessageId(), answer));
-  for (const tc of assistant?.tool_calls || []) output.push(functionCallItem(tc));
+  // A stored turn may predate the egress dedupe (or come from a non-stream
+  // response): never hand two items the same call_id on retrieval either.
+  const allocateCallId = toolHygieneEnabled() ? createToolIdAllocator() : null;
+  for (const tc of assistant?.tool_calls || []) output.push(functionCallItem(tc, 'completed', [], null, allocateCallId));
   return {
     object: 'response',
     id: responseId,
@@ -1327,6 +1870,9 @@ function storedResponseBody(responseId, entry) {
       ? { incomplete_details: { reason: entry.incompleteReason } }
       : {}),
     model: entry.model || null,
+    // The tag the CREATING request attached. Absent when it had none, for the
+    // same reason the POST omits it: `{}` would be an assertion the caller made.
+    ...(entry.metadata ? { metadata: entry.metadata } : {}),
     output,
     output_text: answer,
     // usage is OPTIONAL on the Response model in both official SDKs, and the store
@@ -1410,8 +1956,20 @@ export async function handleResponses(body, deps = {}) {
   const responseId = genResponseId();
   const requestedModel = body.model || 'claude-sonnet-4.6';
   let chatBody;
+  let toolNameMap = null;
+  let responseMetadata = null;
   try {
     chatBody = responsesToChat(body);
+    toolNameMap = chatBody.__toolNameMap || null;
+    delete chatBody.__toolNameMap;
+    // The tag the caller attached, validated by responsesToChat. Stripped here so
+    // it never reaches the upstream request body: it is a response-side echo, not
+    // a chat parameter.
+    responseMetadata = chatBody.__responseMetadata || null;
+    if ('__responseMetadata' in chatBody) {
+      chatBody = { ...chatBody };
+      delete chatBody.__responseMetadata;
+    }
   } catch (err) {
     return {
       status: 400,
@@ -1419,6 +1977,8 @@ export async function handleResponses(body, deps = {}) {
         error: {
           message: err?.message || 'Invalid Responses request',
           type: 'invalid_request_error',
+          ...(err?.param ? { param: err.param } : {}),
+          ...(err?.code ? { code: err.code } : {}),
         },
       },
     };
@@ -1505,13 +2065,65 @@ export async function handleResponses(body, deps = {}) {
     }
   }
 
+  if (toolHygieneEnabled()
+    && (chatBody.messages || []).some((m) => m?.role === 'assistant')) {
+    chatBody = {
+      ...chatBody,
+      messages: normalizeHistoryTail(
+        normalizeToolIdsInMessages(chatBody.messages || [], { seed: body.previous_response_id || 'responses' }),
+        { fold: true },
+      ),
+    };
+  }
+
+  // P-03: the Devin Connect wire has no file/document field. responsesToChat
+  // deliberately preserves typed file blocks for Cascade's image.js extractor,
+  // so the backend-aware rejection belongs here: check the merged conversation
+  // before dispatch, account acquisition, or any socket, and return 400 naming
+  // `input`. Checking AFTER the previous_response_id merge also covers a stored
+  // history written before this guard existed.
+  if (selectBackend({ modelInfo: null }).flow === 'devin_connect') {
+    const filePart = findFilePartInMessages(chatBody.messages || []);
+    if (filePart) {
+      const err = unsupportedFilePartError(filePart, { param: 'input' });
+      return {
+        status: 400,
+        body: {
+          error: {
+            message: err.message,
+            type: 'invalid_request_error',
+            param: err.param,
+            code: err.code,
+          },
+        },
+      };
+    }
+  }
+
   // The conversation to persist for the NEXT turn: everything the upstream saw.
   const priorMessages = chatBody.messages || [];
+  // V-12: the item sidecar is THIS module's bookkeeping (exact ordered output
+  // items for GET replay and ordered chaining). It must never reach the upstream
+  // request body, so every dispatch below uses this stripped copy while the
+  // store keeps the annotated one.
+  const dispatchMessages = priorMessages.map((m) => {
+    if (!m || typeof m !== 'object' || !('__responses_items' in m)) return m;
+    const { __responses_items, ...rest } = m;
+    return rest;
+  });
   // `terminal` carries the status this request REPORTED to the client, so a later
   // GET /v1/responses/{id} answers with the same thing instead of assuming
   // 'completed'. Defaults to a clean completion when the caller passes nothing.
-  const commit = (assistantMessage, terminal = {}) => {
+  // `servedModel` is what the POST reported as response.model (the served name,
+  // not the raw request string) so a later retrieval cannot contradict it.
+  const commit = (assistantMessage, terminal = {}, servedModel = requestedModel, items = null) => {
     if (!isResponseStoreEnabled() || !chainable) return;
+    // A06/KH-018: an upstream-truncated turn is not a completed assistant
+    // reply. Committing it would poison the next request's context with a
+    // half answer the client only saw as `incomplete` (or never received).
+    // A LEGITIMATE length/content_filter truncation is still chainable — only
+    // `upstream_incomplete` (the upstream never finished) is excluded.
+    if (terminal.incompleteReason === 'upstream_incomplete') return;
     try {
       const stored = putResponse(
         responseId,
@@ -1519,14 +2131,26 @@ export async function handleResponses(body, deps = {}) {
           const base = instructionsMsg
             ? priorMessages.filter(m => m !== instructionsMsg)
             : priorMessages;
+          // V-12: prefer the turn's ORDERED items. The flat assistant message is
+          // only the fallback (no items available, or a turn that produced
+          // nothing the item list could express). The sidecar on the last
+          // assistant message is what GET replays and what keeps the exact item
+          // identity across turns; it is stripped before anything is dispatched
+          // upstream.
+          const ordered = items?.length ? historyFromResponseItems(items, toolNameMap) : [];
+          if (ordered.length) {
+            ordered[ordered.length - 1] = { ...ordered[ordered.length - 1], __responses_items: items };
+            return [...base, ...ordered];
+          }
           return assistantMessage ? [...base, assistantMessage] : base;
         })(),
         callerKey,
         {
-          model: requestedModel,
+          model: servedModel || requestedModel,
           store: body.store,
           status: terminal.status || 'completed',
           incompleteReason: terminal.incompleteReason || null,
+          metadata: responseMetadata,
         },
       );
       // putResponse's return value used to be dropped, so a refusal to store was
@@ -1548,10 +2172,10 @@ export async function handleResponses(body, deps = {}) {
   };
 
   if (!body.stream) {
-    const result = await chatHandler({ ...chatBody, stream: false, __route: 'responses' }, context);
+    const result = await chatHandler({ ...chatBody, messages: dispatchMessages, stream: false, __route: 'responses' }, context);
     if (result.status !== 200) return result;
     const msg = result.body?.choices?.[0]?.message;
-    const responseBody = chatToResponse(result.body, requestedModel, responseId, genMessageId(), requestedTools);
+    const responseBody = chatToResponse(result.body, requestedModel, responseId, genMessageId(), requestedTools, toolNameMap, responseMetadata);
     // Record the status THIS response reported, so retrieval agrees with it.
     commit(msg ? {
       role: 'assistant',
@@ -1560,7 +2184,7 @@ export async function handleResponses(body, deps = {}) {
     } : null, {
       status: responseBody.status,
       incompleteReason: responseBody.incomplete_details?.reason || null,
-    });
+    }, responseBody.model, responseBody.output);
     return { status: 200, body: responseBody };
   }
 
@@ -1570,7 +2194,7 @@ export async function handleResponses(body, deps = {}) {
   // Responses client sent — the Responses API reports usage on its own terminal
   // event, not via an OpenAI-style stream_options toggle.
   const streamResult = await chatHandler(
-    { ...chatBody, stream: true, __route: 'responses', stream_options: { ...(chatBody.stream_options || {}), include_usage: true } },
+    { ...chatBody, messages: dispatchMessages, stream: true, __route: 'responses', stream_options: { ...(chatBody.stream_options || {}), include_usage: true } },
     context,
   );
   if (!streamResult.stream) return streamResult;
@@ -1585,7 +2209,7 @@ export async function handleResponses(body, deps = {}) {
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new ResponsesStreamTranslator(realRes, responseId, requestedModel, requestedTools);
+      const translator = new ResponsesStreamTranslator(realRes, responseId, requestedModel, requestedTools, toolNameMap, responseMetadata);
       const captureRes = createCaptureRes(translator, realRes);
 
       realRes.on('close', () => {
@@ -1612,7 +2236,10 @@ export async function handleResponses(body, deps = {}) {
         // `aborted` is the case `failed` cannot see: a stream that ended with no
         // (real) terminal chunk at all raises no error, so it reached here looking
         // clean and its half answer was stored as the next turn's context.
-        if (translator.finished && !translator.failed && !translator.aborted) {
+        // `clientGone` (V-08): a drain timeout means the client stopped reading,
+        // so the half turn it never received must not become the next turn's
+        // context either.
+        if (translator.finished && !translator.failed && !translator.aborted && !translator.clientGone) {
           // Same as the non-streaming path: persist the status the client was told,
           // so a later retrieval does not report a truncated turn as completed.
           const reason = translator.streamFinishReason;
@@ -1625,7 +2252,7 @@ export async function handleResponses(body, deps = {}) {
               status: 'incomplete',
               incompleteReason: reason === 'length' ? 'max_output_tokens' : 'content_filter',
             }
-            : { status: 'completed' });
+            : { status: 'completed' }, translator.model, translator.committedItems);
         }
       } catch (e) {
         log.error(`Responses stream error: ${e.message}`);
@@ -1653,7 +2280,15 @@ export async function handleResponses(body, deps = {}) {
       // exists to plug, on the failure side. chat.js's post-error path writes an
       // explicit error chunk before `[DONE]`; here the failure is already in the
       // terminal event, so the sentinel must simply not be written.
-      if (translator.finished && !translator.failed && !realRes.writableEnded) realRes.write('data: [DONE]\n\n');
+      // A06/KH-024: `aborted` is an upstream truncation, not a clean end. A
+      // relay that sees [DONE] treats the stream as whole, which would erase
+      // the only failure signal the Responses client got.
+      // V-08: the sentinel is part of the same sequential emission — wait out any
+      // outstanding drain so it cannot overtake a frame the socket has not taken.
+      if (translator.finished && !translator.failed && !translator.aborted && !realRes.writableEnded) {
+        await translator.settleEgress();
+        translator.writeRaw('data: [DONE]\n\n');
+      }
       if (!realRes.writableEnded) realRes.end();
     },
   };

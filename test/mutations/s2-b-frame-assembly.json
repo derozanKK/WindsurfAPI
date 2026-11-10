@@ -4,13 +4,13 @@
     "test/s2-b-grpc.test.js",
     "test/s2-b-grpc-limit.test.js"
   ],
-  "expectBaselinePass": 23,
+  "expectBaselinePass": 34,
   "mutations": [
     {
-      "name": "B-length: read the Connect length little-endian",
+      "name": "B-length: accept a frame one byte past the advertised ceiling",
       "file": "src/connect.js",
-      "anchor": "      for (let i = 1; i < 5; i++) len = len * 256 + this._byteAt(i);",
-      "replacement": "      for (let i = 1; i < 5; i++) len += this._byteAt(i) * 2 ** (8 * (i - 1));",
+      "anchor": "      if (len > MAX_FRAME_SIZE) {",
+      "replacement": "      if (len > MAX_FRAME_SIZE + 1) {",
       "expectCaught": true
     },
     {
@@ -56,10 +56,10 @@
       "expectCaught": true
     },
     {
-      "name": "B-inflate: remove the decompressed-size ceiling",
+      "name": "B-inflate: tighten the decompressed-size ceiling by one byte",
       "file": "src/connect.js",
       "anchor": "        try { payload = gunzipSync(payload, { maxOutputLength: MAX_FRAME_SIZE }); }",
-      "replacement": "        try { payload = gunzipSync(payload); }",
+      "replacement": "        try { payload = gunzipSync(payload, { maxOutputLength: MAX_FRAME_SIZE - 1 }); }",
       "expectCaught": true
     }
   ]

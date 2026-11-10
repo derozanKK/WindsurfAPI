@@ -26,7 +26,7 @@ import https from 'https';
 import { randomBytes } from 'crypto';
 import { log } from './config.js';
 import { parseFields, writeStringField, writeMessageField, writeVarintField } from './proto.js';
-import { getConnectToken, classifyUpstreamError } from './devin-connect.js';
+import { getConnectToken, classifyUpstreamError, MAX_ERROR_BODY_BYTES, ERROR_BODY_TRUNCATION_MARKER, createBoundedBodyAccumulator } from './devin-connect.js';
 
 // Transport seam: defaults to https.request. Swappable in tests so the non-200
 // classification path can be exercised without a real socket. Mirrors the
@@ -99,12 +99,27 @@ function unaryCall(path, token, { signal, timeoutMs = 30000, extraBody } = {}) {
       },
       signal,
     }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      // Bounded read: the response is attacker-controlled and its body is
+      // decoded for classification. Reading it unbounded is the availability
+      // bug createBoundedBodyAccumulator exists for — and on this path it has
+      // already taken the process down once: raw.toString('utf8') ran BEFORE
+      // the 200-byte slice, so a 600MiB body threw ERR_STRING_TOO_LONG inside
+      // this 'end' listener, which nothing catches.
+      const buffer = createBoundedBodyAccumulator();
+      res.on('data', buffer.onData);
       res.on('end', () => {
-        const raw = Buffer.concat(chunks);
+        const { raw, truncated } = buffer.finish();
         if (res.statusCode !== 200) {
-          const text = raw.toString('utf8').slice(0, 200);
+          // Slice BEFORE stringifying: only the classification window is
+          // decoded, never the whole body. The window is 200 bytes (error
+          // bodies are ASCII JSON/text, so bytes and characters coincide), and
+          // the truncation marker is appended AFTER it so an operator can tell
+          // a clipped body from a short one.
+          const text = raw.subarray(0, 200).toString('utf8')
+            + (truncated ? ERROR_BODY_TRUNCATION_MARKER : '');
+          if (truncated) {
+            log.warn(`[devin-connect] upstream ${res.statusCode} error body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated for classification`);
+          }
           // Transient-first: the upstream wraps capacity ("high demand") and
           // backend ("internal error occurred (trace ID: ...)") faults inside a
           // 401/403 auth-shell on the unary probe path too — not just on
@@ -127,6 +142,14 @@ function unaryCall(path, token, { signal, timeoutMs = 30000, extraBody } = {}) {
           } catch { /* text body */ }
           const { code, message } = classifyUpstreamError(text, upstreamCode, res.statusCode);
           reject(Object.assign(new Error(`${path} HTTP ${res.statusCode}: ${message}`), { code, status: res.statusCode }));
+          return;
+        }
+        if (truncated) {
+          // A 200 body past the ceiling cannot be the single protobuf response
+          // this path expects; fail instead of decoding a prefix as if it were
+          // the whole message.
+          log.warn(`[devin-connect] ${path} response body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated`);
+          reject(Object.assign(new Error(`${path} response body exceeded ${MAX_ERROR_BODY_BYTES} bytes; truncated`), { code: 'UPSTREAM_ERROR', status: res.statusCode }));
           return;
         }
         resolve(raw);
@@ -206,17 +229,21 @@ export function decodePlanName(raw) {
 /**
  * Decode GetUserStatusResponse → full billing ledger.
  *
- * Field spec (calibrated 2026-07-07 against live Teams paid account):
+ * Field spec:
  *   #1.13.16 = balance (varint, micro-dollar — divide by 1e6 for USD)
- *   #1.13.17 = billing period start (varint, epoch seconds)
- *   #1.13.18 = billing period end (varint, epoch seconds)
- *   #1.13.1.21 (repeated) = per-model credit rate table (fixed32 f32, paired to catalog order)
+ *   #1.13.17 = daily quota reset timestamp (varint, epoch seconds)
+ *   #1.13.18 = weekly quota reset timestamp (varint, epoch seconds)
+ *   #1.13.1.21 (repeated) = legacy per-model credit rate table (fixed32 f32, paired to catalog order)
+ *   #1.33.1 (repeated) = per-model credit rate table (model_uid #22, credit_multiplier #3 float)
  *
- * Returns { plan, isPaid, balance, balanceUnit, periodStart, periodEnd, rateTable }.
- * All billing fields are optional — older/free accounts may not carry them. Returns
- * null for missing fields (no throw). Rate table is { selector → creditFloat } where
- * selectors come from pairing with the live catalog (requires separate fetchCatalog
- * call; this decode is catalog-agnostic).
+ * Returns { plan, isPaid, balance, balanceUnit, dailyQuotaResetAt, weeklyQuotaResetAt,
+ * periodStart, periodEnd, rateTable }. periodStart/periodEnd are deprecated aliases
+ * of dailyQuotaResetAt/weeklyQuotaResetAt — they are quota reset timestamps, NOT a
+ * billing period. All billing fields are optional — older/free accounts may not
+ * carry them. Returns null for missing fields (no throw). Rate table is
+ * { selector → creditFloat }: the current shape is keyed by each config's own
+ * model_uid, the legacy shape by pairing with the live catalog (requires a
+ * separate fetchCatalog call; this decode is catalog-agnostic).
  *
  * @param {Buffer} raw  GetUserStatusResponse wire bytes
  * @param {Array<{selector:string}>} [catalog]  live catalog from fetchCatalog (for
@@ -226,9 +253,11 @@ export function decodePlanName(raw) {
  *   plan: string,
  *   isPaid: boolean,
  *   balance: number|null,
- *   balanceUnit: 'micro-usd'|null,
- *   periodStart: Date|null,
- *   periodEnd: Date|null,
+ *   balanceUnit: 'usd'|null,
+ *   dailyQuotaResetAt: number|null,
+ *   weeklyQuotaResetAt: number|null,
+ *   periodStart: number|null,
+ *   periodEnd: number|null,
  *   rateTable: Object<string,number>|Array<number>|null
  * }}
  */
@@ -238,8 +267,10 @@ export function decodeUserStatusFull(raw, catalog = null) {
     isPaid: false,
     balance: null,
     balanceUnit: null,
-    periodStart: null,
-    periodEnd: null,
+    dailyQuotaResetAt: null,
+    weeklyQuotaResetAt: null,
+    periodStart: null, // deprecated alias of dailyQuotaResetAt
+    periodEnd: null,   // deprecated alias of weeklyQuotaResetAt
     rateTable: null,
   };
 
@@ -250,6 +281,28 @@ export function decodeUserStatusFull(raw, catalog = null) {
 
     if (field1) {
       const lvl1 = parseFields(field1.value);
+
+      // Rate table, current shape: UserStatus#33 (cascade_model_config_data)
+      // carries client_model_configs[] with model_uid (#22) + credit_multiplier
+      // (#3, float). PlanInfo#21 is reserved on target servers, so read #33
+      // first and keep the #21 path below as the fallback for older servers.
+      const cmcField = lvl1.find((x) => x.field === 33 && x.wireType === 2);
+      if (cmcField) {
+        try {
+          const cmc = parseFields(cmcField.value);
+          const configs = cmc.filter((x) => x.field === 1 && x.wireType === 2);
+          const table = {};
+          for (const cfg of configs) {
+            const cf = parseFields(cfg.value);
+            const selector = strField(cf, 22);
+            const cm = cf.find((x) => x.field === 3 && x.wireType === 5);
+            if (!selector || !cm || cm.value.length !== 4) continue;
+            table[selector] = cm.value.readFloatLE(0);
+          }
+          if (Object.keys(table).length > 0) result.rateTable = table;
+        } catch { /* fall through to the legacy #21 path */ }
+      }
+
       // #1.13 = billing structure
       const billingField = lvl1.find((x) => x.field === 13 && x.wireType === 2);
       if (billingField) {
@@ -260,19 +313,32 @@ export function decodeUserStatusFull(raw, catalog = null) {
         // is already USD and `balanceUnit` reflects that — consumers must NOT
         // divide by 1e6 again.
         const balanceMicro = intField(billing, 16);
-        if (balanceMicro != null) {
+        // uint64 -1 is a common "unknown/unlimited" sentinel on the wire; read as
+        // an unsigned varint it becomes 1.8e19 micro-dollars and the dashboard
+        // rendered $18,446,744,073,709.43. Only a plausible on-demand balance
+        // (0 .. $1,000,000 in micro-dollars) is real; everything else is unknown.
+        if (balanceMicro != null && Number.isFinite(balanceMicro)
+            && balanceMicro >= 0 && balanceMicro <= 1e12) {
           result.balance = balanceMicro / 1e6;
           result.balanceUnit = 'usd';
           result.balanceMicro = balanceMicro; // raw micro-usd, for callers that want it
         }
 
-        // Period: #1.13.17/18 are epoch SECONDS on the wire. Return them as
-        // millisecond timestamps (numbers) — JSON-safe (no Date→string round
-        // trip through accounts.json), and directly usable by `new Date(ms)`.
-        const periodStartEpoch = intField(billing, 17);
-        const periodEndEpoch = intField(billing, 18);
-        if (periodStartEpoch != null) result.periodStart = periodStartEpoch * 1000;
-        if (periodEndEpoch != null) result.periodEnd = periodEndEpoch * 1000;
+        // Quota resets: #1.13.17/18 are the daily/weekly quota reset
+        // timestamps (epoch SECONDS on the wire), NOT a billing period. Return
+        // them as millisecond numbers — JSON-safe, directly usable by
+        // `new Date(ms)`. periodStart/periodEnd keep the same values for
+        // existing consumers (deprecated aliases; see the header note).
+        const dailyResetEpoch = intField(billing, 17);
+        const weeklyResetEpoch = intField(billing, 18);
+        if (dailyResetEpoch != null) {
+          result.dailyQuotaResetAt = dailyResetEpoch * 1000;
+          result.periodStart = result.dailyQuotaResetAt;
+        }
+        if (weeklyResetEpoch != null) {
+          result.weeklyQuotaResetAt = weeklyResetEpoch * 1000;
+          result.periodEnd = result.weeklyQuotaResetAt;
+        }
 
         // #1.13.1 = plan detail
         const planField = billing.find((x) => x.field === 1 && x.wireType === 2);
@@ -286,9 +352,10 @@ export function decodeUserStatusFull(raw, catalog = null) {
             result.isPaid = result.plan !== 'free' && result.plan !== '';
           }
 
-          // #1.13.1.21 (repeated) = credit rate table (fixed32 f32)
+          // #1.13.1.21 (repeated) = legacy credit rate table (fixed32 f32) —
+          // only consulted when the #33 table above was absent (fallback path).
           const rateEntries = plan.filter((x) => x.field === 21 && x.wireType === 2);
-          if (rateEntries.length > 0) {
+          if (rateEntries.length > 0 && !result.rateTable) {
             const rates = rateEntries.map((entry) => {
               try {
                 const fields = parseFields(entry.value);
@@ -359,8 +426,9 @@ export async function fetchCatalog({ token, signal, env = process.env } = {}) {
  * Fetch the account's plan/tier name for a session token.
  *
  * Returns the full billing ledger when available (paid accounts): { plan, isPaid,
- * balance, balanceUnit, periodStart, periodEnd, rateTable }. Free/old accounts
- * only have plan + isPaid. All billing fields are nullable (no throw on missing).
+ * balance, balanceUnit, dailyQuotaResetAt, weeklyQuotaResetAt, periodStart,
+ * periodEnd, rateTable }. Free/old accounts only have plan + isPaid. All billing
+ * fields are nullable (no throw on missing).
  *
  * @param {object} [opts]
  * @param {string} [opts.token]  session token; defaults to env (getConnectToken)
@@ -372,8 +440,10 @@ export async function fetchCatalog({ token, signal, env = process.env } = {}) {
  *   isPaid: boolean,
  *   balance?: number,
  *   balanceUnit?: string,
- *   periodStart?: Date,
- *   periodEnd?: Date,
+ *   dailyQuotaResetAt?: number,
+ *   weeklyQuotaResetAt?: number,
+ *   periodStart?: number,  // deprecated alias of dailyQuotaResetAt
+ *   periodEnd?: number,    // deprecated alias of weeklyQuotaResetAt
  *   rateTable?: Object|Array
  * }>}
  */
@@ -436,31 +506,30 @@ export async function checkSessionLiveness({ token, signal, env = process.env } 
 // issues GetChatMessage with the RESOLVED model_uid. WindsurfAPI never made that
 // hop, so every router model was rejected upstream (D4 §6).
 //
-// Wire calibration status (recon P2-apiserver-methods-fields.md §1):
-//   - method path + ResponseMsg shape (AssignModelResponse{ assignment },
-//     ModelAssignment{ model_uid, assignment_jwt, harness_uids }) are VERIFIED
-//     from binary strings.
-//   - all TAG NUMBERS are UNKNOWN (prost left no constants). Same situation as
-//     billing/vision: we use the most-likely tag-1-first layout as the default
-//     and let an operator override every tag via env once a real AssignModel
-//     round-trip is captured on a paid account. Defaults are isolated so a wrong
-//     guess is one env var away from fixed, never a code change.
+// Wire layout: the method path and the message shapes (AssignModelResponse
+// { assignment }, ModelAssignment{ model_uid, assignment_jwt, harness_uids })
+// are known; the request carries model_router_uid (#2) and cascade_id (#3,
+// required upstream); the assignment carries assignment_jwt (#1), model_uid
+// (#2) and harness_uids (#3). Every tag stays overridable via
+// DEVIN_CONNECT_ASSIGN_TAGS, so a live round-trip can re-point any of them
+// without a code change.
 const ASSIGN_MODEL_PATH = '/exa.api_server_pb.ApiServerService/AssignModel';
 
-// Default tag guesses (override via DEVIN_CONNECT_ASSIGN_TAGS). Field NAMES are
-// verified; only the integer tags are guessed (sequential from 1, the prost
-// default when fields are declared in order with no explicit gaps).
+// Default tags (override via DEVIN_CONNECT_ASSIGN_TAGS). req_cascade_id is
+// required by the server's request validation — assignModel() writes it on
+// every call (empty string when the cascade is unknown).
 const ASSIGN_TAGS_DEFAULT = Object.freeze({
   req_model_uid: 2,      // request: model_uid string (after client-meta #1)
+  req_cascade_id: 3,     // request: cascade_id string (required; '' when unknown)
   resp_assignment: 1,    // AssignModelResponse.assignment (message)
-  asg_model_uid: 1,      // ModelAssignment.model_uid (string)
-  asg_jwt: 2,            // ModelAssignment.assignment_jwt (string)
+  asg_model_uid: 2,      // ModelAssignment.model_uid (string)
+  asg_jwt: 1,            // ModelAssignment.assignment_jwt (string)
   asg_harness: 3,        // ModelAssignment.harness_uids (repeated string)
 });
 
 /**
  * Parse DEVIN_CONNECT_ASSIGN_TAGS overrides, e.g.
- *   "req_model_uid=2,resp_assignment=1,asg_model_uid=1,asg_jwt=2,asg_harness=3"
+ *   "req_model_uid=2,req_cascade_id=3,resp_assignment=1,asg_model_uid=2,asg_jwt=1,asg_harness=3"
  * Unknown keys / non-positive-int tags are ignored. Returns the default map with
  * any valid overrides applied.
  */
@@ -492,9 +561,17 @@ export function isRouterModel(name, env = process.env) {
     p.endsWith('*') ? n.startsWith(p.slice(0, -1)) : n === p);
 }
 
-/** Encode the AssignModel request body (the extra fields after client-meta #1). */
-export function encodeAssignModelRequest(modelUid, tags = ASSIGN_TAGS_DEFAULT) {
-  return writeStringField(tags.req_model_uid, String(modelUid));
+/**
+ * Encode the AssignModel request body (the extra fields after client-meta #1).
+ * cascade_id (#3) is required by the server's request validation: pass the
+ * cascade the turn belongs to via `cascadeId`, or leave it empty — the field is
+ * written either way so the request always carries it.
+ */
+export function encodeAssignModelRequest(modelUid, tags = ASSIGN_TAGS_DEFAULT, cascadeId = '') {
+  return Buffer.concat([
+    writeStringField(tags.req_model_uid, String(modelUid)),
+    writeStringField(tags.req_cascade_id, String(cascadeId ?? '')),
+  ]);
 }
 
 /**
@@ -522,16 +599,20 @@ export function decodeAssignModelResponse(raw, tags = ASSIGN_TAGS_DEFAULT) {
  * the caller can fall back / surface a clean message instead of letting the
  * router uid hit GetChatMessage (where it's rejected).
  *
+ * @param {object} opts
+ * @param {string} [opts.cascadeId]  cascade the turn belongs to (sent as
+ *   cascade_id #3; an empty string is written when omitted — the field is
+ *   required on the wire)
  * @returns {Promise<{model_uid, assignment_jwt, harness_uids}>}
  */
-export async function assignModel({ token, modelUid, signal, env = process.env } = {}) {
+export async function assignModel({ token, modelUid, cascadeId, signal, env = process.env } = {}) {
   const sessionToken = token || getConnectToken(env);
   if (!sessionToken) throw Object.assign(new Error('DEVIN_CONNECT: no session token configured'), { code: 'NO_TOKEN' });
   if (!modelUid) throw Object.assign(new Error('AssignModel: modelUid required'), { code: 'BAD_REQUEST' });
   const tags = parseAssignTags(env);
   const raw = await unaryCall(ASSIGN_MODEL_PATH, sessionToken, {
     signal,
-    extraBody: encodeAssignModelRequest(modelUid, tags),
+    extraBody: encodeAssignModelRequest(modelUid, tags, cascadeId),
   });
   const assignment = decodeAssignModelResponse(raw, tags);
   if (!assignment) {

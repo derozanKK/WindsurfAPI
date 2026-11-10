@@ -3,7 +3,7 @@
     "test/connect-catalog-delatch.test.js",
     "test/devin-connect-models.test.js"
   ],
-  "expectBaselinePass": 41,
+  "expectBaselinePass": 56,
   "mutations": [
     {
       "name": "failed and empty catalog requests hot-loop because the retry deadline is ignored",

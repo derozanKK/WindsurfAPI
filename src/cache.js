@@ -81,11 +81,23 @@ function normalizeDataUrl(url) {
   return `data:${m[1].toLowerCase()};base64,${digestBase64Data(m[2], m[1])}`;
 }
 
+// Cache-key normalisation must be TOTAL: it runs on the RAW request body
+// before any validation (the wrapper computes the original key first, by
+// design — chat.js:2840), so every JSON value a client can actually send must
+// produce a key rather than a throw. Non-object entries — a null part
+// (`content:[null]`), a null message, a bare string/number — pass through
+// unchanged; the shared tail guard rejects or the wire builder coerces them
+// later. Before this guard, `content:[null]` from any caller with a
+// trustworthy per-user scope threw
+// `TypeError: Cannot read properties of null (reading 'type')` here and the
+// route answered 500 before the guard could return its 400.
 function normalizeBinary(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(m => {
+    if (!m || typeof m !== 'object') return m;
     if (!Array.isArray(m.content)) return m;
     return { ...m, content: m.content.map(p => {
+      if (!p || typeof p !== 'object') return p;
       if (p.type === 'image_url' && typeof p.image_url?.url === 'string' && p.image_url.url.startsWith('data:'))
         return { ...p, image_url: { ...p.image_url, url: normalizeDataUrl(p.image_url.url) } };
       if (p.type === 'image' && p.source?.type === 'base64')

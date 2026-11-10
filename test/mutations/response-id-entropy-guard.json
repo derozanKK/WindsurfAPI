@@ -3,7 +3,7 @@
     "test/response-id-entropy-guard.test.js",
     "test/responses.test.js"
   ],
-  "expectBaselinePass": 44,
+  "expectBaselinePass": 69,
   "mutations": [
     {
       "name": "the id is shortened to 12 hex chars — half the width the README's 90-bit claim rests on, and every other test stays green",

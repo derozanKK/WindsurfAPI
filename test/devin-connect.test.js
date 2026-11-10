@@ -23,6 +23,9 @@ import {
 } from '../src/proto.js';
 import { wrapEnvelope, endOfStreamEnvelope } from '../src/connect.js';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const ENV_KEYS = ['DEVIN_CONNECT_TOKEN', 'WINDSURF_API_KEY', 'DEVIN_CONNECT_IMAGE_TAG',
   'DEVIN_CONNECT_IMAGE_INNER_TAGS', 'DEVIN_CONNECT_TOOL_DEF_TAGS',
@@ -921,16 +924,14 @@ describe('mapFinishReason', () => {
   it('returns null when no finish signal was seen', () => {
     assert.equal(mapFinishReason(null), null);
   });
-  it('maps the un-calibrated 3 and 5 to "stop", NOT to length/content_filter', () => {
-    // Both were name-order guesses (max_tokens→'length', refusal→'content_filter').
-    // 4 proved that method wrong once already, and the cost of a wrong guess is
-    // asymmetric: on /v1/responses either value closes the turn as
-    // `response.incomplete` (a whole-turn hard failure for Codex-style clients),
-    // and content_filter additionally surfaces on /v1/messages as
-    // stop_reason:'refusal' — reporting a normal answer as the model refusing.
-    // Truncation is inferred from usage instead (see resolveFinishReason).
-    assert.equal(mapFinishReason(3), 'stop');
-    assert.equal(mapFinishReason(5), 'stop');
+  it('maps the descriptor-pinned 3 and 5 to "length"', () => {
+    // These were name-order guesses when the only evidence was the variant
+    // NAMES. The binary descriptor set now pins the integers themselves:
+    // 3 = MAX_TOKENS, 5 = MAX_NEWLINES — both are limit cuts, i.e. 'length'.
+    // (4 stays 'stop': the paid 2026-07-27 capture is a stronger authority for
+    // that value than the MIN_LOG_PROB name.)
+    assert.equal(mapFinishReason(3), 'length');
+    assert.equal(mapFinishReason(5), 'length');
   });
 
   it('maps 4 to "stop" — paid capture overturned the name-order guess', () => {
@@ -962,7 +963,7 @@ describe('mapFinishReason', () => {
     assert.equal(mapFinishReason(3, { DEVIN_CONNECT_STOP_REASON_MAP: '3=length' }), 'length');
     // garbage in the override is ignored, defaults survive
     const env2 = { DEVIN_CONNECT_STOP_REASON_MAP: '3=bogus,xx=length' };
-    assert.equal(mapFinishReason(3, env2), 'stop');      // bad value ignored → default
+    assert.equal(mapFinishReason(3, env2), 'length');    // bad value ignored → descriptor default
   });
 });
 
@@ -1045,6 +1046,34 @@ describe('classifyUpstreamError', () => {
     assert.equal(classifyUpstreamError('insufficient credits remaining').code, 'QUOTA_EXHAUSTED');
     assert.equal(classifyUpstreamError('Your account quota has been exceeded').code, 'QUOTA_EXHAUSTED');
     assert.equal(classifyUpstreamError('credit exhausted for this billing cycle').code, 'QUOTA_EXHAUSTED');
+  });
+  it('maps the LIVE "daily usage quota has been exhausted" body to QUOTA_EXHAUSTED', () => {
+    // Exact live shape (2026-10-22, Pro account, daily bucket dry), carried on gRPC
+    // code `failed_precondition`. Before `exhausted` was in the arm this matched
+    // NOTHING, fell through to the verbatim passthrough, and became
+    // `failed_precondition` — rendered as HTTP 502 `upstream_error`, absent from
+    // isAccountFailoverError (no cross-account failover), and present in
+    // TRANSPORT_FAULT_CODES (charged the internal-error breaker).
+    const live = 'Your daily usage quota has been exhausted. Visit '
+      + 'https://app.devin.ai/settings/usage to review your plan and usage. (trace ID: 6f1c9a2e)';
+    const r = classifyUpstreamError(live, 'failed_precondition', 400);
+    assert.equal(r.code, 'QUOTA_EXHAUSTED');
+    assert.equal(r.message, live, 'the raw body is preserved for the client/log');
+
+    // Same account state, different upstream wording.
+    assert.equal(classifyUpstreamError('Your weekly usage quota has been exhausted.').code, 'QUOTA_EXHAUSTED');
+    assert.equal(classifyUpstreamError('Your on-demand usage has been exhausted').code, 'QUOTA_EXHAUSTED');
+    assert.equal(classifyUpstreamError('on-demand balance exhausted').code, 'QUOTA_EXHAUSTED');
+    assert.equal(classifyUpstreamError('You are running out of credits').code, 'QUOTA_EXHAUSTED');
+    assert.equal(classifyUpstreamError('quota depleted', 'insufficient_quota').code, 'QUOTA_EXHAUSTED');
+  });
+  it('keeps capacity / tier-wall / rate-limit bodies out of the quota arm', () => {
+    // Widening the quota regex must not swallow the narrower classes that were
+    // already ordered ahead of it.
+    assert.equal(classifyUpstreamError('We are facing high demand for this model. Please try again later.').code, 'CAPACITY');
+    assert.equal(classifyUpstreamError('Please /upgrade to access this model').code, 'MODEL_BLOCKED');
+    assert.equal(classifyUpstreamError('Reached message rate limit for this model. Resets in: 3h0m0s').code, 'RATE_LIMITED');
+    assert.equal(classifyUpstreamError('blocked by our content policy').code, 'CONTENT_BLOCKED');
   });
   it('still maps a paid-entitlement /upgrade wall to MODEL_BLOCKED (no penalty)', () => {
     assert.equal(classifyUpstreamError('insufficient entitlement for this model').code, 'MODEL_BLOCKED');
@@ -2405,5 +2434,120 @@ describe('encodeAssistantToolCall reasoning-tag guard (PR #241 review point 3)',
       withEleven.indexOf(writeStringField(11, 'some reasoning text')) >= 0,
       'tag 11 reasoning must still be serialized verbatim',
     );
+  });
+});
+
+// A non-200 error body is a diagnostic, but it arrives on an unbounded stream.
+// Before the ceiling, a hostile or broken upstream could push past V8's string
+// limit; the resulting ERR_STRING_TOO_LONG is thrown inside the 'end' listener
+// where nothing catches it, escapes as an uncaughtException and exits the
+// process — so one bad response disconnects every tenant. The cap has to keep
+// the classification path working AND make the truncation visible.
+describe('non-200 error body is bounded', () => {
+  const realMax = process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES;
+  afterEach(() => {
+    __setRequestImpl(null);
+    if (realMax === undefined) delete process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES;
+    else process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES = realMax;
+  });
+
+  // The module reads the cap at load, so a case that needs a different ceiling
+  // has to load a fresh copy of the module graph under its own env. `body` may
+  // be an array of chunks: production delivers an error body as many ≤64 KiB
+  // socket chunks, and only a test that emits more than one can pin the
+  // accumulator that counts them.
+  const withCap = async (cap, body, statusCode = 500) => {
+    const dir = mkdtempSync(join(tmpdir(), 'dc-cap-'));
+    const prev = process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES;
+    process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES = String(cap);
+    try {
+      const mod = await import(`${new URL('../src/devin-connect.js', import.meta.url).href}?cap=${cap}&r=${Math.random()}`);
+      mod.__setRequestImpl((_opts, cb) => {
+        const req = { on() { return req; }, setTimeout() { return req; }, write() {}, end() {}, destroy() {} };
+        const res = new EventEmitter();
+        res.statusCode = statusCode;
+        if (cb) cb(res);
+        queueMicrotask(() => {
+          for (const chunk of Array.isArray(body) ? body : [body]) res.emit('data', chunk);
+          res.emit('end');
+        });
+        return req;
+      });
+      const err = await mod.streamChat({
+        messages: [{ role: 'user', content: 'hi' }], model: 'swe-1-7', token: TOKEN,
+      }).next().then(() => null, (e) => e);
+      return err;
+    } finally {
+      if (prev === undefined) delete process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES;
+      else process.env.DEVIN_CONNECT_MAX_ERROR_BODY_BYTES = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it('truncates an oversized error body instead of buffering without bound', async () => {
+    // 4 KiB of body against a 64-byte ceiling. The previous assertion compared
+    // the result against the INPUT size, which the uncapped path also satisfies
+    // — it could not tell the two implementations apart. Compare against the
+    // CEILING instead: only a bounded implementation can come back that small.
+    const err = await withCap(64, Buffer.alloc(4096, 0x41));
+    assert.ok(err, 'an oversized error body must still produce a classified error');
+    const marker = '\n[... truncated: upstream error body exceeded the cap ...]';
+    assert.ok(err.message.length < 512,
+      `a 64-byte ceiling must not yield a ${err.message.length}-character message`);
+    // ceiling + marker + nothing else. The earlier form compared against a
+    // hand-counted marker length and was off by one; derive it instead.
+    assert.equal(err.message.length, 64 + marker.length);
+  });
+
+  it('counts the ceiling across data events, not per chunk', async () => {
+    // Every other case emits the body as ONE event, so an implementation that
+    // never accumulated `bodyBytes` across events (production delivers many
+    // ≤64 KiB socket chunks) would pass them all while re-opening unbounded
+    // buffering. Three 32-byte chunks against a 64-byte ceiling: the first two
+    // exactly fill it, the third must trigger truncation instead of extending
+    // the buffer — kept bytes are the ceiling plus the marker, and the third
+    // chunk is never kept.
+    const err = await withCap(64, [Buffer.alloc(32, 0x41), Buffer.alloc(32, 0x42), Buffer.alloc(32, 0x43)]);
+    const marker = '\n[... truncated: upstream error body exceeded the cap ...]';
+    assert.equal(err.message, 'A'.repeat(32) + 'B'.repeat(32) + marker,
+      'the ceiling must be counted across data events: keep A+B (64 bytes) + marker, never C');
+  });
+
+  it('keeps the body a genuine prefix of the real one, not a reordering', async () => {
+    const err = await withCap(64, Buffer.from('ABCDEFGH'.repeat(512), 'utf8'));
+    const kept = err.message.split('\n[... truncated')[0];
+    assert.ok('ABCDEFGH'.repeat(512).startsWith(kept), 'kept text must be a prefix of the body');
+    assert.ok(kept.length > 0, 'truncation must not discard everything');
+  });
+
+  it('marks the truncation so the error does not silently describe a prefix', async () => {
+    const err = await withCap(64, Buffer.alloc(4096, 0x41));
+    assert.match(err.message, /truncated: upstream error body exceeded the cap/);
+  });
+
+  it('leaves a body under the cap untouched and still classifies it', async () => {
+    const err = await withCap(64 * 1024, Buffer.from('upstream said no', 'utf8'), 429);
+    assert.equal(err.code, 'RATE_LIMITED');
+    assert.match(err.message, /upstream said no/);
+    assert.doesNotMatch(err.message, /truncated/, 'a body that fit must not be marked truncated');
+  });
+
+  it('falls back to the default ceiling when the override is not a positive integer', async () => {
+    for (const bad of ['0', '-1', 'abc', '', '1e400', '  ']) {
+      const err = await withCap(bad, Buffer.from('short', 'utf8'), 500);
+      assert.ok(err, `override ${JSON.stringify(bad)} must not break the path`);
+    }
+  });
+
+  it('never treats a bad override as "no ceiling"', async () => {
+    // A body larger than the 8MiB default is what makes this case load-bearing:
+    // a 1KiB body is kept whole by an 8MiB ceiling AND by no ceiling at all, so
+    // it cannot tell the two apart. Only a finite fallback truncates this one,
+    // at exactly the default ceiling.
+    const err = await withCap('not-a-number', Buffer.alloc(8 * 1024 * 1024 + 64, 0x43), 500);
+    const marker = '\n[... truncated: upstream error body exceeded the cap ...]';
+    assert.match(err.message, /truncated/, 'a body above the default ceiling must be truncated');
+    assert.equal(err.message.length, 8 * 1024 * 1024 + marker.length,
+      'an unparseable override must fall back to the real 8MiB ceiling, not to no ceiling');
   });
 });

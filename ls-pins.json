@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-10-22",
+  "notes": [
+    "Trust anchor for install-ls.sh. Every release here was downloaded and hashed during review; do not edit hashes by hand.",
+    "3.10.67 archive sha256 values come from https://windsurf-stable.codeium.com/api/versions and were re-verified against the downloaded archives. Inner sha256 values were computed from the extracted language-server binaries.",
+    "3.5.17 is the explicit rollback release from https://github.com/dwgx/windsurf-ls-release/releases/tag/v3.5.17. Archive (gzip) and inner hashes were verified against the published assets and SHA256SUMS.",
+    "The upstream manifest is unauthenticated (TLS + same-vendor sha256 only). A reviewed pin is the trust anchor; an upstream archive that does not match a pin is refused."
+  ],
+  "releases": [
+    {
+      "version": "3.10.67",
+      "channel": "stable",
+      "source": "upstream",
+      "releasedAt": "2026-10-12T00:36:55Z",
+      "commit": "0b186d6e13a1a48a46430c51fe414dd0747d46f6",
+      "commitKind": "desktop-commit",
+      "targets": {
+        "linux-x64": {
+          "archive": "Devin-linux-x64-3.10.67.tar.gz",
+          "archiveSha256": "3295f8bdfb460180a7e96961c0a6156f108b6502684287f17b8b512246c35803",
+          "member": "Devin/resources/app/extensions/windsurf/bin/language_server_linux_x64",
+          "binarySha256": "111901504bf6eda98fda45080aa28ca7b64ef935c586556d3f702be72da49d7a",
+          "binaryBytes": 193635880
+        },
+        "darwin-arm64": {
+          "archive": "Devin-darwin-arm64-3.10.67.zip",
+          "archiveSha256": "8063233fcc937a9fdb53191ff25de5313b0a580f1b0eb6be6f660a154f40b817",
+          "member": "Devin.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm",
+          "binarySha256": "e6481920bab182bafed14d8dca777e6fb9ad5ce8d6807284593a7aaf745a39cd",
+          "binaryBytes": 176113248
+        },
+        "darwin-x64": {
+          "archive": "Devin-darwin-x64-3.10.67.zip",
+          "archiveSha256": "d805a02df276361fe311b4bb0564f20b2bb798c447a70283f1a25b9c040e4d78",
+          "member": "Devin.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64",
+          "binarySha256": "eeb7eed62ebec891208ed442e3f9389cf43bf943295e96f06adf00ac41da4eea",
+          "binaryBytes": 180424544
+        }
+      }
+    },
+    {
+      "version": "3.5.17",
+      "channel": "stable",
+      "source": "mirror",
+      "releasedAt": "2026-07-20T06:30:42Z",
+      "commit": "2c489dfc762456657db8662309c0d5e76e886397",
+      "commitKind": "ls-build-revision",
+      "releaseTag": "v3.5.17",
+      "targets": {
+        "linux-x64": {
+          "archive": "language_server_linux_x64.gz",
+          "archiveSha256": "7e0130724843bb627ed904fae062c31e1ced44179818982d0ea5c600a407ec3b",
+          "compression": "gzip",
+          "binarySha256": "0555f88967b6f9e51c4a78e5af9434f885826f894f2508ed69ebffa4cc90b59d",
+          "binaryBytes": 190937480
+        },
+        "darwin-arm64": {
+          "archive": "language_server_macos_arm.gz",
+          "archiveSha256": "14b6d875434c69ef626f2260b33b2dbee686ed7fff0b538070171c4b90638ab2",
+          "compression": "gzip",
+          "binarySha256": "8452fd60b35c7eb5f2e40f2c82148964b91a9c88c90c4c8bc77fcf5b9c0c2ad0",
+          "binaryBytes": 173931456
+        },
+        "darwin-x64": {
+          "archive": "language_server_macos_x64.gz",
+          "archiveSha256": "69bfc2f2e31182d1cd4e4b44843b8785a729c5be37333cd96a445eb6767f4c3b",
+          "compression": "gzip",
+          "binarySha256": "ef5f8e7e6950e86c2c8a8e41bafe148bfbafb9fb2b1cb3ec63e9b0c00e8a3579",
+          "binaryBytes": 178152832
+        }
+      }
+    }
+  ]
+}

@@ -16,6 +16,7 @@ deploy-us.py
 # a handoff before anyone noticed git had never seen it; it surfaced only because
 # `git status` still reported the same file count as before.
 scripts/*
+!scripts/fetch-repokit.mjs
 !scripts/gen-star-history.mjs
 !scripts/local-gate.mjs
 !scripts/native-bridge-smoke.mjs
@@ -23,7 +24,14 @@ scripts/*
 !scripts/lsp-capacity-matrix.mjs
 !scripts/web-search-direct-probe.mjs
 !scripts/sync-docs-contributors.mjs
+!scripts/sync-changelog-counts.mjs
+!scripts/unverified-register.mjs
+!scripts/check-dashboard-copy.mjs
+!scripts/verify-release-assets.mjs
+!scripts/generate-release-attestation.mjs
+!scripts/verify-release-attestation.mjs
 !scripts/secret-scan.mjs
+!scripts/support-bundle.mjs
 !scripts/run-test-shard.mjs
 !scripts/run-tests.mjs
 !scripts/spec-static-check.mjs
@@ -43,6 +51,11 @@ scripts/*
 !scripts/cline-compat-verify.mjs
 !scripts/cline-smoke.sh
 !scripts/dashboard-cdp-check.mjs
+!scripts/dashboard-smoke.mjs
+!scripts/smoke-matrix.mjs
+!scripts/smoke-matrix-mutants.mjs
+!scripts/smoke-matrix/
+!scripts/smoke-matrix/*.mjs
 !scripts/exe-boot-smoke.mjs
 !scripts/verify-release-version.mjs
 !scripts/mutate-verify.mjs
@@ -88,7 +101,7 @@ copilot2api-go/
 .continue/
 .codex/
 .devin/
-audit/
+/audit/
 tmp/
 tmp-testing/
 runtime-config.json
@@ -120,6 +133,9 @@ docs/*.bak
 .trace/
 .wire-dump/
 .wire-dump-pull/
+# Support bundles (trace archives can carry prompt fragments — attach, never commit)
+support-bundle-*.zip
+support-bundle-*.manifest.json
 
 # Exported chat-session transcripts (/export output — never commit)
 2026-*-local-command-*.txt
@@ -134,6 +150,8 @@ docs/*.bak
 # OTA 回滚点（运行时记录，勿提交）
 data/self-update-before.json
 data/self-update-before.pending.json
+data/self-update-journal.json
+data/self-update-docker.json
 
 # Machine-local; never product
 .DS_Store
@@ -142,3 +160,9 @@ data/self-update-before.pending.json
 # Tracked baseline gate runtime dependencies (not audit scratch files).
 !scripts/spec-baseline-evidence.mjs
 !scripts/spec-baseline-platform-skips.json
+# SEC-05 history secret scan: the scan, its shared rule set, and the reviewed baseline.
+# Without these three lines the CI job's own files are absent from the commit and the job
+# fails with "Cannot find module" — the ignore-by-default trap described at the top.
+!scripts/secret-rules.mjs
+!scripts/history-secret-scan.mjs
+!scripts/history-secret-scan.baseline

@@ -7,15 +7,15 @@
     {
       "name": "H3-M1: emit reasoning only on the first raw frame",
       "file": "src/devin-connect.js",
-      "anchor": "          reasoning: reasoningText,\n          reasoningTagNum,",
-      "replacement": "          reasoning: !preText && tc === msg.tool_calls[0] ? reasoningText : '',\n          reasoningTagNum,",
+      "anchor": "          reasoning: reasoningText,\n          reasoningTagNum: turnReasoningTag,",
+      "replacement": "          reasoning: !preText && tc === msg.tool_calls[0] ? reasoningText : '',\n          reasoningTagNum: turnReasoningTag,",
       "expectCaught": true
     },
     {
       "name": "H3-M2: omit reasoning from preText",
       "file": "src/devin-connect.js",
-      "anchor": "        if (reasoningText) parts.push(writeStringField(reasoningTagNum, reasoningText));",
-      "replacement": "        if (false && reasoningText) parts.push(writeStringField(reasoningTagNum, reasoningText));",
+      "anchor": "        if (reasoningText) parts.push(writeStringField(turnReasoningTag, reasoningText));",
+      "replacement": "        if (false && reasoningText) parts.push(writeStringField(turnReasoningTag, reasoningText));",
       "expectCaught": true
     },
     {
@@ -35,22 +35,22 @@
     {
       "name": "H3-M5: reverse native alias precedence",
       "file": "src/devin-connect.js",
-      "anchor": "      const reasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';",
-      "replacement": "      const reasoningText = reasoningTagNum && (msg.reasoning_content || msg.reasoning) ? String(msg.reasoning_content || msg.reasoning) : '';",
+      "anchor": "      const probeReasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';",
+      "replacement": "      const probeReasoningText = reasoningTagNum && (msg.reasoning_content || msg.reasoning) ? String(msg.reasoning_content || msg.reasoning) : '';",
       "expectCaught": true
     },
     {
       "name": "H3-M6: use nullish native alias precedence",
       "file": "src/devin-connect.js",
-      "anchor": "      const reasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';",
-      "replacement": "      const reasoningText = reasoningTagNum ? String(msg.reasoning ?? msg.reasoning_content ?? '') : '';",
+      "anchor": "      const probeReasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';",
+      "replacement": "      const probeReasoningText = reasoningTagNum ? String(msg.reasoning ?? msg.reasoning_content ?? '') : '';",
       "expectCaught": true
     },
     {
       "name": "H3-M7: trim native replay",
       "file": "src/devin-connect.js",
-      "anchor": "      const reasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';",
-      "replacement": "      const reasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content).trim() : '';",
+      "anchor": "      const probeReasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content) : '';",
+      "replacement": "      const probeReasoningText = reasoningTagNum && (msg.reasoning || msg.reasoning_content) ? String(msg.reasoning || msg.reasoning_content).trim() : '';",
       "expectCaught": true
     },
     {

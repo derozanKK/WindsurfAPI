@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http2 from 'http2';
+import { terminateRpcWithStatus, isConnectContentType } from './helpers/fake-grpc-trailers.mjs';
 import { WindsurfClient } from '../src/client.js';
 import { parseTrajectorySteps } from '../src/windsurf.js';
 import { repairToolCallArguments } from '../src/handlers/chat.js';
@@ -31,14 +32,14 @@ function extractGrpcFrames(buf) {
 
 function requestPayload(body, headers) {
   const contentType = String(headers['content-type'] || '');
-  if (contentType.includes('application/connect+proto')) return unwrapRequest(body, headers);
+  if (isConnectContentType(contentType)) return unwrapRequest(body, headers);
   const frames = extractGrpcFrames(body);
   return frames.length ? Buffer.concat(frames) : body.subarray(5);
 }
 
 function responseBody(payload, headers) {
   const contentType = String(headers['content-type'] || '');
-  if (contentType.includes('application/connect+proto')) {
+  if (isConnectContentType(contentType)) {
     return Buffer.concat([wrapEnvelope(payload, { compress: false }), endOfStreamEnvelope()]);
   }
   return grpcFrame(payload);
@@ -86,7 +87,7 @@ async function withFakeLanguageServer(handler, fn) {
     sessions.add(session);
     session.on('close', () => sessions.delete(session));
   });
-  server.on('stream', handler);
+  server.on('stream', (stream, headers) => { terminateRpcWithStatus(stream); handler(stream, headers); });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   try {

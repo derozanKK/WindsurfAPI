@@ -26,7 +26,7 @@ describe('release workflow', () => {
       'release identity must be checked before dependencies, tests, or builds run',
     );
     assert.match(test, /\brun:\s*npm run test:release\b/);
-    assert.match(test, /\btimeout-minutes:\s*10\b/);
+    assert.match(test, /\btimeout-minutes:\s*20\b/);
     assert.match(docker, /\bneeds:\s*test\b/);
     assert.match(docker, /\btimeout-minutes:\s*30\b/);
     // Release waits for docker image, Windows single-exe, AND macOS arm64.
@@ -76,6 +76,123 @@ describe('release workflow', () => {
       'BUILD_BRANCH',
     ]) {
       assert.match(docker, new RegExp(`\\b${name}=`), `${name} build arg is missing`);
+    }
+  });
+
+  it('signs the pushed Docker image digest and publishes image-digest.txt', () => {
+    const docker = jobBlock('docker');
+    const release = jobBlock('release');
+
+    // Policy T (D9 §5.3): keyless signing needs an OIDC token in the same job
+    // that pushes the image, and the build step must expose its digest.
+    assert.match(docker, /\bid-token:\s*write\b/,
+      'the docker job needs id-token: write for keyless cosign signing');
+    assert.match(docker, /\boutputs:\s*\n\s*digest:\s*\$\{\{\s*steps\.build\.outputs\.digest\s*\}\}/,
+      'the docker job must keep the image digest in its job output');
+    assert.match(docker, /- name: Build and push\n\s+id: build\n\s+uses: docker\/build-push-action@(?:v7|[0-9a-f]{40})\b/,
+      'the build-push step needs id: build so its digest output is addressable');
+
+    const buildIndex = docker.indexOf('Build and push');
+    const signIndex = docker.indexOf('cosign sign --yes');
+    const digestIndex = docker.indexOf('image-digest.txt');
+    assert.ok(buildIndex >= 0 && signIndex > buildIndex,
+      'the image digest must be signed after the push');
+    assert.ok(digestIndex > signIndex,
+      'image-digest.txt must record the digest that was signed');
+    assert.match(docker, /cosign sign --yes "\$\{IMAGE\}@\$\{\{\s*steps\.build\.outputs\.digest\s*\}\}"/,
+      'cosign must sign the image digest, not a mutable tag');
+    assert.match(docker, /printf '%s\\n' "\$digest" > image-digest\.txt/,
+      'image-digest.txt must contain the digest that was signed');
+    assert.match(docker, /cosign sign-blob[\s\S]{0,200}image-digest\.txt/,
+      'the digest file itself must carry a keyless signature bundle');
+    assert.match(docker, /name:\s*image-digest\b[\s\S]*?image-digest\.txt\.sigstore\.json/,
+      'the signed digest and its bundle must be uploaded as a job artifact');
+  });
+
+  it('generates and signs release-attestation.json and attaches both files', () => {
+    const release = jobBlock('release');
+    const generate = release.indexOf('Generate release attestation');
+    const sign = release.indexOf('Sign the release attestation');
+    const upload = release.indexOf('Create GitHub Release');
+
+    assert.ok(generate > release.indexOf('Generate SHA256SUMS'),
+      'the attestation must hash the assets after SHA256SUMS exists');
+    assert.ok(generate < release.indexOf('Install cosign'),
+      'the attestation must exist before the signing steps');
+    assert.ok(sign > release.indexOf('Sign the published assets and SHA256SUMS'),
+      'the attestation is signed with the same keyless identity as the assets');
+    assert.ok(sign < upload, 'the signature must exist before the release upload');
+
+    const generateStep = release.slice(generate, sign);
+    assert.match(generateStep, /node scripts\/generate-release-attestation\.mjs/,
+      'the release job must run the generator');
+    assert.match(generateStep, /--tag "\$GITHUB_REF_NAME"/,
+      'the attestation must name the release tag');
+    assert.match(generateStep, /--commit "\$\(git rev-parse HEAD\)"/,
+      'the attestation must name the tag commit');
+    assert.match(generateStep, /--tree "\$\(git rev-parse 'HEAD\^\{tree\}'\)"/,
+      'the attestation must name the commit tree');
+
+    const signStep = release.slice(sign, upload);
+    assert.match(signStep, /cosign sign-blob/,
+      'the attestation must be signed as a blob');
+    assert.match(signStep, /--bundle release-attestation\.json\.sigstore\.json/,
+      'the signature must be a durable Sigstore bundle');
+
+    const files = /files: \|([\s\S]*)$/.exec(release)[1];
+    assert.match(files, /^\s+release-attestation\.json$/m,
+      'release-attestation.json must be attached to the GitHub Release');
+    assert.match(files, /^\s+release-attestation\.json\.sigstore\.json$/m,
+      'the attestation bundle must be attached to the GitHub Release');
+  });
+
+  it('downloads and attaches the signed image digest artifact', () => {
+    const release = jobBlock('release');
+    assert.match(
+      release,
+      /- name: Download the signed image digest\n[\s\S]{0,400}?uses: actions\/download-artifact@(?:v7|[0-9a-f]{40})\b[\s\S]{0,200}?name: image-digest\b/,
+      'the release job must download the docker job\'s signed digest artifact',
+    );
+    const files = /files: \|([\s\S]*)$/.exec(release)[1];
+    assert.match(files, /^\s+image-digest\.txt$/m,
+      'image-digest.txt must be attached to the GitHub Release');
+    assert.match(files, /^\s+image-digest\.txt\.sigstore\.json$/m,
+      'the image digest bundle must be attached to the GitHub Release');
+  });
+
+  it('publishes SHA256SUMS covering exactly the four release assets', () => {
+    const release = jobBlock('release');
+    // SEC-04: a tampered download must be distinguishable from a real one.
+    // The manifest names the assets as they appear on the release page (flat),
+    // because GitHub release assets have no directories. v3.9.53 shipped
+    // build-tree paths and `sha256sum -c` failed for three of the four files.
+    assert.match(
+      release,
+      /\( cd dist-windows && sha256sum windsurfapi\.exe windsurfapi-windows\.zip \) > SHA256SUMS[\s\S]*?\( cd dist-macos && sha256sum windsurfapi-macos-arm64 \) >> SHA256SUMS[\s\S]*?sha256sum windsurfapi-macos\.zip >> SHA256SUMS/,
+      'the manifest must hash exactly the four published files using their flat release-asset names',
+    );
+    assert.doesNotMatch(
+      release.slice(release.indexOf('Generate SHA256SUMS'), release.indexOf('Create GitHub Release')),
+      /sha256sum[^\n]*dist-(?:windows|macos)\//,
+      'manifest entries must not carry build-tree directory prefixes',
+    );
+    assert.match(release, /files: \|[\s\S]*\n\s+SHA256SUMS\s*$/,
+      'SHA256SUMS must be attached to the GitHub Release');
+    assert.ok(
+      release.indexOf('Generate SHA256SUMS') < release.indexOf('softprops/action-gh-release'),
+      'the manifest has to exist before the upload step',
+    );
+  });
+
+  it('pins build-time esbuild instead of floating the latest version', () => {
+    const releaseInstalls = workflow.split('\n').filter((line) => /npm i(?:nstall)? -g\b/.test(line));
+    assert.equal(releaseInstalls.length, 3, 'release builds install pkg + esbuild on three runners');
+    for (const [name, yaml] of [['release.yml', workflow], ['ci.yml', ciWorkflow]]) {
+      for (const line of yaml.split('\n').filter((l) => /npm i(?:nstall)? -g\b/.test(l))) {
+        assert.doesNotMatch(line, /(?:^|\s)esbuild(?:\s|$)/,
+          `${name} installs an unpinned esbuild: ${line.trim()}`);
+        assert.match(line, /esbuild@\d+\.\d+\.\d+/, `${name} must pin esbuild to an exact version: ${line.trim()}`);
+      }
     }
   });
 

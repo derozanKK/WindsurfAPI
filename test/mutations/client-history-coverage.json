@@ -3,34 +3,34 @@
     "test/client-panel-retry.test.js",
     "test/review-history-coverage.test.js"
   ],
-  "expectBaselinePass": 13,
+  "expectBaselinePass": 14,
   "mutations": [
     {
       "name": "GPT-08: the rebuilt history stops updating its coverage, so a truncated recovery reports full history",
       "file": "src/client.js",
-      "anchor": "        const { lines, firstIncluded } = buildHistoryLines(cascadeHistoryBudget(modelUid), 0);\n        historyCoverage = {\n          droppedTurnCount: firstIncluded,\n          firstIncludedTurnIndex: firstIncluded,\n          totalTurns: convo.length,\n        };",
-      "replacement": "        const { lines, firstIncluded } = buildHistoryLines(cascadeHistoryBudget(modelUid), 0);\n        void firstIncluded;",
+      "anchor": "        const { firstIncluded } = built;\n        historyCoverage = {\n          droppedTurnCount: firstIncluded,\n          firstIncludedTurnIndex: firstIncluded,\n          totalTurns: convo.length,\n        };\n        text = built.text;\n        images = built.images;",
+      "replacement": "        const { firstIncluded } = built;\n        void firstIncluded;\n        text = built.text;\n        images = built.images;",
       "expectCaught": true
     },
     {
       "name": "Rebuild budget changes and its decoded wire suffix regresses",
       "file": "src/client.js",
-      "anchor": "        const { lines, firstIncluded } = buildHistoryLines(cascadeHistoryBudget(modelUid), 0);",
-      "replacement": "        const { lines, firstIncluded } = buildHistoryLines(cascadeHistoryBudget(modelUid) * 4, 0);",
+      "anchor": "        const built = await buildCascadeMultiTurnPrompt(convo, {\n          budgetBytes: cascadeHistoryBudget(modelUid),",
+      "replacement": "        const built = await buildCascadeMultiTurnPrompt(convo, {\n          budgetBytes: cascadeHistoryBudget(modelUid) * 4,",
       "expectCaught": true
     },
     {
       "name": "GPT-08: the coverage count stops matching the truncation rule it reports",
       "file": "src/client.js",
-      "anchor": "        return { lines, firstIncluded };",
-      "replacement": "        return { lines, firstIncluded: 0 };",
+      "anchor": "  return { entries, firstIncluded };",
+      "replacement": "  return { entries, firstIncluded: 0 };",
       "expectCaught": true
     },
     {
       "name": "GPT-08: the rebuilt history is sent newest-first",
       "file": "src/client.js",
-      "anchor": "          lines.unshift(line);",
-      "replacement": "          lines.push(line);",
+      "anchor": "    entries.unshift({ index: i, tag, body });",
+      "replacement": "    entries.push({ index: i, tag, body });",
       "expectCaught": true
     }
   ]

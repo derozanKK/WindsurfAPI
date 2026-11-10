@@ -9,12 +9,12 @@ import {
 } from '../src/devin-connect-catalog.js';
 import { writeStringField, writeMessageField, parseFields } from '../src/proto.js';
 
-// Build a synthetic AssignModelResponse with the default tag layout:
-//   #1 assignment { #1 model_uid, #2 assignment_jwt, #3 harness_uids* }
+// Build a synthetic AssignModelResponse in the wire layout:
+//   #1 assignment { #1 assignment_jwt, #2 model_uid, #3 harness_uids* }
 function buildAssignResponse({ modelUid, jwt, harness = [] } = {}) {
   const inner = [];
-  if (modelUid != null) inner.push(writeStringField(1, modelUid));
-  if (jwt != null) inner.push(writeStringField(2, jwt));
+  if (jwt != null) inner.push(writeStringField(1, jwt));
+  if (modelUid != null) inner.push(writeStringField(2, modelUid));
   for (const h of harness) inner.push(writeStringField(3, h));
   return writeMessageField(1, Buffer.concat(inner));
 }
@@ -49,7 +49,7 @@ describe('parseAssignTags', () => {
   it('returns the default layout when unset', () => {
     const t = parseAssignTags({});
     assert.deepEqual(t, {
-      req_model_uid: 2, resp_assignment: 1, asg_model_uid: 1, asg_jwt: 2, asg_harness: 3,
+      req_model_uid: 2, req_cascade_id: 3, resp_assignment: 1, asg_model_uid: 2, asg_jwt: 1, asg_harness: 3,
     });
   });
 
@@ -59,7 +59,7 @@ describe('parseAssignTags', () => {
     });
     assert.equal(t.resp_assignment, 4);   // overridden
     assert.equal(t.asg_model_uid, 7);     // overridden
-    assert.equal(t.asg_jwt, 2);           // non-int ignored → default
+    assert.equal(t.asg_jwt, 1);           // non-int ignored → default
     assert.equal(t.asg_harness, 3);       // negative ignored → default
     assert.equal('bogus' in t, false);    // unknown key not added
   });

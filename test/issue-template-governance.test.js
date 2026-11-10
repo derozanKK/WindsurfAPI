@@ -30,7 +30,7 @@ test('bug template requests current routing and diagnostic evidence', () => {
     'ToolRoute[...]',
     'BridgeResult[...]',
     'WINDSURFAPI_NATIVE_TOOL_BRIDGE',
-    'WINDSURFAPI_LS_RELEASE',
+    'WINDSURFAPI_LS_VERSION',
   ]) {
     assert.match(body, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }

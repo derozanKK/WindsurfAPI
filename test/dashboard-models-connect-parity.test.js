@@ -37,8 +37,9 @@ import {
   removeAccount,
 } from '../src/auth.js';
 import { handleDashboardApi } from '../src/dashboard/api.js';
-import { handleModels } from '../src/handlers/models.js';
-import { setLiveCatalogSelectors, clearLiveCatalogSelectors } from '../src/devin-connect-models.js';
+import { handleModels, buildConnectReachability } from '../src/handlers/models.js';
+import { setLiveCatalogSelectors, clearLiveCatalogSelectors, resolveConnectSelector, __testing as connectModelsTesting } from '../src/devin-connect-models.js';
+import { mergeCloudModels } from '../src/models.js';
 import { _resetRuntimeConfigForTests } from '../src/runtime-config.js';
 
 // Written literally rather than imported from FREE_REACHABLE_SELECTORS: importing the set
@@ -214,10 +215,12 @@ describe('dashboard /models agrees with /v1/models on the Connect namespace (#23
     assert.ok(row, 'Dashboard omitted a selector that /v1/models advertises');
     assert.equal(row.reachable, true);
     assert.equal(row.connectSelector, liveOnly);
-    assert.ok('currentlyFree' in row,
+    assert.ok('freeNow' in row,
       'the live-only Dashboard producer must carry the pricing field too');
-    assert.equal(row.currentlyFree, null,
+    assert.equal(row.freeNow, null,
       'a live-only selector without a rate-table entry has unknown pricing');
+    assert.equal(row.freeReason, null);
+    assert.equal(row.quotaState, 'unknown');
     assert.equal(rows.filter((r) => r.reachable && r.connectSelector === aliasBacked).length, 1,
       'Dashboard must not append a canonical row when a visible alias already represents it');
   });
@@ -236,10 +239,11 @@ describe('dashboard /models agrees with /v1/models on the Connect namespace (#23
     assert.equal(row.reachable, false,
       'a free-only pool must annotate the paid live-only row as unreachable');
     assert.equal(row.connectSelector, paidLiveOnly);
-    assert.ok('currentlyFree' in row,
+    assert.ok('freeNow' in row,
       'an unreachable live-only row must still carry the pricing field');
-    assert.equal(row.currentlyFree, null,
+    assert.equal(row.freeNow, null,
       'reachability does not turn absent pricing data into a billable claim');
+    assert.equal(row.quotaState, 'unknown');
   });
 
   it('keeps snapshot rows reachable for an env token beside a restricted live pool', async () => {
@@ -335,8 +339,8 @@ describe('dashboard /models agrees with /v1/models on the Connect namespace (#23
       // "free" on an unpriced model is precisely the reporter's loss. Assert the exact value.
       const nonFree = withSelector.filter((r) => r.connectSelector !== CONNECT_FREE_SELECTOR);
       assert.ok(nonFree.length > 0, 'precondition: need a resolving non-free selector');
-      const wrong = nonFree.filter((r) => r.currentlyFree !== null);
-      assert.deepEqual(wrong.map((r) => `${r.id}=${r.currentlyFree}`), [],
+      const wrong = nonFree.filter((r) => r.freeNow !== null);
+      assert.deepEqual(wrong.map((r) => `${r.id}=${r.freeNow}`), [],
         'with no rate table anywhere, a resolving non-free selector must read null (unknown). '
         + '`false` presents a guess as a fact; `true` is the exact claim that burned the '
         + 'reporter\'s weekly allowance. isConnectSelectorCurrentlyFree returns plain false '
@@ -344,23 +348,30 @@ describe('dashboard /models agrees with /v1/models on the Connect namespace (#23
         + 'free-set to tell them apart');
     });
 
-    it('reports the free-reachable selector as free even with no rate table', async () => {
+    it('reports the static-fallback selector as free only while there is no live data', async () => {
       seed('free');
       const rows = await dashboardModels();
       const free = rows.find((r) => r.id === CONNECT_FREE_SELECTOR);
-      assert.equal(free.currentlyFree, true,
-        'FREE_REACHABLE membership IS the definition of free-to-any-account, and it must not '
-        + 'depend on a rate table the pool may never report');
+      assert.equal(free.freeNow, true,
+        'with no live cost tier and no rate table, the documented static fallback is the '
+        + 'only free source — the cold-start case it exists for');
+      assert.equal(free.freeReason, 'fallback_whitelist');
     });
 
-    it('carries the field on every row so the UI never has to infer it', async () => {
+    it('carries the full pricing/quota shape on every row so the UI never infers it', async () => {
       seed('free');
       const rows = await dashboardModels();
       for (const r of rows) {
-        assert.ok('currentlyFree' in r, `${r.id} is missing currentlyFree`);
+        for (const key of ['costTier', 'promoEndsAt', 'freeNow', 'freeReason', 'quotaState']) {
+          assert.ok(key in r, `${r.id} is missing ${key}`);
+        }
         assert.ok(
-          r.currentlyFree === true || r.currentlyFree === false || r.currentlyFree === null,
-          `${r.id} has a non-tri-state currentlyFree: ${JSON.stringify(r.currentlyFree)}`,
+          r.freeNow === true || r.freeNow === false || r.freeNow === null,
+          `${r.id} has a non-tri-state freeNow: ${JSON.stringify(r.freeNow)}`,
+        );
+        assert.ok(
+          r.quotaState === null || ['free', 'blocked_daily', 'blocked_weekly', 'not_in_catalog', 'unknown'].includes(r.quotaState),
+          `${r.id} has an unknown quotaState: ${JSON.stringify(r.quotaState)}`,
         );
       }
     });
@@ -375,15 +386,106 @@ describe('dashboard /models agrees with /v1/models on the Connect namespace (#23
       acct.credits = { rateTable: { [target.connectSelector]: 4 } };
       const rows1 = await dashboardModels();
       const priced = rows1.find((r) => r.id === target.id);
-      assert.equal(priced.currentlyFree, false,
+      assert.equal(priced.freeNow, false,
         `${target.id} resolves to ${target.connectSelector} which the rate table prices at 4, `
         + 'so it must read as billable rather than unknown');
 
       acct.credits = { rateTable: { [target.connectSelector]: 0 } };
       const rows2 = await dashboardModels();
-      assert.equal(rows2.find((r) => r.id === target.id).currentlyFree, true,
+      const free = rows2.find((r) => r.id === target.id);
+      assert.equal(free.freeNow, true,
         'rate === 0 must read as free — otherwise the field is stuck and tells the operator '
         + 'nothing that changes');
+      assert.equal(free.freeReason, 'rate_zero');
+    });
+  });
+
+  // The live Pro account (2026-10-22) is the fixture: its catalog marks exactly three
+  // selectors MODEL_COST_TIER_FREE with a promo ending 2026-11-01, its rate table has
+  // zero zero-rate entries, its daily bucket is at 0 %, and the selector the static
+  // whitelist called free (`swe-1-6-slow`) is absent from the catalog and 502s.
+  // Before the fix the panel showed the inverse of all of that.
+  describe('rows carry upstream cost tier, promo and account quota state', () => {
+    const PROMO_END = '2026-11-01T06:59:59.999999999Z';
+    const CONNECT_ROWS = [
+      { selector: 'swe-2-medium', provider: 'windsurf', label: 'SWE-2 Medium' },
+      { selector: 'swe-2-high', provider: 'windsurf', label: 'SWE-2 High' },
+      { selector: 'swe-2-max', provider: 'windsurf', label: 'SWE-2 Max' },
+      { selector: 'swe-2-medium-lightning', provider: 'windsurf', label: 'SWE-2 Medium Lightning' },
+    ];
+    const COST_CONFIGS = [
+      { modelUid: 'swe-2-medium', creditMultiplier: 6, modelCostTier: 'MODEL_COST_TIER_FREE', promoStatus: { isActive: true, endDate: PROMO_END } },
+      { modelUid: 'swe-2-high', creditMultiplier: 9, modelCostTier: 'MODEL_COST_TIER_FREE', promoStatus: { isActive: true, endDate: PROMO_END } },
+      { modelUid: 'swe-2-max', creditMultiplier: 12, modelCostTier: 'MODEL_COST_TIER_FREE', promoStatus: { isActive: true, endDate: PROMO_END } },
+      {
+        modelUid: 'swe-2-medium-lightning',
+        creditMultiplier: 12,
+        modelCostTier: 'MODEL_COST_TIER_HIGH',
+        promoStatus: { isActive: true, endDate: '2027-01-01T07:59:59.999999999Z', label: '83% off' },
+      },
+    ];
+
+    async function seedLiveProAccount() {
+      __setModelCatalogDeps({
+        getCascadeModelConfigs: async () => ({ configs: [] }),
+        scheduleCatalogRetry: () => () => {},
+        fetchConnectCatalog: async () => CONNECT_ROWS,
+      });
+      const acct = seed('pro');
+      acct.credits = { dailyPercent: 0, weeklyPercent: 47 };
+      await __waitForModelCatalogSync();
+      // The Cascade cost-tier map is account-scoped in models.js; mergeCloudModels
+      // (the legacy entry point) records it for the default catalog key, which the
+      // pool-wide lookup unions. Bypasses the shrink-confirmation guard so the
+      // fixture stays the five rows the upstream actually sent.
+      mergeCloudModels(COST_CONFIGS);
+      return acct;
+    }
+
+    it('marks the three cost-tier-FREE selectors free, with the promo end', async () => {
+      await seedLiveProAccount();
+      const rows = await dashboardModels();
+
+      for (const id of ['swe-2-medium', 'swe-2-high', 'swe-2-max']) {
+        const row = rows.find((r) => r.id === id);
+        assert.ok(row, `${id} missing from the panel`);
+        assert.equal(row.reachable, true, `${id} is in the live catalog and the tier is paid`);
+        assert.equal(row.costTier, 'MODEL_COST_TIER_FREE', id);
+        assert.equal(row.freeNow, true, id);
+        assert.equal(row.freeReason, 'cost_tier_free', id);
+        assert.equal(row.promoEndsAt, '2026-11-01T06:59:59.999Z', id);
+        assert.equal(row.quotaState, 'free', id);
+      }
+    });
+
+    it('marks a discounted paid selector blocked_daily instead of a bare QUOTA chip', async () => {
+      await seedLiveProAccount();
+      const rows = await dashboardModels();
+
+      const row = rows.find((r) => r.id === 'swe-2-medium-lightning');
+      assert.ok(row);
+      assert.equal(row.costTier, 'MODEL_COST_TIER_HIGH');
+      assert.equal(row.freeNow, false);
+      assert.equal(row.freeReason, null);
+      assert.equal(row.promoEndsAt, '2027-01-01T07:59:59.999Z',
+        'a discount is not free, but the operator still needs to see when it ends');
+      assert.equal(row.quotaState, 'blocked_daily',
+        'the account is daily-dry, which is why this selector cannot run right now');
+    });
+
+    it('marks the absent phantom not_in_catalog instead of FREE', async () => {
+      await seedLiveProAccount();
+      const rows = await dashboardModels();
+
+      const phantom = rows.find((r) => r.id === CONNECT_FREE_SELECTOR);
+      assert.ok(phantom, 'the row stays visible so an allow-list entry remains removable');
+      assert.equal(phantom.reachable, false,
+        'the account live catalog omits it, and it 502s with quota exhausted when called');
+      assert.equal(phantom.costTier, null);
+      assert.equal(phantom.freeNow, false,
+        'live pricing data exists and does not name it free — the static floor is not a claim');
+      assert.equal(phantom.freeReason, null);
+      assert.equal(phantom.quotaState, 'not_in_catalog');
     });
   });
 
@@ -401,5 +503,27 @@ describe('dashboard /models agrees with /v1/models on the Connect namespace (#23
       rows.every((r) => r.connectSelector === null),
       'connectSelector must be null off the Connect transport, not a stale resolution',
     );
+  });
+});
+
+describe('read-only discovery does not consume the one-time degrade warning', () => {
+  it('discovery is silent; the next real request warns exactly once', () => {
+    const name = 'zzscale-parity-discovery-ghost';
+    const warns = [];
+    const originalWarn = console.warn;
+    connectModelsTesting.degradeWarned.clear();
+    console.warn = (...args) => { warns.push(args.join(' ')); };
+    try {
+      const reach = buildConnectReachability({ ...process.env, DEVIN_CONNECT: '1' });
+      reach(name);
+      assert.equal(warns.filter((l) => l.includes(name)).length, 0,
+        'catalog discovery is not a paid request and must not spend the warning');
+      resolveConnectSelector(name);
+      assert.equal(warns.filter((l) => l.includes(name)).length, 1,
+        'the first real request after discovery must still warn');
+    } finally {
+      console.warn = originalWarn;
+      connectModelsTesting.degradeWarned.clear();
+    }
   });
 });

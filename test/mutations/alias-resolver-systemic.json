@@ -1,0 +1,93 @@
+{
+  "tests": [
+    "test/devin-connect-models.test.js",
+    "test/tool-emulation-gpt-native.test.js"
+  ],
+  "expectBaselinePass": 58,
+  "mutations": [
+    {
+      "name": "S3 reverted — the prefix strip cannot match a hyphenated provider, so every x-ai/ / z-ai/ spelling fails model_not_found again",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  const stripped = raw.toLowerCase().replace(/^[a-z0-9][a-z0-9-]*\\//, '');",
+      "replacement": "  const stripped = raw.toLowerCase().replace(/^[a-z]+\\//, '');",
+      "expectCaught": true
+    },
+    {
+      "name": "S4 reverted — no compact split, so gpt5.5 / gemini3.5-flash / gpt5.4-mini miss every map lookup again",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  const compact = stripped.replace(/^(gpt|claude|gemini)(\\d)\\./, '$1-$2.');",
+      "replacement": "  const compact = stripped;",
+      "expectCaught": true
+    },
+    {
+      "name": "S4 over-reach — the split no longer requires the version separator, so the family shorthand claude5 becomes the nonexistent claude-5 and degrades",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  const compact = stripped.replace(/^(gpt|claude|gemini)(\\d)\\./, '$1-$2.');",
+      "replacement": "  const compact = stripped.replace(/^(gpt|claude|gemini)(\\d)/, '$1-$2');",
+      "expectCaught": true
+    },
+    {
+      "name": "S5 reverted — the enum test runs on the RAW name again, so a lowercased or prefixed enum matches neither path",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  const enumForm = norm.toUpperCase();",
+      "replacement": "  const enumForm = raw;",
+      "expectCaught": true
+    },
+    {
+      "name": "S5 existence check dropped — a bogus MODEL_* is passed through to #21 instead of failing closed",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  if (/^MODEL_[A-Z0-9_]+$/.test(enumForm)\n    && isKnownConnectSelector(enumForm, { allowSnapshotFallback })) {",
+      "replacement": "  if (/^MODEL_[A-Z0-9_]+$/.test(enumForm)) {",
+      "expectCaught": true
+    },
+    {
+      "name": "S2 reverted — family rules test the literal spelling again, so gpt.5.5.low never reaches the GPT branch",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  const dashed = normalizedModelKey.replace(/\\./g, '-')\n    .replace(/^(gpt|claude|gemini)(\\d)(?=-)/, '$1-$2');",
+      "replacement": "  const dashed = normalizedModelKey\n    .replace(/^(gpt|claude|gemini)(\\d)(?=-)/, '$1-$2');",
+      "expectCaught": true
+    },
+    {
+      "name": "S4/S2 split — the dialect no longer splits the compact version, so gpt5.6-luna misses the 5.4+ gate",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  const dashed = normalizedModelKey.replace(/\\./g, '-')\n    .replace(/^(gpt|claude|gemini)(\\d)(?=-)/, '$1-$2');",
+      "replacement": "  const dashed = normalizedModelKey.replace(/\\./g, '-');",
+      "expectCaught": true
+    },
+    {
+      "name": "S2 partial — the Kimi SKU check tests the literal spelling again, so kimi.k2 flips to the other dialect",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "    if (dashed === 'kimi-k2' || dashed === 'kimi-k2-thinking') {",
+      "replacement": "    if (normalizedModelKey === 'kimi-k2' || normalizedModelKey === 'kimi-k2-thinking') {",
+      "expectCaught": true
+    },
+    {
+      "name": "S7 reverted — the SWE enum target is not read into the family spelling, so swe-1-5 and MODEL_SWE_1_5_SLOW pick different protocols",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  const familyKey = /^model_swe_1_5(?:_slow)?$/.test(dashed) ? 'swe-1-5' : dashed;",
+      "replacement": "  const familyKey = dashed;",
+      "expectCaught": true
+    },
+    {
+      "name": "P2-2 reverted — the dialect strip is wider than the resolver's, so foo_bar/glm-5.1 picks a dialect for a name the resolver degrades",
+      "file": "src/handlers/tool-emulation.js",
+      "anchor": "  const normalizedModelKey = String(modelKey || '').toLowerCase().replace(/^[a-z0-9][a-z0-9-]*\\//, '');",
+      "replacement": "  const normalizedModelKey = String(modelKey || '').toLowerCase().replace(/^[a-z][a-z0-9_-]*\\//, '');",
+      "expectCaught": true
+    },
+    {
+      "name": "bare grok-4-5 alias removed — the family name 400s while grok-4-6 / grok-4-7 keep working",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  'grok-4-5': 'grok-4-5-medium',\n",
+      "replacement": "",
+      "expectCaught": true
+    },
+    {
+      "name": "bare inkling alias removed — the family name 400s although a real -medium target exists",
+      "file": "src/devin-connect-models.js",
+      "anchor": "  'inkling': 'inkling-medium',\n",
+      "replacement": "",
+      "expectCaught": true
+    }
+  ]
+}

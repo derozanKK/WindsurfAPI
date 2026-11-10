@@ -19,6 +19,13 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleChatCompletions, __setConnectDeps } from '../src/handlers/chat.js';
 import { addAccountByKey, removeAccount, getAccountInternal } from '../src/auth.js';
+// The fingerprint case below runs the REAL adapter (no toChatCompletion stub) so it
+// asserts the production derivation, not a fixture's copy of it: the adapter builds
+// system_fingerprint as systemFingerprint(displayModel || params.model)
+// (src/devin-connect-openai.js:565), and __setStreamChatForTest is that module's
+// documented offline seam (same usage as test/devin-connect-openai.test.js).
+import { toChatCompletion as realToChatCompletion, __setStreamChatForTest } from '../src/devin-connect-openai.js';
+import { systemFingerprint } from '../src/system-fingerprint.js';
 
 const FREE_SELECTOR = 'swe-1-6-slow';
 const UNMAPPED_PAID = 'claude-opus-4.9';
@@ -77,6 +84,7 @@ async function chat(model) {
   return {
     status: res?.status ?? null,
     bodyModel: res?.body?.model ?? null,
+    fingerprint: res?.body?.system_fingerprint ?? null,
     errCode: res?.body?.error?.code ?? null,
     wire: seen?.wire ?? null,
     echoed: seen?.echoed ?? null,
@@ -93,6 +101,7 @@ beforeEach(() => {
 afterEach(() => {
   while (seeded.length) removeAccount(seeded.pop());
   __setConnectDeps(null);
+  __setStreamChatForTest(null);
   seen = null;
   for (const k of ENV_KEYS) {
     if (SAVED[k] === undefined) delete process.env[k];
@@ -200,12 +209,36 @@ describe('degrade honesty: the echoed model must be what ran (#234)', () => {
   it('derives system_fingerprint from the echoed name, not the requested one', async () => {
     // The fingerprint is keyed to the model. If it stayed keyed to the requested paid
     // name it would contradict the model field we now report honestly.
+    //
+    // Runs the REAL adapter (the toChatCompletion stub is replaced for this case), so
+    // the fingerprint comes from production code — devin-connect-openai.js:565 keys it
+    // to `displayModel || params.model` — rather than from a fixture that could only
+    // ever agree with itself. The upstream is faked through that module's documented
+    // seam; the fake yields content so the retry-on-empty wrapper does not re-issue.
+    //
+    // The guard this replaced (`if (typeof systemFingerprint !== 'function') return;`)
+    // was never false: chat.js imports systemFingerprint but does not re-export it, so
+    // the case returned early and asserted nothing. Mutating chat.js's connectDisplayModel
+    // back to reqModelName turns it red (measured).
     process.env.WINDSURFAPI_STRICT_MODEL = '0';
-    const { systemFingerprint } = await import('../src/handlers/chat.js');
-    if (typeof systemFingerprint !== 'function') return; // not exported: adapter owns it
+    __setStreamChatForTest(async function* () {
+      yield { type: 'content', text: 'ok' };
+      yield { type: 'finish', reason: 'stop', usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } };
+    });
+    __setConnectDeps({ toChatCompletion: realToChatCompletion });
 
     const r = await chat(UNMAPPED_PAID);
+
+    // Fingerprint first: on the degrade path the honest model name and the honest
+    // fingerprint source are the same string, so a displayModel mutation breaks both —
+    // asserting the fingerprint before the model field is what makes a failure report
+    // the fingerprint contract rather than the sibling one.
+    assert.equal(r.fingerprint, systemFingerprint(FREE_SELECTOR),
+      'the fingerprint must be keyed to the name we report, not to the requested one');
+    assert.notEqual(r.fingerprint, systemFingerprint(UNMAPPED_PAID));
     assert.equal(r.bodyModel, FREE_SELECTOR);
+    // Precondition for the check above: the two names must hash differently, or a
+    // swapped fingerprint would be invisible to it.
     assert.notEqual(systemFingerprint(FREE_SELECTOR), systemFingerprint(UNMAPPED_PAID),
       'precondition: the two names produce different fingerprints');
   });

@@ -88,7 +88,7 @@ describe('#120 — GLM/Kimi/openai_xml dialect anti-fabrication strengthened', (
   const tools = [{ type: 'function', function: { name: 'shell_exec', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }];
 
   it('glm47 preamble now contains anti-fabrication wording', () => {
-    const p = buildToolPreambleForProto(tools, 'auto', '', 'glm-5.1', 'zhipu', 'chat');
+    const p = buildToolPreambleForProto(tools, 'auto', '', 'glm-5', 'zhipu', 'chat');
     assert.match(p, /NEVER FABRICATE|fabricate/i);
     assert.match(p, /timestamps|file contents|command outputs/i);
   });

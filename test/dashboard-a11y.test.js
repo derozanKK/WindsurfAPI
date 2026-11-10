@@ -15,10 +15,17 @@ function method(name) {
 
 describe('dashboard a11y — segmented controls are radio groups (D3a)', () => {
   it('no seg-group still declares role="tablist"', () => {
-    assert.equal(
-      /role="tablist"/.test(html), false,
-      'single-select seg-groups must be radiogroup, not tablist',
-    );
+    const segGroups = html.match(/<div class="seg-group"[^>]*>/g) || [];
+    for (const g of segGroups) {
+      assert.doesNotMatch(g, /role="tablist"/,
+        'single-select seg-groups must be radiogroup, not tablist');
+    }
+    // The merged add-account modal IS a real tablist (tabs -> tabpanels), and it
+    // must stay the only one so this guard keeps policing the seg-groups.
+    assert.equal((html.match(/role="tablist"/g) || []).length, 1,
+      'only the add-account modal may declare a tablist');
+    assert.match(html, /class="add-tabs" role="tablist"/);
+    assert.match(html, /role="tabpanel"/);
   });
 
   it('every seg-group is a labelled radiogroup', () => {

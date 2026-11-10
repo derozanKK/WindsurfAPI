@@ -32,6 +32,7 @@ function fixture() {
   for (const k of Object.keys(env)) if (k.startsWith('GIT_')) delete env[k];
   mkdirSync(join(root, 'scripts'));
   writeFileSync(join(root, 'scripts/secret-scan.mjs'), readFileSync(new URL('../scripts/secret-scan.mjs', import.meta.url)));
+  writeFileSync(join(root, 'scripts/secret-rules.mjs'), readFileSync(new URL('../scripts/secret-rules.mjs', import.meta.url)));
   writeFileSync(join(root, 'tracked.js'), '// clean\n');
   const git = (...args) => execFileSync('git', args, { cwd: root, env, stdio: 'pipe' });
   git('init', '-q');

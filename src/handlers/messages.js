@@ -14,7 +14,15 @@
 import { createHash, randomUUID } from 'crypto';
 import { handleChatCompletions, connectErrorToHttp } from './chat.js';
 import { log } from '../config.js';
+import { createBoundedWriter, resolveMaxDrainWaitMs } from '../stream-writer.js';
+import { SseFramer } from '../sse-framer.js';
+import { buildToolNameMap, restoreToolName } from '../tool-names.js';
+import { createToolIdAllocator, normalizeToolIdsInMessages, toolHygieneEnabled } from '../tool-ids.js';
+import { normalizeHistoryTail } from '../history-normalize.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from '../leak-trace.js';
+import { recordToolDeferLoading } from './cc-compat.js';
+import { getModelInfo, resolveModel } from '../models.js';
+import { isClaudeThinkingSignature } from '../claude-signature.js';
 
 function genMsgId() {
   return 'msg_' + randomUUID().replace(/-/g, '').slice(0, 24);
@@ -137,6 +145,16 @@ function clientFacingMessage(type, rawMessage) {
 function withUpstreamHeaders(response, headers) {
   if (!headers || typeof headers !== 'object' || !Object.keys(headers).length) return response;
   return { ...response, headers: { ...headers, ...response.headers } };
+}
+
+// The chat handler's error body is OpenAI-shaped; this surface's is Anthropic-shaped.
+// Translate the type/status and carry the upstream transport headers.
+function toAnthropicChatError(result) {
+  const err = result?.body?.error || {};
+  return withUpstreamHeaders(
+    toAnthropicError(result.status || 502, err.type, err.message),
+    result.headers,
+  );
 }
 
 function toAnthropicError(status, internalType, message) {
@@ -446,6 +464,72 @@ function invalidRequest(message) {
   return { status: 400, body: { type: 'error', error: { type: 'invalid_request_error', message } } };
 }
 
+// CL2 (Claude Code 2.1.306, beta `context-management-2025-06-27`): the client
+// now sends `context_management.edits[]` asking the API to prune history. The
+// upstream has no equivalent directive, so every edit must either be satisfied
+// by this bridge's own translation or be refused with an actionable 400 —
+// silently dropping it would let a caller's context bound go unenforced.
+//
+// Supported: `clear_thinking_20251015`. anthropicToOpenAI already drops every
+// incoming thinking block before forwarding (the upstream cannot consume them:
+// no real signature, and the K2 family ignores the candidate tag), so the
+// edit's context-growth intent holds for any `keep` value. `keep` is still
+// shape-validated so a malformed edit fails loudly instead of half-applying.
+// Refused: `clear_tool_uses_20250919` (token-triggered pruning of
+// tool_use/tool_result pairs is a server-side edit with no upstream
+// counterpart; accepting it while forwarding the full history would silently
+// ignore the bound) and any unknown edit type.
+const SUPPORTED_CONTEXT_EDITS = new Set(['clear_thinking_20251015']);
+const CONTEXT_MANAGEMENT_ACTION =
+  'Remove the unsupported edit from context_management.edits (or disable context editing in the client) and retry.';
+
+// Anthropic error objects have no `param`/`code`, but both are additive and the
+// OpenAI-dialect code names the failure precisely. `unsupported_parameter` is
+// the same code chat.js uses for a request field this deployment cannot honour.
+function unsupportedParameter(param, message) {
+  return {
+    status: 400,
+    body: { type: 'error', error: { type: 'invalid_request_error', message, param, code: 'unsupported_parameter' } },
+  };
+}
+
+// `keep` for clear_thinking_20251015: "all" | "none" | {type:"thinking_turns",
+// value:<positive integer>}. Anything else is a malformed request, not an
+// unsupported feature, so it gets invalid_request_error.
+function validateThinkingKeep(keep, where) {
+  if (keep == null || keep === 'all' || keep === 'none') return null;
+  if (typeof keep !== 'object' || Array.isArray(keep)) {
+    return invalidRequest(`${where}.keep must be 'all', 'none', or { type: 'thinking_turns', value: <positive integer> }`);
+  }
+  if (keep.type !== 'thinking_turns') return invalidRequest(`${where}.keep.type must be 'thinking_turns'`);
+  if (!Number.isInteger(keep.value) || keep.value < 1) {
+    return invalidRequest(`${where}.keep.value must be a positive integer`);
+  }
+  return null;
+}
+
+function validateContextManagement(cm) {
+  if (cm == null) return null;
+  if (typeof cm !== 'object' || Array.isArray(cm)) return invalidRequest('context_management must be an object');
+  if (cm.edits == null) return null;
+  if (!Array.isArray(cm.edits)) return invalidRequest('context_management.edits must be an array');
+  for (let i = 0; i < cm.edits.length; i++) {
+    const edit = cm.edits[i];
+    const where = `context_management.edits[${i}]`;
+    if (!edit || typeof edit !== 'object' || Array.isArray(edit)) return invalidRequest(`${where} must be an object`);
+    if (typeof edit.type !== 'string' || !edit.type) return invalidRequest(`${where}.type is required`);
+    if (!SUPPORTED_CONTEXT_EDITS.has(edit.type)) {
+      return unsupportedParameter(
+        `${where}.type`,
+        `context_management edit type "${edit.type}" is not supported by this proxy. Supported: clear_thinking_20251015. ${CONTEXT_MANAGEMENT_ACTION}`,
+      );
+    }
+    const keepErr = validateThinkingKeep(edit.keep, where);
+    if (keepErr) return keepErr;
+  }
+  return null;
+}
+
 // C4: a cache_control breakpoint must be { type: 'ephemeral', ttl?: '5m'|'1h' }.
 // Non-ephemeral types and unknown ttl values were silently accepted (ttl fell
 // back to 5m); official behavior is a 400. Returns an error {status,body} or null.
@@ -475,6 +559,10 @@ export function validateMessagesRequest(body) {
   if (typeof mt !== 'number' || !Number.isInteger(mt) || mt < 1) {
     return invalidRequest('max_tokens must be a positive integer');
   }
+  // CL2: context_management edits are either satisfied locally or refused —
+  // never silently dropped (Claude Code 2.1.306 sends one on every turn).
+  const cmErr = validateContextManagement(body.context_management);
+  if (cmErr) return cmErr;
   // C3/C4: walk every block that can carry a cache_control breakpoint in the
   // same tools → system → messages prefix order extractCachePolicy uses.
   let breakpointCount = 0;
@@ -521,6 +609,22 @@ export function validateCountTokensRequest(body) {
   if (!body || typeof body !== 'object') return invalidRequest('request body must be a JSON object');
   if (body.model == null || body.model === '') return invalidRequest('model: field required');
   return null;
+}
+
+// Native replay of signed Claude thinking on DEVIN_CONNECT (default OFF). The
+// upstream verifies the signature (a one-character change is rejected with
+// invalid_argument) and only then lets the model see the replayed thinking:
+// measured 2026-10-28 on claude-opus-5-5, recalled 2/2 inside a tool loop with
+// #11+#12 (0/3 with #11 alone) and 3/3 after a later user message (0/4 without
+// replay). Needs DEVIN_CONNECT_SIGNATURE_TAG so the client receives the
+// signatures in the first place.
+export function signedThinkingReplayEnabled(env = process.env, model = null) {
+  const normalized = model == null ? '' : String(model).trim().toLowerCase();
+  const provider = model == null
+    ? 'anthropic'
+    : getModelInfo(resolveModel(model))?.provider
+      || (/^(?:claude-|anthropic\/)/.test(normalized) ? 'anthropic' : null);
+  return provider === 'anthropic' && String(env.DEVIN_CONNECT_REPLAY_SIGNED_THINKING || '').trim() === '1';
 }
 
 // A3: normalize an Anthropic image block ({ type:'image', source:{...} }) into
@@ -614,7 +718,61 @@ export { neutralizeClientIdentity } from './identity-neutralize.js';
 import { neutralizeClientIdentity } from './identity-neutralize.js';
 
 function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
+  if (signedThinkingReplayEnabled(process.env, body.model)
+      && (body.tools || []).length
+      && (String(process.env.DEVIN_CONNECT_TOOL_CALL_TAGS || '').trim() === 'invalid'
+        || String(process.env.DEVIN_CONNECT_TOOL_DEF_TAGS || '').trim() === 'invalid')) {
+    const signedToolHistory = (body.messages || []).some((message) => message?.role === 'assistant' && Array.isArray(message.content)
+      && message.content.some((block) => block?.type === 'thinking' && block.thinking && block.signature)
+      && message.content.some((block) => block?.type === 'tool_use'));
+    if (signedToolHistory) {
+      const err = new Error('Signed thinking replay requires native tool history; prompt emulation would discard the signed assistant turn.');
+      err.status = 400;
+      err.param = 'messages';
+      err.code = 'signed_thinking_tool_history_unsupported';
+      throw err;
+    }
+  }
+  if (signedThinkingReplayEnabled(process.env, body.model)) {
+    for (const message of body.messages || []) {
+      if (message?.role !== 'assistant' || !Array.isArray(message.content)) continue;
+      for (const block of message.content) {
+        if (block?.type === 'thinking' && block.signature && !isClaudeThinkingSignature(block.signature)) {
+          const err = new Error('Unsupported Claude thinking signature envelope; replay accepts only an unprefixed E/R/C/Q structure.');
+          err.status = 400;
+          err.param = 'messages';
+          err.code = 'unsupported_thinking_signature';
+          throw err;
+        }
+      }
+    }
+  }
   const cachePolicy = extractCachePolicy(body, promptEstimate);
+  // CL2: context_management is validated at the entry point
+  // (validateMessagesRequest). clear_thinking_20251015 needs no translation:
+  // the message loop below already drops every incoming thinking block, so the
+  // forwarded history contains none — the strictest form of the edit. Log a
+  // real pruning request (keep !== "all") so the substitution is visible;
+  // keep:"all" is the 2.1.306 default and needs no per-turn line.
+  for (const edit of (Array.isArray(body.context_management?.edits) ? body.context_management.edits : [])) {
+    if (edit?.type === 'clear_thinking_20251015' && edit.keep != null && edit.keep !== 'all') {
+      const keep = typeof edit.keep === 'object' ? `thinking_turns:${edit.keep?.value}` : edit.keep;
+      log.info(`messages: context_management clear_thinking_20251015 keep=${keep} — incoming thinking blocks are already dropped before forwarding (edit satisfied)`);
+    }
+  }
+  const historyToolNames = [];
+  for (const m of body.messages || []) {
+    if (m?.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    for (const block of m.content) {
+      if (block?.type === 'tool_use' && typeof block.name === 'string' && block.name) historyToolNames.push(block.name);
+    }
+  }
+  const toolNameMap = toolHygieneEnabled()
+    ? buildToolNameMap([
+      ...(body.tools || []).map((t) => t?.name).filter(Boolean),
+      ...historyToolNames,
+    ])
+    : null;
   const mapAnthropicToolChoice = (toolChoice) => {
     if (!toolChoice || typeof toolChoice !== 'object') return toolChoice;
     if (toolChoice.type === 'auto') return 'auto';
@@ -625,14 +783,51 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
     }
     return toolChoice;
   };
+  // A07/KH-003: a forced/required choice that cannot survive conversion is a
+  // 400, never a silent downgrade to auto. Dropping it left the model free to
+  // answer as if the caller had not asked for that tool at all.
+  const toolChoiceContractError = (detail) => {
+    const err = new Error(`Invalid 'tool_choice': ${detail}.`);
+    err.param = 'tool_choice';
+    err.code = 'tool_choice_tool_not_declared';
+    err.status = 400;
+    return err;
+  };
   const pruneToolChoice = (toolChoice, forwardedTools) => {
-    if (!toolChoice || !forwardedTools.length) return undefined;
+    if (!toolChoice) return undefined;
+    if (toolChoice === 'none') return 'none';
+    if (toolChoice === 'auto') return forwardedTools.length ? 'auto' : undefined;
+    if (toolChoice === 'required') {
+      if (!forwardedTools.length) {
+        throw toolChoiceContractError("tool_choice 'required' cannot be satisfied because no executable tools remain");
+      }
+      return 'required';
+    }
     if (toolChoice.type === 'function') {
       const names = new Set(forwardedTools.map(t => t.function?.name).filter(Boolean));
-      return names.has(toolChoice.function?.name) ? toolChoice : undefined;
+      if (!names.has(toolChoice.function?.name)) {
+        throw toolChoiceContractError(`function '${toolChoice.function?.name || ''}' not found in 'tools'`);
+      }
+      return toolChoice;
     }
     return toolChoice;
   };
+  // A07/KH-003: refuse a forced server-side tool BEFORE pruneToolChoice sees
+  // only the post-filter list, so the error names the real reason instead of a
+  // generic "not declared".
+  if (body.tool_choice?.type === 'tool' && body.tool_choice.name) {
+    const declared = (body.tools || []).find(t => t?.name === body.tool_choice.name);
+    if (!declared) {
+      throw toolChoiceContractError(`function '${body.tool_choice.name}' not found in 'tools'`);
+    }
+    if (declared.type && SERVER_SIDE_ANTHROPIC_TOOL_TYPES.has(declared.type)) {
+      const err = new Error(`Server-executed tool "${declared.type}" is not supported by this proxy: it requires an executor that runs on this server, and this proxy has none.`);
+      err.param = 'tool_choice';
+      err.code = 'unsupported_server_side_tool';
+      err.status = 400;
+      throw err;
+    }
+  }
   const messages = [];
   const toolNameById = new Map();
   // T2 (Thinking-core): capture the LAST assistant turn's incoming thinking before
@@ -640,10 +835,15 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
   // upstream response itself carries none (resumed dialogs).
   let lastIncomingThinking = null;
   if (body.system) {
+    // `body.system` is a string or an array of text blocks — both are legal
+    // Anthropic shapes, and the typeof branch handles the string. In the array
+    // branch a malformed element contributes nothing instead of throwing:
+    // `system:[null]` used to 500 the whole request at `b.text` (the same
+    // class as the null content-block guard in the message loop below).
     const rawSys = typeof body.system === 'string'
       ? body.system
       : Array.isArray(body.system)
-        ? body.system.map(b => b.text || '').join('\n')
+        ? body.system.map(b => b?.text || '').join('\n')
         : '';
     // Strip the competitor self-ID that trips Devin's upstream fingerprint gate.
     // ccActive gates only the opt-in (cc) aggressive block; a1-a5 stay on for all.
@@ -660,7 +860,19 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
       const toolCalls = [];
       const toolResults = [];
       const msgThinking = [];
+      // Signed thinking, kept only when EVERY thinking block on the turn carries a
+      // signature: the upstream verifies each signature against its own text, so a
+      // partial set cannot be replayed (see signedThinkingReplayEnabled).
+      const signedThinking = [];
+      let unsignedThinking = false;
       for (const block of m.content) {
+        // Malformed block shapes are dropped, never fatal: a null/undefined
+        // entry (or a bare string) used to throw
+        // `TypeError: Cannot read properties of null (reading 'type')` here
+        // and 500 the whole request. Same skip convention as geminiToOpenAI
+        // (`if (part == null) continue`), responses' normalizeMessageContent
+        // (`if (!part) continue`) and the image extractors.
+        if (!block || typeof block !== 'object') continue;
         if (block.type === 'text') {
           textParts.push(block.text || '');
         } else if (block.type === 'image') {
@@ -692,19 +904,28 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
           }
         } else if (block.type === 'thinking') {
           if (typeof block.thinking === 'string' && block.thinking) msgThinking.push(block.thinking);
+          if (typeof block.thinking === 'string' && block.thinking
+              && typeof block.signature === 'string' && block.signature) {
+            signedThinking.push({ thinking: block.thinking, signature: block.signature });
+          } else {
+            unsignedThinking = true;
+          }
           // Incoming assistant thinking blocks are dropped on history translation:
           // 1) Upstream swe-1-7 (K2 family) accepts outgoing candidate tag #11 in ChatMessage,
           //    but causally ignores its content (0/3 causal effect; tag #9 is incoming-only).
           // 2) Wholesale promotion (reasoning -> text content) is an industry anti-pattern
           //    inducing self-reflection loops on Kimi/DeepSeek families.
           // 3) Genuine Bedrock clients send #11+#12 (signature), but K2 family emits no signature.
+          // Exception: a SIGNED Claude thinking block is replayed natively (below) when
+          // DEVIN_CONNECT_REPLAY_SIGNED_THINKING=1 — measured 2026-10-28 on
+          // claude-opus-5-5: #11+#12 is verified upstream and recalled inside a tool loop.
         } else if (block.type === 'tool_use' && role === 'assistant') {
           const id = block.id || `call_${randomUUID().slice(0, 8)}`;
           toolNameById.set(id, block.name || '');
           toolCalls.push({
             id,
             type: 'function',
-            function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
+            function: { name: toolNameMap?.toUpstream.get(block.name) ?? block.name, arguments: JSON.stringify(block.input ?? {}) },
           });
         } else if (block.type === 'tool_result') {
           // B2: flatten sub-blocks without dropping non-text (image) blocks.
@@ -717,27 +938,50 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
             toolName: toolNameById.get(block.tool_use_id),
             isError: !!block.is_error,
           });
+          // B2 (GFHarness probe C): is_error used to be read ONLY by the Read
+          // stub heuristic above, so a failed Bash/Edit/etc. result reached the
+          // model as an ordinary success output. Neither the OpenAI-shaped tool
+          // message nor the Cascade request encoder has an is_error slot (the
+          // proto's field 7 exists only on the response delta), so the flag is
+          // carried in the one field the model reads — the content. A fixed
+          // prefix keeps every failed result distinguishable and non-error
+          // results byte-identical.
+          if (block.is_error) content = `[tool error] ${content}`;
           toolResults.push({ role: 'tool', tool_call_id: block.tool_use_id, content });
         }
       }
       if (role === 'assistant' && msgThinking.length) {
         lastIncomingThinking = msgThinking.join('\n');
       }
+      // Signed thinking to replay on this assistant turn, tool-call turn or not:
+      // Opus 4.5+ keeps prior turns' thinking in context, and the upstream honors
+      // a replay after a later user message too (measured 2026-10-28: recall 3/3
+      // replayed vs 0/4 without, forced-answer design). One block only: the wire
+      // has one #11/#12 slot per message.
+      const signedReplay = role === 'assistant' && signedThinkingReplayEnabled(process.env, body.model)
+        && !unsignedThinking && signedThinking.length === 1
+        ? signedThinking[0]
+        : null;
+      const withSignedThinking = (msg) => (signedReplay
+        ? { ...msg, reasoning_content: signedReplay.thinking, reasoning_signature: signedReplay.signature }
+        : msg);
       // Tool results must directly follow the assistant tool_calls message
       // in OpenAI format. Push them before the user content message.
       for (const tr of toolResults) messages.push(tr);
       if (toolCalls.length) {
-        messages.push({
+        messages.push(withSignedThinking({
           role: 'assistant',
           content: textParts.length ? textParts.join('\n') : null,
           tool_calls: toolCalls,
-        });
+        }));
       } else if (imageParts.length) {
         const contentArr = [...imageParts];
         if (textParts.length) contentArr.push({ type: 'text', text: textParts.join('\n') });
-        messages.push({ role, content: contentArr });
+        messages.push(withSignedThinking({ role, content: contentArr }));
       } else if (textParts.length) {
-        messages.push({ role, content: textParts.join('\n') });
+        messages.push(withSignedThinking({ role, content: textParts.join('\n') }));
+      } else if (signedReplay) {
+        messages.push({ role: 'assistant', content: null, reasoning_content: signedReplay.thinking, reasoning_signature: signedReplay.signature });
       }
     }
   }
@@ -751,6 +995,30 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
   // a server_tool_result for.
   const droppedServerTools = [];
   const convertedServerTools = [];
+  const droppedDuplicateTools = [];
+  // CL3 (Claude Code 2.1.306 `defer_loading`): two buckets, both logged below.
+  // honored = a deferred tool with no declared parameters, dropped because
+  // there is no schema to load and the client forbids calling it; ignored = a
+  // deferred tool WITH a schema, forwarded anyway because the upstream has no
+  // tool-loading protocol (see the branch in the reduce).
+  const deferredPlaceholders = [];
+  const deferredIgnored = [];
+  // GFHarness: duplicate tool names were forwarded verbatim — a caller function
+  // named `web_search` plus the web_search_20250305 conversion produced
+  // `tools: ["web_search", "web_search"]`. Duplicate names are ambiguous for the
+  // model and rejected by Anthropic's own API, so the forwarded list is
+  // deduplicated deterministically: one definition per wire name, first caller
+  // definition wins. A caller-declared function always shadows the synthesized
+  // conversion regardless of array order (the client can only execute names it
+  // declared), so caller names are pre-scanned rather than discovered in order.
+  const callerToolNames = new Set();
+  for (const t of body.tools || []) {
+    if (t?.type === 'web_search_20250305') continue;
+    if (t?.type && SERVER_SIDE_ANTHROPIC_TOOL_TYPES.has(t.type)) continue;
+    const name = toolNameMap?.toUpstream.get(t?.name) ?? t?.name;
+    if (typeof name === 'string' && name) callerToolNames.add(name);
+  }
+  const emittedToolNames = new Set();
   const tools = (body.tools || []).reduce((acc, t) => {
     if (t?.type && SERVER_SIDE_ANTHROPIC_TOOL_TYPES.has(t.type)) {
       droppedServerTools.push(t.type);
@@ -760,15 +1028,58 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
     if (t?.type === 'web_search_20250305') {
       const converted = convertServerSideTool(t);
       if (converted) {
-        acc.push(converted);
-        convertedServerTools.push('web_search_20250305→web_search');
+        const name = converted.function.name;
+        if (callerToolNames.has(name) || emittedToolNames.has(name)) {
+          droppedDuplicateTools.push(name);
+        } else {
+          emittedToolNames.add(name);
+          acc.push(converted);
+          convertedServerTools.push('web_search_20250305→web_search');
+        }
       }
       return acc;
     }
+    // CL3: Anthropic deferred tool loading. `defer_loading:true` says "do not
+    // put this schema in the model's context; the client will load it later".
+    // The upstream has no tool-loading protocol we can speak — devin-connect.js
+    // has proprietary custom_tool/defer_loading ToolDef tags, but their field
+    // numbers are uncalibrated and emitting one risks a broken frame — so:
+    //   • no declared parameters (Claude Code's DeferredToolPlaceholder: empty
+    //     schema, "never call this tool"): drop it. There is nothing to load
+    //     and forwarding it only invites a call the client cannot answer.
+    //   • a schema-bearing deferred tool: forward it in full and count it as
+    //     `tool_defer_loading_ignored`. Dropping it would leave the tool
+    //     permanently uncallable (a ToolSearch result is text, not a
+    //     declaration), so the deviation is made visible instead of silent.
+    // `defer_loading` itself is never forwarded — the OpenAI-shaped tool has no
+    // slot for it.
+    if (t?.defer_loading === true) {
+      const schema = t.input_schema;
+      const hasDeclaredParams = !!schema && typeof schema === 'object' && (
+        (schema.properties && typeof schema.properties === 'object' && Object.keys(schema.properties).length > 0)
+        || (Array.isArray(schema.required) && schema.required.length > 0)
+      );
+      if (!hasDeclaredParams) {
+        deferredPlaceholders.push(t.name || '(unnamed)');
+        return acc;
+      }
+    }
+    const name = toolNameMap?.toUpstream.get(t.name) ?? t.name;
+    if (typeof name === 'string' && name) {
+      if (emittedToolNames.has(name)) {
+        droppedDuplicateTools.push(name);
+        return acc;
+      }
+      emittedToolNames.add(name);
+    }
+    // Count only what is actually forwarded: a schema-bearing deferred tool
+    // that lost the dedupe race is already reported by droppedDuplicateTools,
+    // so counting it as an ignored deferral too would double-report it.
+    if (t?.defer_loading === true) deferredIgnored.push(t.name || '(unnamed)');
     acc.push({
       type: 'function',
       function: {
-        name: t.name,
+        name,
         description: t.description || '',
         parameters: t.input_schema || {},
       },
@@ -781,8 +1092,25 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
   if (convertedServerTools.length) {
     log.info(`messages: converted ${convertedServerTools.length} server-side tool(s) [${convertedServerTools.join(',')}]`);
   }
+  if (droppedDuplicateTools.length) {
+    log.warn(`messages: dropped ${droppedDuplicateTools.length} duplicate tool definition(s) [${[...new Set(droppedDuplicateTools)].join(',')}] — one definition per name, first caller definition wins`);
+  }
+  // CL3: one structured line per request that carried deferred tools, plus the
+  // process counters exposed through getCcCompatStats() (dashboard diagnostics).
+  if (deferredPlaceholders.length || deferredIgnored.length) {
+    recordToolDeferLoading({ honored: deferredPlaceholders.length, ignored: deferredIgnored.length });
+  }
+  if (deferredPlaceholders.length) {
+    log.info(`messages: dropped ${deferredPlaceholders.length} deferred tool placeholder(s) [${[...new Set(deferredPlaceholders)].join(',')}] — defer_loading honored (no schema to load, never callable by design)`);
+  }
+  if (deferredIgnored.length) {
+    log.warn(`messages: tool_defer_loading_ignored count=${deferredIgnored.length} tools=[${[...new Set(deferredIgnored)].join(',')}] — upstream has no tool-loading protocol; schemas forwarded so the tools stay callable`);
+  }
+  const mappedToolChoice = body.tool_choice ? mapAnthropicToolChoice(body.tool_choice) : undefined;
   const forwardedToolChoice = pruneToolChoice(
-    body.tool_choice ? mapAnthropicToolChoice(body.tool_choice) : undefined,
+    mappedToolChoice?.type === 'function'
+      ? { ...mappedToolChoice, function: { ...mappedToolChoice.function, name: toolNameMap?.toUpstream.get(mappedToolChoice.function.name) ?? mappedToolChoice.function.name } }
+      : mappedToolChoice,
     tools,
   );
   // Claude Code 2.x and Anthropic SDK clients send response shape and
@@ -830,6 +1158,7 @@ function anthropicToOpenAI(body, ccActive = false, promptEstimate = null) {
       ? { parallel_tool_calls: false }
       : {}),
     ...(forwardedToolChoice ? { tool_choice: forwardedToolChoice } : {}),
+    ...((tools.length || historyToolNames.length) && toolNameMap ? { __toolNameMap: toolNameMap } : {}),
     ...(body.thinking ? { thinking: body.thinking } : {}),
     ...(ocEffort ? { reasoning_effort: ocEffort } : {}),
     ...(translatedResponseFormat ? { response_format: translatedResponseFormat } : {}),
@@ -863,29 +1192,32 @@ export function annotateRiskyReadToolResult(content, { toolName = '', isError = 
 
 // ─── OpenAI → Anthropic non-stream response translation ──────
 
-export function openAIToAnthropic(result, model, msgId, cachePolicy = null, stopSequences = null) {
+export function openAIToAnthropic(result, model, msgId, cachePolicy = null, stopSequences = null, toolNameMap = null) {
   const choice = result.choices?.[0];
   const usage = result.usage || {};
   const content = [];
   if (choice?.message?.reasoning_content) {
     // Anthropic thinking blocks may carry an opaque encrypted `signature` that
     // the *real* Anthropic server decrypts on multi-turn replay. Our upstream
-    // (Devin #9 / Cascade) never emits one, so when it is missing we omit the
-    // field entirely rather than emitting an empty-string placeholder — some
-    // strict clients (e.g. Grok Build's messages backend) reject `signature: ""`
-    // as a missing/invalid value. If upstream ever supplies a real signature we
-    // forward it (forward-compat for a future thinking/paid model).
-    const thinkingBlock = {
+    // (Devin #9 / Cascade) never emits one, so we fall back to an empty string.
+    // The key itself must always be present: strict clients (e.g. Grok Build's
+    // messages backend, serde `signature: String`) fail the whole response with
+    // "missing field `signature`" when it is omitted, while `""` parses fine.
+    // If upstream ever supplies a real signature we forward it.
+    content.push({
       type: 'thinking',
       thinking: choice.message.reasoning_content,
-    };
-    if (choice.message.reasoning_signature) {
-      thinkingBlock.signature = choice.message.reasoning_signature;
-    }
-    content.push(thinkingBlock);
+      signature: choice.message.reasoning_signature || '',
+    });
   }
   if (choice?.message?.tool_calls?.length) {
     if (choice.message.content) content.push({ type: 'text', text: choice.message.content });
+    // Upstream may reuse one call id for two distinct calls; the client must
+    // never see the same tool_use id twice (GFProtocol Q1-04).
+    const fallbackToolId = () => `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+    const allocateToolId = toolHygieneEnabled()
+      ? createToolIdAllocator({ makeFallback: fallbackToolId })
+      : (id) => id || fallbackToolId();
     for (const tc of choice.message.tool_calls) {
       let input = {};
       const rawArgs = tc.function?.arguments;
@@ -905,8 +1237,8 @@ export function openAIToAnthropic(result, model, msgId, cachePolicy = null, stop
         // B3: fall back to a generated toolu_ id when the upstream omits one,
         // symmetric with the request-side id fallback in anthropicToOpenAI. A
         // tool_use block without an id is invalid Anthropic output.
-        id: tc.id || `toolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
-        name: tc.function?.name || 'unknown',
+        id: allocateToolId(tc.id),
+        name: restoreToolName(tc.function?.name, toolNameMap) || 'unknown',
         input,
       });
     }
@@ -1024,21 +1356,33 @@ function buildAnthropicUsage(usage, cachePolicy = null) {
     }
   }
   // v2.0.68 (#118): Anthropic semantics for input_tokens DIFFER from OpenAI.
-  // OpenAI: prompt_tokens = freshInput + cacheRead (cached_tokens is a subset;
-  //         cache_creation ships SEPARATELY, not inside prompt_tokens).
+  // OpenAI: prompt_tokens = the full input the model processed.
   // Anthropic: input_tokens = freshInput ONLY; cache_read_input_tokens and
   //            cache_creation_input_tokens are siblings (mutually exclusive).
-  // Real upstream path (chat.js buildUsageBody): prompt_tokens already excludes
-  // cache_creation, so freshInput = promptTotal - cacheRead is correct and we
-  // must NOT subtract creation again.
+  //
+  // The two producers disagree on whether cache_creation lives INSIDE
+  // prompt_tokens: chat.js buildUsageBody (Cascade) excludes it, while the
+  // connect normalizer (O2) includes it because the upstream reports the written
+  // prefix as input. Neither can be re-derived from promptTotal alone, so both
+  // emit an explicit fresh bucket when they have one:
+  //   - connect: `usage.fresh_input_tokens` (top level)
+  //   - Cascade: `usage.cascade_breakdown.fresh_input_tokens`
+  // Prefer those; the arithmetic fallback stays for hand-built/synthetic blocks.
   // B6: the LOCAL-estimate fallback path is different — promptTotal there is the
   // whole-request estimate that INCLUDES the cacheable prefix now counted in
   // cacheCreationFlat. Subtract it too so the three buckets
   // (input / cache_creation / cache_read) are mutually exclusive and don't
   // double-count the prefix. Negative values clamp to 0 (defensive).
+  const connectFresh = usage.fresh_input_tokens;
+  const cascadeFresh = usage.cascade_breakdown?.fresh_input_tokens;
+  const reportedFresh = connectFresh != null && Number.isFinite(Number(connectFresh))
+    ? Math.max(0, Number(connectFresh))
+    : (cascadeFresh != null && Number.isFinite(Number(cascadeFresh))
+      ? Math.max(0, Number(cascadeFresh))
+      : null);
   const freshInput = usedEstimate
     ? Math.max(0, promptTotal - cacheRead - cacheCreationFlat)
-    : Math.max(0, promptTotal - cacheRead);
+    : (reportedFresh != null ? reportedFresh : Math.max(0, promptTotal - cacheRead));
   return {
     input_tokens: freshInput,
     output_tokens: usage.completion_tokens || usage.output_tokens || 0,
@@ -1058,7 +1402,7 @@ function buildAnthropicUsage(usage, cachePolicy = null) {
 // ─── Streaming translator: intercepts OpenAI SSE, emits Anthropic SSE ──
 
 class AnthropicStreamTranslator {
-  constructor(res, msgId, model, cachePolicy = null, inputEstimate = 0, stopSequences = null, reqId = null, conversationId = null) {
+  constructor(res, msgId, model, cachePolicy = null, inputEstimate = 0, stopSequences = null, reqId = null, conversationId = null, toolNameMap = null) {
     this.res = res;
     this.msgId = msgId;
     this.model = model;
@@ -1066,6 +1410,7 @@ class AnthropicStreamTranslator {
     // caller threads them in — log fields only, no behavior.
     this.reqId = reqId;
     this.conversationId = conversationId;
+    this.toolNameMap = toolNameMap;
     // Local cache-prefix estimate from extractCachePolicy; used by finish() to
     // fill cache_creation_input_tokens when upstream reports none (see
     // buildAnthropicUsage). null when the request had no cache_control markers.
@@ -1083,7 +1428,22 @@ class AnthropicStreamTranslator {
     // type: 'text' | 'thinking' | 'tool_use'
     this.current = null;
     this.blockIndex = 0;
-    this.toolCallBufs = new Map();   // index → { id, name, argsBuffered }
+    this.toolCallBufs = new Map();   // index → { id, rawId, name, argsBuffered }
+    // Egress id allocator: upstream may reuse one call id for two distinct
+    // calls, but the client must never see the same tool_use id twice
+    // (GFProtocol Q1-04). First-seen id wins; duplicates get a stable suffix.
+    this.allocateToolId = toolHygieneEnabled()
+      ? createToolIdAllocator()
+      : (id) => id || '';
+    // B1: text/thinking that arrived while a tool_use block was open. Anthropic
+    // allows only one open content block and a tool_use block is never reopened,
+    // so emitting text immediately would close the tool and strand every later
+    // argument fragment (GFHarness probe B assembled `{"path"`, which Claude Code
+    // cannot parse). Held deltas are emitted in arrival order once every tool
+    // block has closed; when the open tool's arguments already form complete
+    // JSON it is closed first and the text streams in place, keeping ordinary
+    // non-interleaved streams byte-identical.
+    this.heldDeltas = [];
     this.finalUsage = null;
     this.stopReason = 'end_turn';
     // B5/SEED-C3a: the request's accepted stop_sequences (used to validate the
@@ -1105,20 +1465,44 @@ class AnthropicStreamTranslator {
     // chat.js emits `[DONE]` on that path too — so both signals must be discounted
     // together or BUG1's guard stays defeated.
     this.sawSyntheticFinish = false;
-    this.pendingSseBuf = '';
+    this.sseFramer = new SseFramer({ onFrame: (frame) => this.handleSseFrame(frame) });
     // Anthropic streams close a thinking block with a `signature_delta` carrying
     // the encrypted-thinking signature. Our upstream never produces one, so we
     // keep the pending signature empty and only emit the delta if a real
-    // `delta.reasoning_signature` arrives. An empty-string fallback is omitted
-    // because strict clients (e.g. Grok Build's messages backend) reject
-    // `signature: ""` as an invalid value.
+    // `delta.reasoning_signature` arrives. The thinking content_block_start
+    // always carries `signature: ""` (as Anthropic does), so strict clients that
+    // require the key (e.g. Grok Build's messages backend) still parse it.
     this.pendingThinkingSignature = '';
+    this.signedThinkingSegment = false;
+    this.multipleSignedThinkingSegments = false;
+    // V-08/D8: one abort-aware bounded writer for this egress. `res` is the RE…
+    // response; the Chat producer writes into `createCaptureRes`, which reports
+    // THIS writer's pressure back to it. Without the wait the translator consumed
+    // `res.write()`'s false verdict itself, so the Cascade/Connect producer was
+    // never held and a slow reader bought unbounded upstream production.
+    const maxWaitMs = resolveMaxDrainWaitMs();
+    this.writer = createBoundedWriter({
+      res,
+      maxWaitMs,
+      onTimeout: () => {
+        // Teardown belongs to chat.js's own bounded writer (it writes the typed
+        // DRAIN_TIMEOUT frame and aborts the upstream turn). Log only: ending the
+        // response here would race that stage and strip the error frame.
+        log.warn(`Messages: no drain for ${maxWaitMs}ms — the client stopped reading`);
+      },
+    });
+  }
+
+  /** True while the client's socket has not accepted the bytes we handed it. */
+  get egressOk() {
+    return !this.writer.pending;
   }
 
   send(event, data) {
     if (!this.res.writableEnded) {
-      this.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      return this.writer.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     }
+    return true;
   }
 
   // F6: official Anthropic streams emit typed `event: ping` frames (with a
@@ -1164,11 +1548,16 @@ class AnthropicStreamTranslator {
   }
 
   startBlock(type, extra = {}) {
-    this.closeCurrentBlock();
+    // closeCurrentBlock() validates the accumulated tool JSON before closing a
+    // tool_use block. A false result means it refused to close a malformed call
+    // and already failed the stream, so no new block may be opened.
+    if (!this.closeCurrentBlock()) return false;
     this.current = { type, index: this.blockIndex };
     let content_block;
     if (type === 'text') content_block = { type: 'text', text: '' };
-    else if (type === 'thinking') content_block = { type: 'thinking', thinking: '' };
+    // `signature` must be present on the start event: Grok Build deserializes it
+    // as a required field and aborts the stream with "missing field `signature`".
+    else if (type === 'thinking') content_block = { type: 'thinking', thinking: '', signature: '' };
     else if (type === 'tool_use') content_block = { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
     this.send('content_block_start', {
       type: 'content_block_start',
@@ -1185,23 +1574,35 @@ class AnthropicStreamTranslator {
         model: this.model,
       });
     }
+    return true;
   }
 
   closeCurrentBlock() {
-    if (!this.current) return;
+    if (!this.current) return true;
     // BUG3: before stopping a tool_use block, flush any buffered arg fragments
     // WHILE the block is still the open/current one. After content_block_stop
     // the index is closed and any input_json_delta against it would be invalid.
     if (this.current.type === 'tool_use') {
-      this.flushToolArgs(this.toolBufForBlockIndex(this.current.index));
+      const buf = this.toolBufForBlockIndex(this.current.index);
+      this.flushToolArgs(buf);
+      // KH-017: a tool_use block may only close when everything the client has
+      // accumulated forms ONE complete JSON value. Flushing the final fragment
+      // and then unconditionally sending content_block_stop made a truncated
+      // call (`{"path"`) look successful: finish() went on to message_delta /
+      // message_stop, and the client executed a tool_use whose input JSON cannot
+      // be parsed. Refuse the close and fail the stream instead — no
+      // content_block_stop, no message_stop, no executable call.
+      if (!this.toolArgsValid(buf)) {
+        this.failInvalidToolBlock(buf, this.current.index);
+        return false;
+      }
     }
     // A thinking block should close with a signature_delta BEFORE content_block_stop
     // (Anthropic sequence: start → thinking_delta* → signature_delta → stop). Only
     // thinking blocks get it — never text/tool_use. We only emit the delta when
-    // the upstream actually provided a real signature; an empty-string fallback
-    // is omitted because strict clients (e.g. Grok Build's messages backend)
-    // reject `signature: ""` as invalid (see constructor note).
-    if (this.current.type === 'thinking' && this.pendingThinkingSignature) {
+    // the upstream actually provided a real signature; otherwise the `signature: ""`
+    // already sent on content_block_start stands (see constructor note).
+    if (this.current.type === 'thinking' && this.pendingThinkingSignature && !this.multipleSignedThinkingSegments) {
       this.send('content_block_delta', {
         type: 'content_block_delta',
         index: this.current.index,
@@ -1212,11 +1613,31 @@ class AnthropicStreamTranslator {
     this.send('content_block_stop', { type: 'content_block_stop', index: this.current.index });
     this.blockIndex++;
     this.current = null;
+    this.pendingThinkingSignature = '';
+    this.signedThinkingSegment = false;
+    this.multipleSignedThinkingSegments = false;
+    return true;
+  }
+
+  // Fail the turn for a tool_use block whose accumulated arguments are not one
+  // complete JSON value. The block is dropped WITHOUT a content_block_stop:
+  // sending one would tell the client the malformed input is complete and
+  // executable. error() sets messageStopped, so no later message_delta /
+  // message_stop can turn this into a successful turn.
+  failInvalidToolBlock(buf, index) {
+    const bytes = (buf?.argsBuffered || '').length + (buf?.pendingArgs || '').length;
+    if (this.current && this.current.index === index) this.current = null;
+    this.error({
+      status: 502,
+      type: 'upstream_error',
+      message: `Upstream tool call "${buf?.name || 'unknown'}" (id=${buf?.id || 'none'}) ended with incomplete or invalid JSON arguments (${bytes} byte(s))`,
+    });
   }
 
   emitTextDelta(text) {
     if (!text) return;
-    if (this.current?.type !== 'text') this.startBlock('text');
+    if (this.holdIfToolBlockOpen('text', text)) return;
+    if (this.current?.type !== 'text' && !this.startBlock('text')) return;
     this.send('content_block_delta', {
       type: 'content_block_delta',
       index: this.current.index,
@@ -1226,12 +1647,64 @@ class AnthropicStreamTranslator {
 
   emitThinkingDelta(text) {
     if (!text) return;
-    if (this.current?.type !== 'thinking') this.startBlock('thinking');
+    if (this.signedThinkingSegment) this.multipleSignedThinkingSegments = true;
+    if (this.holdIfToolBlockOpen('thinking', text)) return;
+    if (this.current?.type !== 'thinking' && !this.startBlock('thinking')) return;
     this.send('content_block_delta', {
       type: 'content_block_delta',
       index: this.current.index,
       delta: { type: 'thinking_delta', thinking: text },
     });
+  }
+
+  // B1: a tool_use block stays open across a text/thinking delta unless its
+  // arguments are already complete JSON (then no fragment can legally follow and
+  // the block is closed in stream order). Holding is the lossless choice: a
+  // block is never reopened, so the alternative drops the fragments that follow.
+  // Returns true when the delta was held instead of emitted.
+  holdIfToolBlockOpen(type, text) {
+    if (this.current?.type !== 'tool_use') return false;
+    const buf = this.toolBufForBlockIndex(this.current.index);
+    if (buf && this.toolArgsComplete(buf)) {
+      this.closeCurrentBlock();
+      return false;
+    }
+    const last = this.heldDeltas[this.heldDeltas.length - 1];
+    if (last && last.type === type) last.text += text;
+    else this.heldDeltas.push({ type, text });
+    return true;
+  }
+
+  // True when the accumulated argument bytes already form one complete JSON
+  // value. An empty buffer is NOT complete — a block may open on the name and
+  // receive its arguments in later deltas.
+  toolArgsComplete(buf) {
+    const json = (buf?.argsBuffered || '') + (buf?.pendingArgs || '');
+    if (!json) return false;
+    try { JSON.parse(json); return true; } catch { return false; }
+  }
+
+  // Close-time counterpart to toolArgsComplete(). An empty buffer IS valid here:
+  // content_block_start already published `input: {}`, and a tool call with no
+  // argument deltas is a legitimate zero-argument call. Any non-empty byte
+  // sequence must parse as one complete JSON value — partial JSON (`{"path"`)
+  // and malformed JSON (`{"path": }`) are both refused by closeCurrentBlock().
+  toolArgsValid(buf) {
+    const json = (buf?.argsBuffered || '') + (buf?.pendingArgs || '');
+    if (!json) return true;
+    try { JSON.parse(json); return true; } catch { return false; }
+  }
+
+  // Emit the deltas held during tool_use blocks, in arrival order. Only called
+  // once no tool block is open, so emitText/Thinking cannot re-hold.
+  flushHeldDeltas() {
+    if (!this.heldDeltas.length) return;
+    const held = this.heldDeltas;
+    this.heldDeltas = [];
+    for (const d of held) {
+      if (d.type === 'thinking') this.emitThinkingDelta(d.text);
+      else this.emitTextDelta(d.text);
+    }
   }
 
   // Find the tool buffer whose open block has this content-block index.
@@ -1265,23 +1738,62 @@ class AnthropicStreamTranslator {
   emitToolCallDelta(toolCall) {
     const idx = toolCall.index ?? 0;
     let existing = this.toolCallBufs.get(idx);
-    const id = toolCall.id || existing?.id;
-    const name = toolCall.function?.name || existing?.name;
+    const rawId = toolCall.id || null;
+    const rawName = toolCall.function?.name || '';
     const argsChunk = toolCall.function?.arguments || '';
 
     if (!existing) {
-      existing = { id, name, blockIndex: null, argsBuffered: '', pendingArgs: '' };
+      existing = {
+        id: rawId ? this.allocateToolId(rawId) : null,
+        rawId,
+        name: '',
+        wireName: '',
+        blockIndex: null,
+        argsBuffered: '',
+        pendingArgs: '',
+      };
       this.toolCallBufs.set(idx, existing);
-    } else {
-      if (id) existing.id = id;
-      if (name) existing.name = name;
+    } else if (rawId && rawId !== existing.rawId) {
+      // The id is delivered once, possibly on a later delta than the first. A
+      // repeated id is the same call and must not be allocated twice; a changed
+      // id can only take effect before the block published it.
+      existing.rawId = rawId;
+      if (existing.blockIndex == null) existing.id = this.allocateToolId(rawId);
+    }
+    if (rawName) {
+      // A spec-legal stream may split `function.name` across deltas. Accumulate
+      // until the wire name is known to the request map; a repeated full name is
+      // ignored once it is already known.
+      if (!existing.wireName) existing.wireName = rawName;
+      else if (!this.toolNameMap || !this.toolNameMap.toClient.has(existing.wireName)) existing.wireName += rawName;
+      existing.name = restoreToolName(existing.wireName, this.toolNameMap) || existing.wireName;
     }
     const buf = this.toolCallBufs.get(idx);
-    // Open this tool's block the first time we have both id and name. If another
-    // block is currently open (text/thinking/another tool), startBlock closes it
-    // first, so on return `this.current` is guaranteed to be THIS tool's block.
-    if (buf.blockIndex == null && buf.id && buf.name) {
-      this.startBlock('tool_use', { id: buf.id, name: buf.name });
+    const nameKnown = !this.toolNameMap || this.toolNameMap.toClient.has(buf.wireName);
+    // A spec-legal stream may split function.name across deltas without a name
+    // map (the common valid-name case). Do not open the tool_use block on the
+    // first fragment: wait for a chunk that carries arguments, a name-less
+    // follow-up (the name is settled), a mapped name, or finish(). Opening early
+    // publishes a truncated name that cannot be corrected in Anthropic's stream.
+    const nameSettled = nameKnown && (
+      !!(this.toolNameMap && this.toolNameMap.toClient.has(buf.wireName))
+      || !rawName
+    );
+    // Open this tool's block the first time we have both id and a settled name.
+    // If a TEXT/thinking block is current, startBlock closes it first, so on
+    // success `this.current` is guaranteed to be THIS tool's block. A false
+    // return means a prior malformed tool block failed the stream — stop here.
+    //
+    // Do NOT open a second tool_use block while one is still current: an
+    // Anthropic tool_use block can never be reopened, so opening B here would
+    // close A and strand every A fragment that arrives afterwards (finish()
+    // could only log the drop). Parallel calls interleave in the upstream
+    // stream, so B is held until finish(), which opens it with its complete
+    // arguments while A keeps its block and streams to the end. The cost is
+    // that all but the first call buffer instead of streaming their args.
+    if (buf.blockIndex == null && buf.id && buf.name && nameSettled
+        && this.current?.type !== 'tool_use') {
+      if (!this.startBlock('tool_use', { id: buf.id, name: buf.name })) return;
       buf.blockIndex = this.current.index;
     }
     // Always accumulate into pendingArgs, then attempt a guarded flush. The flush
@@ -1350,7 +1862,10 @@ class AnthropicStreamTranslator {
       // Forward-compat: if a future upstream attaches a real encrypted signature
       // to the reasoning stream, capture it so closeCurrentBlock round-trips the
       // genuine value instead of the empty-string placeholder.
-      if (delta.reasoning_signature) this.pendingThinkingSignature = delta.reasoning_signature;
+      if (delta.reasoning_signature) {
+        this.pendingThinkingSignature += delta.reasoning_signature;
+        this.signedThinkingSegment = true;
+      }
       if (delta.content) {
         if (leakTraceEnabled()) {
           log.info('LEAK_TRACE classify', {
@@ -1378,7 +1893,7 @@ class AnthropicStreamTranslator {
         // BUG1's guard below — verified: a mid-stream death reported
         // stop_reason:'end_turn' with no error frame, telling Claude Code the
         // truncated answer was complete.
-        if (chunk.__synthetic_finish) this.sawSyntheticFinish = true;
+        if (chunk.__synthetic_finish || chunk.__windsurf_end_reason === 'upstream_truncated') this.sawSyntheticFinish = true;
         else this.sawTerminalSignal = true;
         // SEED-C3a: the generation layer reports WHICH stop sequence truncated
         // the answer on this terminal choice (only the internal Messages route
@@ -1396,6 +1911,8 @@ class AnthropicStreamTranslator {
   }
 
   finish() {
+    if (this.messageStopped) return;
+    this.sseFramer.end();
     if (this.messageStopped) return;
     // BUG1: An abnormally cut-off stream (network drop, upstream abort, hung-
     // stream deadline) reaches finish() with NO terminal signal — no
@@ -1435,7 +1952,6 @@ class AnthropicStreamTranslator {
       });
       return;
     }
-    this.messageStopped = true;
     // Ensure message_start is always sent: Claude Code needs a complete event
     // sequence, and without this it sees message_delta + message_stop with no
     // preceding start and reports "Content block not found".
@@ -1446,20 +1962,61 @@ class AnthropicStreamTranslator {
     // content) no longer reaches here: the BUG1 guard above now catches a missing
     // terminal signal regardless of whether content started.
     if (!this.messageStarted) this.startMessage();
-    this.closeCurrentBlock();
-    // B1: interleaved-fragment edge case. flushToolArgs only emits arg fragments
-    // while a tool's block is the currently-open one; a tool_use block that got
-    // permanently closed (a text/other-tool delta interleaved) can still receive
-    // late fragments that stay parked in pendingArgs and never make it out. The
-    // buffered-flush design (BUG3) covers the common case, but this residual
-    // corner is real — surface it as a warning instead of dropping silently so a
-    // truncated tool call is diagnosable. (Reopening a closed block is not
-    // spec-legal in Anthropic's stream, so we log rather than re-emit.)
+    // KH-017: this is the close that used to flush the final fragment and send
+    // content_block_stop without checking the accumulated bytes. If they are not
+    // complete JSON, closeCurrentBlock() fails the stream (error event, no
+    // content_block_stop) and returns false — finish() must stop here rather
+    // than going on to message_delta/message_stop.
+    if (!this.closeCurrentBlock()) return;
+    // NOTE: `messageStopped` is deliberately NOT set yet — error() below is a
+    // no-op once it is, and the unrepresentable-tool check must be able to fail
+    // the stream. Nothing between here and that check can re-enter finish().
+    // Open every tool still held at finish: either its name settled late (the
+    // block is opened only now) or another tool_use block was current when it
+    // became openable (emitToolCallDelta holds it so the current tool keeps its
+    // block). Each gets its complete buffered arguments in one delta.
+    let unrepresentable = null;
     for (const buf of this.toolCallBufs.values()) {
-      if (buf.pendingArgs) {
-        log.warn(`messages: dropped ${buf.pendingArgs.length} buffered tool_use arg char(s) for tool "${buf.name || 'unknown'}" (id=${buf.id || 'none'}) — fragments arrived after the block closed (interleaved stream)`);
+      if (buf.blockIndex == null && buf.id && buf.name) {
+        // startBlock() closes the previously opened held tool first; if that
+        // one carried malformed JSON it has already failed the stream.
+        if (!this.startBlock('tool_use', { id: buf.id, name: buf.name })) return;
+        buf.blockIndex = this.current.index;
+        // The name may have been split across deltas; the block is opened only
+        // at finish in that case, so flush the arguments that accumulated while
+        // the block did not yet exist.
+        this.flushToolArgs(buf);
       }
+      // A tool_use block is never reopened, so argument bytes still buffered for
+      // a call whose block cannot be opened (missing id/name) or was already
+      // closed have no legal destination. Emitting the block with a partial
+      // `input` is the truncated-JSON defect this translator must not produce,
+      // so the stream is failed explicitly below instead.
+      if (buf.pendingArgs) unrepresentable = buf;
     }
+    // The held tools opened above are current one at a time; close the last one
+    // so every content_block_start has its content_block_stop before the
+    // message_delta. No-op when the loop opened nothing. A malformed final tool
+    // fails here exactly like the streaming one above (no message_delta).
+    if (!this.closeCurrentBlock()) return;
+    if (unrepresentable) {
+      // error() returns immediately once messageStopped is set, so this check
+      // runs while the guard is still clear and aborts before message_delta:
+      // the client sees an explicit error instead of a tool_use whose input is
+      // invalid JSON.
+      this.error({
+        status: 502,
+        type: 'upstream_error',
+        message: `Upstream tool call "${unrepresentable.name || 'unknown'}" (id=${unrepresentable.id || 'none'}) cannot be represented: ${unrepresentable.pendingArgs.length} argument byte(s) arrived with no openable tool_use block`,
+      });
+      return;
+    }
+    this.messageStopped = true;
+    // B1: text/thinking held while a tool block was open goes out now, in
+    // arrival order, after the tool blocks that had to stay open for their
+    // fragments. flushHeldDeltas opens the trailing text/thinking block.
+    this.flushHeldDeltas();
+    this.closeCurrentBlock();
     const u = this.finalUsage || {};
     // A1/G2: the final message_delta carries the AUTHORITATIVE upstream usage.
     // When the upstream supplied prompt/input tokens, they win. When it did NOT
@@ -1506,37 +2063,40 @@ class AnthropicStreamTranslator {
     const mapped = toAnthropicError(http.status, http.type, err?.message);
     this.send('error', {
       type: 'error',
-      error: mapped.body.error,
+      error: {
+        ...mapped.body.error,
+        ...(err?.code ? { code: err.code } : {}),
+        ...(Number.isFinite(Number(err?.retry_after_ms)) ? { retry_after_ms: Number(err.retry_after_ms) } : {}),
+      },
     });
   }
 
-  // SSE parser — handleChatCompletions writes `data: {...}\n\n` frames;
-  // accumulate and flush each complete frame as a translated event.
+  // SSE parser — handleChatCompletions writes `data: {...}\n\n` frames.
+  // SseFramer owns CRLF, split UTF-8, multi-line data and EOF flush so this
+  // route and the other two dialects cannot drift apart.
   feed(rawChunk) {
-    this.pendingSseBuf += typeof rawChunk === 'string' ? rawChunk : rawChunk.toString('utf8');
-    let idx;
-    while ((idx = this.pendingSseBuf.indexOf('\n\n')) !== -1) {
-      const frame = this.pendingSseBuf.slice(0, idx);
-      this.pendingSseBuf = this.pendingSseBuf.slice(idx + 2);
-      const lines = frame.split('\n');
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const payload = line.slice(6);
-        if (payload === '[DONE]') {
-          // [DONE] is the OpenAI stream's terminator, but it is NOT proof the turn
-          // completed: chat.js writes it on the truncated path too, right after the
-          // synthetic finish frame. Treating it as authoritative is the SECOND way
-          // BUG1's guard was defeated — plugging only the finish-frame check leaves
-          // this one open, which is why both are needed.
-          if (!this.sawSyntheticFinish) this.sawTerminalSignal = true;
-          continue;
-        }
-        try {
-          this.processChunk(JSON.parse(payload));
-        } catch (e) {
-          log.warn(`Messages SSE parse error: ${e.message}`);
-        }
-      }
+    this.sseFramer.push(rawChunk);
+    // V-08/D8: the verdict the Chat producer reads. `push` dispatches every frame
+    // synchronously, so `egressOk` is the state AFTER this chunk was emitted —
+    // false means the socket reported backpressure and has not drained yet.
+    return this.egressOk;
+  }
+
+  handleSseFrame({ data }) {
+    if (!data) return;
+    if (data === '[DONE]') {
+      // [DONE] is the OpenAI stream's terminator, but it is NOT proof the turn
+      // completed: chat.js writes it on the truncated path too, right after the
+      // synthetic finish frame. Treating it as authoritative is the SECOND way
+      // BUG1's guard was defeated — plugging only the finish-frame check leaves
+      // this one open, which is why both are needed.
+      if (!this.sawSyntheticFinish) this.sawTerminalSignal = true;
+      return;
+    }
+    try {
+      this.processChunk(JSON.parse(data));
+    } catch (e) {
+      log.warn(`Messages SSE parse error: ${e.message}`);
     }
   }
 }
@@ -1549,6 +2109,14 @@ function createCaptureRes(translator, realRes) {
     const cbs = listeners.get(event) || [];
     for (const cb of cbs) { try { cb(); } catch {} }
   };
+  // V-08/D8: the producer (chat.js) waits for 'drain' on THIS fake response. The
+  // translator's bounded writer owns the wait on the real socket, and the real
+  // socket's drain is the only one that exists — without this forward the chat
+  // writer would park on a signal that can never arrive (the 120s half-fix).
+  if (realRes?.on) {
+    realRes.on('drain', () => fire('drain'));
+    realRes.on('error', () => fire('error'));
+  }
   return {
     writableEnded: false,
     _disconnected: false, // set by _clientDisconnected(); gates write() feed work
@@ -1581,7 +2149,10 @@ function createCaptureRes(translator, realRes) {
         try { translator.sendPing(); } catch {}
       }
       translator.feed(chunk);
-      return true;
+      // V-08/D8: return the REAL socket's verdict (via the translator's bounded
+      // writer). A constant `true` kept chat.js's bounded writer permanently
+      // disarmed on this route, so the Cascade producer never paused.
+      return translator.egressOk;
     },
     end(chunk) {
       if (this.writableEnded) return;
@@ -1594,7 +2165,14 @@ function createCaptureRes(translator, realRes) {
     // close handler sees an un-ended stream and triggers its abort path.
     // Set an INDEPENDENT _disconnected flag (not writableEnded — that would
     // suppress the abort path) so write() can skip post-disconnect feed work.
-    _clientDisconnected() { this._disconnected = true; fire('close'); },
+    _clientDisconnected() {
+      this._disconnected = true;
+      // V-08/D8: settle the translator's outstanding drain wait and refuse any
+      // further byte — a terminal frame must not be written into a socket that is
+      // already gone. (The chat writer's own wait settles through fire('close').)
+      translator.writer.dispose();
+      fire('close');
+    },
     on(event, cb) {
       if (!listeners.has(event)) listeners.set(event, []);
       listeners.get(event).push(cb);
@@ -1632,7 +2210,33 @@ export async function handleMessages(body, context = {}) {
   // false → byte-identical to the pre-cc translation for every other client.
   const ccActive = !!context.ccCompat?.active;
   const promptEstimate = { tokens: 0 };
-  const openaiBody = anthropicToOpenAI(body, ccActive, promptEstimate);
+  let openaiBody;
+  try {
+    openaiBody = anthropicToOpenAI(body, ccActive, promptEstimate);
+  } catch (err) {
+    // A07/KH-003: only the tool/choice contract is a client error; anything
+    // else is a real conversion fault and must not be relabelled as 400.
+    if (err?.status !== 400) throw err;
+    return {
+      status: 400,
+      body: {
+        error: {
+          message: err.message,
+          type: 'invalid_request_error',
+          ...(err.param ? { param: err.param } : {}),
+          ...(err.code ? { code: err.code } : {}),
+        },
+      },
+    };
+  }
+  if (toolHygieneEnabled()) {
+    openaiBody.messages = normalizeHistoryTail(
+      normalizeToolIdsInMessages(openaiBody.messages, { seed: msgId }),
+      { fold: true },
+    );
+  }
+  const toolNameMap = openaiBody.__toolNameMap || null;
+  delete openaiBody.__toolNameMap;
   // anthropicToOpenAI attaches __cachePolicy only when the request carried
   // cache_control breakpoints; reuse it for the local cache-token estimate.
   const cachePolicy = openaiBody.__cachePolicy || null;
@@ -1677,13 +2281,9 @@ export async function handleMessages(body, context = {}) {
       // Only the error VOCABULARY is Anthropic-specific; Retry-After is HTTP, and the
       // comment on the streaming twin of this branch already says the mapping exists
       // "so the SDK applies correct retry/backoff" — which is precisely the header.
-      return withUpstreamHeaders(toAnthropicError(
-        result.status,
-        result.body?.error?.type,
-        result.body?.error?.message,
-      ), result.headers);
+      return toAnthropicChatError(result);
     }
-    return { status: 200, body: openAIToAnthropic(result.body, requestedModel, msgId, cachePolicy, body.stop_sequences) };
+    return { status: 200, body: openAIToAnthropic(result.body, requestedModel, msgId, cachePolicy, body.stop_sequences, toolNameMap) };
   }
 
   // Streaming path — ask handleChatCompletions for its streaming handler and
@@ -1705,11 +2305,7 @@ export async function handleMessages(body, context = {}) {
     // The OpenAI path returned a non-stream error (e.g. 403 model_not_entitled,
     // 503 capacity_error) before any byte streamed — map it to the Anthropic
     // error enum so the SDK applies correct retry/backoff.
-    return withUpstreamHeaders(toAnthropicError(
-      streamResult.status || 502,
-      streamResult.body?.error?.type,
-      streamResult.body?.error?.message,
-    ), streamResult.headers);
+    return toAnthropicChatError(streamResult);
   }
 
   return {
@@ -1722,7 +2318,7 @@ export async function handleMessages(body, context = {}) {
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel, cachePolicy, inputEstimate, body.stop_sequences, context.reqId, context.conversation_id);
+      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel, cachePolicy, inputEstimate, body.stop_sequences, context.reqId, context.conversation_id, toolNameMap);
       const captureRes = createCaptureRes(translator, realRes);
 
       // Forward client disconnect so the upstream cascade is cancelled.

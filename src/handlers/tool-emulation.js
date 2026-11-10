@@ -22,6 +22,7 @@
  */
 
 import { log } from '../config.js';
+import { neutralizeToolResultBody } from '../tool-text.js';
 
 // "<workspace>" you may see is a redaction marker, NOT a literal path.
 // Issue #98 (nalayahfowlkest-ship-it): `find <workspace> -type f` was
@@ -351,14 +352,49 @@ export function pickToolDialect(modelKey, provider, route = null) {
   if (forced && /^(glm47|openai_json_xml|kimi_k2|gpt_native)$/.test(forced)) return forced;
   if (forced) log.warn(`pickToolDialect: unrecognized WINDSURFAPI_FORCE_TOOL_DIALECT value ${JSON.stringify(forced)} — ignored, normal routing applies`);
   const normalizedProvider = String(provider || '').toLowerCase();
-  const normalizedModelKey = String(modelKey || '').toLowerCase();
-  if (normalizedProvider === 'zhipu' || normalizedModelKey.startsWith('glm')) {
+  // A client may name the model with a provider prefix (`zhipu/glm-5.1`,
+  // `x-ai/grok-4-5-low`). resolveConnectSelector strips exactly one such segment
+  // before resolving, and for most spellings the prefix therefore does not change
+  // which upstream model runs — so it must not change the dialect either.
+  //
+  // KNOWN EXCEPTION (P2-1): the resolver consults the alias map on the RAW name
+  // first, so a dotted MAP KEY with a curated target runs a DIFFERENT selector
+  // once prefixed — `claude-sonnet-4.6` → claude-sonnet-4-6-thinking, but
+  // `anthropic/claude-sonnet-4.6` → claude-sonnet-4-6 (the base selector). The
+  // dialect is still chosen from the name it is given, so this strip must stay.
+  //
+  // The rule MUST be identical to the resolver's `/^[a-z0-9][a-z0-9-]*\//`
+  // (verifier P2-2): a wider rule here picks a dialect for a model the resolver
+  // never routes to (`foo_bar/glm-5.1` is NOT stripped there — `_` is not a
+  // provider segment — and degrades to free), a narrower one misses `x-ai/`.
+  // Without the strip every prefixed name missed its family rule: `zhipu/glm-5.1`
+  // fell past `startsWith('glm')` to glm47 (the markup that model IGNORES, so it
+  // answers in plain text and the client waits for a tool call forever), and
+  // prefixed Kimi lost kimi_k2. Strip ONCE only: in `x/y/glm-5.1` the second
+  // segment is part of the name, not another provider.
+  const normalizedModelKey = String(modelKey || '').toLowerCase().replace(/^[a-z0-9][a-z0-9-]*\//, '');
+  // The resolver collapses dots before every lookup, so `gpt.5.5.low` and
+  // `glm-5.2` route to the same selectors as their dashed spellings. Collapse
+  // ONCE here and match every family rule below against `dashed`: matching the
+  // literal spelling made a dotted name fall past the GPT branch entirely, so a
+  // model documented to refuse the XML protocol (and GLM, which ignores it) ran
+  // on it. The GLM branch already collapsed dots locally; this is the same
+  // normalization applied to every family.
+  //
+  // The resolver ALSO splits the compact version form (`gpt5.5` → `gpt-5.5`, S4),
+  // so do that here too: the dialect has to describe the selector the request
+  // RUNS ON. Without it `gpt5.6-luna` (a mapped spelling) still missed the 5.4+
+  // gate and ran the XML protocol its own target refuses. The `(?=-)` keeps the
+  // split to version forms only — `claude5` is a family shorthand, not a version.
+  const dashed = normalizedModelKey.replace(/\./g, '-')
+    .replace(/^(gpt|claude|gemini)(\d)(?=-)/, '$1-$2');
+  if (normalizedProvider === 'zhipu' || dashed.startsWith('glm')) {
     // v2.0.72 — glm-5.2 probe: the glm47 XML markup dialect is ignored and
     // the model answers in plain text. The gpt_native function_call JSON
     // dialect is emitted reliably and parsed correctly. Keep older GLM on
     // glm47 until proven otherwise; env override still available for tests.
     //
-    // Dots are collapsed to dashes BEFORE matching, because the same model arrives under
+    // Dots are already collapsed into `dashed` above, because the same model arrives under
     // both spellings — `resolveConnectSelector` maps `glm-5.2` and `glm-5-2` to the same
     // upstream selector, so a client may legitimately send either. Matching the literal
     // spellings missed exactly one form: bare `glm-5-2` (it is not `glm-5.2`, and it has no
@@ -367,11 +403,18 @@ export function pickToolDialect(modelKey, provider, route = null) {
     // hard one to diagnose: the model answers in plain text, emits no tool call, and the
     // client waits forever for one. Every other spelling (`glm-5.2`, `glm-5.2-none`,
     // `glm-5-2-none`) already resolved correctly, which is what kept it hidden.
-    const dashed = normalizedModelKey.replace(/\./g, '-');
-    if (/^glm-5-[2-9](?:-|$)/.test(dashed)) return 'gpt_native';
+    //
+    // GLM-5.1 belongs to the same upstream family: SELECTOR_MAP maps `glm-5.1` / `glm-5-1`
+    // onto the very same `glm-5-2` selector, and the v2.0.72 finding (glm47 markup ignored,
+    // plain-text answer, zero tool calls) holds for the whole 5.x ≥ 5.1 family. The old
+    // `[2-9]` minor-version class started at 5.2, so the entire 5.1 alias family fell
+    // through to glm47 — the identical silent stall. Match the minor version as exactly
+    // `1` or `2`-`9` followed by `-` or end: a hypothetical `glm-5-12` / `glm-5-1x` must
+    // NOT be swallowed, and bare `glm-5` plus glm-4.x stay on glm47.
+    if (/^glm-5-(?:1|[2-9])(?:-|$)/.test(dashed)) return 'gpt_native';
     return 'glm47';
   }
-  if (normalizedProvider === 'moonshot' || normalizedModelKey.startsWith('kimi')) {
+  if (normalizedProvider === 'moonshot' || dashed.startsWith('kimi')) {
     // The Kimi K2 vLLM dialect is verified working only against the original
     // `kimi-k2` and `kimi-k2-thinking` SKUs. Newer Moonshot SKUs
     // (`kimi-k2.5`, `kimi-k2-6`, ...) are served by a different upstream
@@ -381,7 +424,7 @@ export function pickToolDialect(modelKey, provider, route = null) {
     // chat (observed 2026-05-07 on VPS — 12-24 tokens, empty content), the
     // model is temporarily broken at the Windsurf side. The proxy cannot fix
     // this; it is an upstream outage.
-    if (normalizedModelKey === 'kimi-k2' || normalizedModelKey === 'kimi-k2-thinking') {
+    if (dashed === 'kimi-k2' || dashed === 'kimi-k2-thinking') {
       return 'kimi_k2';
     }
     return 'openai_json_xml';
@@ -393,9 +436,18 @@ export function pickToolDialect(modelKey, provider, route = null) {
   // openai_json_xml. swe-1-7-lightning also emits narrative calls instead
   // of Kimi section tokens (live probe 2026-08-09); future variants may
   // differ too.
-  if (/^swe-1[.-](5|6|7)(-|$)/.test(normalizedModelKey)
-      && !normalizedModelKey.endsWith('-slow')
-      && !normalizedModelKey.endsWith('-lightning')) {
+  //
+  // S7: the SWE-1.5 aliases resolve to ENUM selectors — `swe-1-5` →
+  // MODEL_SWE_1_5_SLOW, `swe-1-5-fast` → MODEL_SWE_1_5 — whose names carry no
+  // `swe-1-5` token, so the same model used to get kimi_k2 under one spelling and
+  // openai_json_xml under the other (a client could flip the protocol by renaming
+  // the model). Read those two enums into the family spelling. `_SLOW` there is
+  // the slow MODE of SWE-1.5, not the distinct deployment selector
+  // `swe-1-6-slow` the exclusion is about; the alias spelling is the observed one.
+  const familyKey = /^model_swe_1_5(?:_slow)?$/.test(dashed) ? 'swe-1-5' : dashed;
+  if (/^swe-1-(5|6|7)(-|$)/.test(familyKey)
+      && !familyKey.endsWith('-slow')
+      && !familyKey.endsWith('-lightning')) {
     return 'kimi_k2';
   }
   // v2.0.62 (#115) — GPT family + Codex/Responses route uses bare-JSON
@@ -406,7 +458,13 @@ export function pickToolDialect(modelKey, provider, route = null) {
   // /v1/chat/completions clients aren't surprised by the new prompt.
   // Override with WINDSURFAPI_FORCE_GPT_NATIVE_DIALECT=1 to enable for
   // every route.
-  const isGpt = normalizedProvider === 'openai' || /^(?:gpt-|o3|o4)/i.test(normalizedModelKey);
+  //
+  // `gpt-` covers the compact spelling too: the compact version split above turns
+  // `gpt5.6-luna` into `gpt-5-6-luna`, and a compact name the resolver cannot map
+  // (`gpt5x`) is never routed, so it needs no dialect of its own. Matching only
+  // the literal `gpt` family here would have sent a GPT-5.6 request down the XML
+  // path it refuses — the silent no-tool-call stall this branch prevents.
+  const isGpt = normalizedProvider === 'openai' || /^(?:gpt-|o3|o4)/i.test(dashed);
   if (isGpt) {
     const forceAll = process.env.WINDSURFAPI_FORCE_GPT_NATIVE_DIALECT === '1';
     // GPT-5.4+ refuses the <tool_call> XML protocol on OpenAI-spec tools
@@ -416,9 +474,8 @@ export function pickToolDialect(modelKey, provider, route = null) {
     // existing chat clients; the 5.4+ family is new enough that the gate
     // no longer buys safety there. 5.1/5.2/5.3 keep the original behavior.
     // devin_connect 路径传原始 params.model（连字符形态 gpt-5-4-medium）——
-    // 照 glm-5.2 先例先折叠 dashed 再匹配，两种拼写都覆盖。
-    const dashedKey = normalizedModelKey.replace(/\./g, '-');
-    const isGpt54Plus = /^gpt-5-[456](?:-|$)/.test(dashedKey);
+    // 先折叠 dashed 再匹配，两种拼写都覆盖。
+    const isGpt54Plus = /^gpt-5-[456](?:-|$)/.test(dashed);
     if (forceAll || route === 'responses' || isGpt54Plus) return 'gpt_native';
   }
   return 'openai_json_xml';
@@ -1082,35 +1139,103 @@ function sanitizeToolCallId(rawId) {
 // only salvage-parsed from the MODEL'S OWN OUTPUT, never from tool_result
 // prompt content, and escaping JSON braces here would corrupt legitimate JSON
 // tool results — so gpt_native needs no marker escaping on this path.
-const KIMI_SENTINELS = [
-  '<|tool_calls_section_begin|>',
-  '<|tool_calls_section_end|>',
-  '<|tool_call_begin|>',
-  '<|tool_call_argument_begin|>',
-  '<|tool_call_end|>',
-];
-function neutralizeToolResultBody(text) {
-  let out = String(text ?? '')
-    .replaceAll('</tool_result>', '<\\/tool_result>')
-    .replaceAll('<tool_result', '<\\tool_result')
-    .replaceAll('</tool_call>', '<\\/tool_call>')
-    .replaceAll('<tool_call>', '<\\tool_call>');
-  // Break the Kimi section/call tokens by injecting a backslash after the
-  // leading `<|` so the literal sentinel no longer matches, while the text
-  // stays human-legible.
-  for (const s of KIMI_SENTINELS) {
-    out = out.replaceAll(s, `<\\|${s.slice(2)}`);
+
+
+// Restore call-then-result order for the NATIVE wire. A result that appears
+// before its matching assistant call is not an orphan — the call exists in this
+// request — but the upstream state machine rejects the reversed pair outright.
+// Measured 2026-10-25 (#273) against a scratch DEVIN_CONNECT instance, real
+// account, claude-haiku-5-5-medium, nativeToolCall=true, one call id:
+//
+//   [user, assistant(call a), tool(a), user] -> 200 ("ALPHA-42")
+//   [user, tool(a), assistant(call a), user] -> 502 invalid_argument
+//   [user, assistant(call a), user]          -> 502 (result dropped: the
+//                                               unanswered call is rejected too)
+//   [user, tool(a), user]                    -> 200, but finish_reason=tool_calls:
+//                                               the model re-issued the call, so the
+//                                               client would execute it twice
+//
+// Dropping either half is therefore not a fix. Moving the result to directly
+// after its call both preserves the content and reproduces the measured
+// accepted shape. Only results are moved; assistant/user turns keep their
+// relative order. Results whose call never appears are left alone — that is
+// stripOrphanedToolResults' policy, and the upstream tolerates the shape.
+//
+// Native-path only: the text-emulation wire folds results into user turns, so it
+// has no role=4 frame to order and its bytes must stay unchanged.
+export function orderToolResultsAfterCalls(messages) {
+  if (!Array.isArray(messages)) return messages;
+  // First occurrence of each call id. A later duplicate call (some clients
+  // reuse ids) is not the parent this repair can prove ownership against.
+  const callAt = new Map();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
+    for (const tc of m.tool_calls) {
+      const id = tc?.id;
+      if (id != null && !callAt.has(String(id))) callAt.set(String(id), i);
+    }
   }
+  if (!callAt.size) return messages;
+
+  const emittedCalls = new Set();
+  const deferred = new Map(); // call id -> results waiting for that call
+  let moved = 0;
+  const out = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role === 'tool') {
+      const id = m.tool_call_id != null ? String(m.tool_call_id) : '';
+      const at = id ? callAt.get(id) : undefined;
+      if (id && at !== undefined && at > i && !emittedCalls.has(id)) {
+        const waiting = deferred.get(id);
+        if (waiting) waiting.push(m);
+        else deferred.set(id, [m]);
+        moved += 1;
+        continue;
+      }
+      out.push(m);
+      continue;
+    }
+    out.push(m);
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      const flushed = [];
+      for (const tc of m.tool_calls) {
+        const id = tc?.id;
+        if (id == null) continue;
+        const key = String(id);
+        emittedCalls.add(key);
+        flushed.push(key);
+      }
+      for (const id of flushed) {
+        const waiting = deferred.get(id);
+        if (!waiting) continue;
+        deferred.delete(id);
+        for (const tm of waiting) out.push(tm);
+      }
+    }
+  }
+  if (!moved) return messages;
+  // Unreachable while every deferral points at a later assistant message, but
+  // content must never vanish if that invariant is ever broken.
+  for (const waiting of deferred.values()) out.push(...waiting);
+  log?.warn?.(`tool-pairing: moved ${moved} out-of-order tool_result(s) after their call (#273)`);
   return out;
 }
 
+// Chronology is a SEPARATE concern from orphanhood (see
+// orderToolResultsAfterCalls above): this filter keeps a result whose call
+// appears later, and the native-path normalizer then restores call-then-result
+// order. The split matters because the upstream rejects the reversed order with
+// invalid_argument (measured 2026-10-25, #273) while a result with no call
+// anywhere is a different, tolerated shape.
+//
 // Orphanhood here means no matching assistant call anywhere in the supplied
 // history, not no matching call before the result. Using only a seen-so-far set
 // would silently discard a result whose matching call appears later.
-// This filter does not validate chronology, consume ids, reject duplicate
-// results, or distinguish separate calls that reuse an id. A retained result
-// therefore does not prove that the upstream state machine will accept it.
-// Calls without results remain intact because they may still await execution.
+// This filter does not consume ids, reject duplicate results, or distinguish
+// separate calls that reuse an id. Calls without results remain intact because
+// they may still await execution.
 // Keep the filter opt-in: a truncated continuation can omit a legitimate
 // parent call, so applying this policy on every entry path would lose context.
 export function stripOrphanedToolResults(messages) {
@@ -1239,6 +1364,7 @@ export function interleaveParallelToolMessages(messages) {
             if (!first) {
               delete singleAssistant.reasoning_content;
               delete singleAssistant.reasoning;
+              delete singleAssistant.reasoning_signature;
             }
             out.push(singleAssistant);
 
@@ -1285,6 +1411,12 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
   // In text-emulation mode (nativeStructured: false, e.g. Kimi dialect),
   // dialect-specific batch formatters handle batch history.
   if (options.nativeStructured === true) {
+    // A reversed pair (result before its call) must be repaired BEFORE the
+    // interleave pass: interleave only looks forward from an assistant run, so
+    // it cannot see a result that sits above the call. After the repair the
+    // history is call-then-result, which is the shape the upstream accepts
+    // (measured 2026-10-25, #273) and the shape interleave can split.
+    messages = orderToolResultsAfterCalls(messages);
     messages = interleaveParallelToolMessages(messages);
   }
   // Orphan-stripping is OPT-IN (options.stripOrphans) — NOT the default. Doing it
@@ -1537,7 +1669,127 @@ function parseKimiToolCall(nameWithIndex, argsRaw) {
   return { name: parsedName, arguments: parsedArgs, suffix: nameWithIndex.includes(':') ? `_${nameWithIndex.split(':').pop().trim()}` : '' };
 }
 
+const TOOL_RESULT_OPEN_PREFIX = '<tool_result';
+const TOOL_RESULT_CLOSE_TAG = '</tool_result>';
+
+function isInsideJsonString(text, idx) {
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < idx; i++) {
+    const ch = text[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\' && inString) { escaped = true; continue; }
+    if (ch === '"') inString = !inString;
+  }
+  return inString;
+}
+
+function isToolResultOpenAt(text, idx) {
+  // A tool-call argument can legitimately contain the literal text
+  // `<tool_result>` (documentation, a quoted HTML sample). It is inside a JSON
+  // string there, not a protocol span; do not let the splitter hide the real
+  // call that encloses it.
+  if (isInsideJsonString(text, idx)) return false;
+  const after = idx + TOOL_RESULT_OPEN_PREFIX.length;
+  // A prefix sitting exactly at the buffer tail may be a split tag; treat it
+  // as an open tag and preserve it rather than leaking half a sentinel.
+  if (after >= text.length) return true;
+  const ch = text[after];
+  return ch === '>' || ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+}
+
+/**
+ * Split text into alternating prose and <tool_result …>…</tool_result> spans.
+ *
+ * The non-XML parsers (gpt_native, glm47, kimi_k2) buffer their whole output
+ * and never consumed a tool_result span themselves. That made the final
+ * salvage pass re-read a model echo of a discarded tool result as prose. This
+ * splitter gives those paths the same provenance boundary the XML parser has:
+ * span bodies are returned verbatim to the client but are never scanned for
+ * tool calls. A leading `</tool_result>` without its opening tag means the
+ * feed() path already emitted the open tag; everything before that close is
+ * still discarded span content.
+ */
+function splitToolResultSpans(text) {
+  const segments = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    let open = -1;
+    for (let p = text.indexOf(TOOL_RESULT_OPEN_PREFIX, cursor); p !== -1; p = text.indexOf(TOOL_RESULT_OPEN_PREFIX, p + 1)) {
+      if (isToolResultOpenAt(text, p)) { open = p; break; }
+    }
+    const closeBeforeOpen = text.indexOf(TOOL_RESULT_CLOSE_TAG, cursor);
+    if (closeBeforeOpen !== -1 && (open === -1 || closeBeforeOpen < open)) {
+      segments.push({ type: 'span', text: text.slice(cursor, closeBeforeOpen + TOOL_RESULT_CLOSE_TAG.length) });
+      cursor = closeBeforeOpen + TOOL_RESULT_CLOSE_TAG.length;
+      continue;
+    }
+    if (open === -1) {
+      segments.push({ type: 'text', text: text.slice(cursor) });
+      break;
+    }
+    if (open > cursor) segments.push({ type: 'text', text: text.slice(cursor, open) });
+    const closeAngle = text.indexOf('>', open + TOOL_RESULT_OPEN_PREFIX.length);
+    if (closeAngle === -1) {
+      segments.push({ type: 'span', text: text.slice(open) });
+      break;
+    }
+    const close = text.indexOf(TOOL_RESULT_CLOSE_TAG, closeAngle + 1);
+    const end = close === -1 ? text.length : close + TOOL_RESULT_CLOSE_TAG.length;
+    segments.push({ type: 'span', text: text.slice(open, end) });
+    cursor = end;
+  }
+  return segments;
+}
+
+/**
+ * Salvage every prose segment outside a tool_result span, preserving the spans
+ * verbatim in the returned text. This is the provenance-safe variant used by
+ * every dialect; a body that merely contains a call-shaped JSON object can
+ * never become an executable call.
+ */
+function salvageToolCallsOutsideToolResults(text) {
+  if (typeof text !== 'string' || !text) return { text: text || '', toolCalls: [], formats: [] };
+  const segments = splitToolResultSpans(text);
+  if (!segments.some((segment) => segment.type === 'span')) {
+    return salvageToolCallsFromText(text);
+  }
+  let outText = '';
+  const toolCalls = [];
+  const formats = new Set();
+  for (const segment of segments) {
+    if (segment.type === 'span') {
+      outText += segment.text;
+      continue;
+    }
+    const salvaged = salvageToolCallsFromText(segment.text);
+    outText += salvaged.text;
+    toolCalls.push(...salvaged.toolCalls);
+    for (const format of salvaged.formats) formats.add(format);
+  }
+  return { text: outText, toolCalls, formats: [...formats] };
+}
+
 function parseNonOpenAIDialectBuffer(dialect, body, startSeen) {
+  // A non-XML parser has no tool_result discard state. Split spans out first:
+  // they stay visible as text but are excluded from every dialect's parser and
+  // salvage scan (KH-015 covers the openai_json_xml path; this closes the same
+  // provenance hole for the buffered dialects).
+  const segments = splitToolResultSpans(body);
+  if (segments.some((segment) => segment.type === 'span')) {
+    let outText = '';
+    const calls = [];
+    for (const segment of segments) {
+      if (segment.type === 'span') {
+        outText += segment.text;
+        continue;
+      }
+      const parsed = parseNonOpenAIDialectBuffer(dialect, segment.text, startSeen + calls.length);
+      outText += parsed.text;
+      calls.push(...parsed.toolCalls);
+    }
+    return { text: outText, toolCalls: calls };
+  }
   if (dialect === 'kimi_k2') {
     let cursor = 0;
     let outText = '';
@@ -1688,9 +1940,56 @@ const TOOL_STREAM_PREFIXES = new Map([
   '<tool_result', '{"tool_code"',
 ].map(literal => [literal, toolStreamLiteralPrefixes(literal)]));
 
+/**
+ * Advance JSON string/escape/brace state over `text`. Mutates `state` and
+ * returns the index at which the outermost brace closes (depth returns to 0),
+ * or -1 when it does not close in this slice.
+ *
+ * V-11 — used to find the true end of an abandoned over-limit JSON construct
+ * without retaining its bytes: the scanner state is carried across chunks, so
+ * a `}` inside a string or a nested object cannot terminate the drop early.
+ */
+function advanceJsonBraceState(state, text) {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (state.escaped) { state.escaped = false; continue; }
+    if (ch === '\\' && state.inStr) { state.escaped = true; continue; }
+    if (ch === '"') { state.inStr = !state.inStr; continue; }
+    if (state.inStr) continue;
+    if (ch === '{') state.depth++;
+    else if (ch === '}') {
+      state.depth--;
+      if (state.depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** Longest suffix of `text` that is a proper prefix of `close` (bounded). */
+function overLimitHoldTail(text, close) {
+  const max = Math.min(close.length - 1, text.length);
+  for (let len = max; len > 0; len--) {
+    if (text.endsWith(close.slice(0, len))) return text.slice(-len);
+  }
+  return '';
+}
+
 export class ToolCallStreamParser {
-  /** 超限 tool_call 后为 true：吞掉残余直到闭合标记，防裸泄漏 */
-  _oversizeDropped = false;
+  /**
+   * V-11 — per-construct drop state for an abandoned over-limit construct.
+   * A single shared boolean made the emitted text depend on where the stream
+   * was split: the terminator was guessed per dialect and everything after it
+   * in the same chunk was discarded. The state now owns the construct kind and
+   * its own terminator:
+   *   - `{ kind: 'tag', close, hold }` swallows until the literal `close`
+   *     arrives, retaining only a possible split-prefix of it;
+   *   - `{ kind: 'json', depth, inStr, escaped }` swallows until the
+   *     construct's own outermost brace closes.
+   * Bytes after the terminator are fed back through the normal path.
+   */
+  _oversizeDrop = null;
+  /** Backwards-compatible read of the drop state (tests/diagnostics). */
+  get _oversizeDropped() { return this._oversizeDrop !== null; }
   constructor(options = {}) {
     this.buffer = '';
     this.inToolCall = false;
@@ -1700,6 +1999,12 @@ export class ToolCallStreamParser {
     // of being silently swallowed (which returned an empty response to the
     // client with no error).
     this._toolResultOpenTag = '';
+    // KH-015 — provenance marker: true once a <tool_result …> open tag has
+    // been accepted and its body put in the discard state. Text inside such a
+    // body must never reach the salvage pass: it is tool output (a fetched
+    // page, file, or command stdout), not model prose, and may contain a
+    // forged tool-call shape.
+    this.consumedToolResultSpan = false;
     this.inToolCode = false;
     this.inBareCall = false;
     this._totalSeen = 0;
@@ -1724,15 +2029,71 @@ export class ToolCallStreamParser {
     return -1;
   }
 
+  /**
+   * V-11 — arm the drop state for an abandoned over-limit construct.
+   * `buffered` is the construct text consumed so far, starting at its opening
+   * marker. Returns the bytes after the terminator when it is already present
+   * (the caller feeds them back through the normal path); otherwise arms
+   * `_oversizeDrop` and returns null.
+   */
+  _armOversizeDrop(kind, close, buffered) {
+    if (kind === 'json') {
+      // `buffered` starts at the construct's opening `{`, so depth starts at 0.
+      const state = { depth: 0, inStr: false, escaped: false };
+      const end = advanceJsonBraceState(state, buffered);
+      if (end !== -1) return buffered.slice(end + 1);
+      this._oversizeDrop = { kind, ...state };
+      return null;
+    }
+    const idx = buffered.indexOf(close);
+    if (idx !== -1) return buffered.slice(idx + close.length);
+    this._oversizeDrop = { kind: 'tag', close, hold: overLimitHoldTail(buffered, close) };
+    return null;
+  }
+
+  /**
+   * V-11 — consume one delta while an over-limit construct is being dropped.
+   * Returns '' while the terminator has not arrived, or the bytes after it
+   * (possibly '') once the construct ends; the caller continues with those
+   * bytes through the normal feed path.
+   */
+  _consumeOversizeDrop(delta) {
+    const drop = this._oversizeDrop;
+    if (drop.kind === 'json') {
+      const end = advanceJsonBraceState(drop, delta);
+      if (end === -1) return '';
+      this._oversizeDrop = null;
+      return delta.slice(end + 1);
+    }
+    const haystack = drop.hold + delta;
+    const idx = haystack.indexOf(drop.close);
+    if (idx === -1) {
+      drop.hold = overLimitHoldTail(haystack, drop.close);
+      return '';
+    }
+    this._oversizeDrop = null;
+    return haystack.slice(idx + drop.close.length);
+  }
+
   _consumeJsonBlock(parseFn, pushTool, pushText) {
-    if (this.buffer.length > 65_536) {
-      log.warn(`ToolCallStreamParser: JSON block exceeds 65KB (${this.buffer.length} bytes), emitting placeholder instead of raw text`);
+    // V-11 — the cap applies to the block's own extent, not to whatever
+    // trailing prose shares the buffer: otherwise a small call followed by a
+    // large delta would be dropped in one split and parsed in another.
+    const endIdx = this._findClosingBrace();
+    const blockLength = endIdx === -1 ? this.buffer.length : endIdx + 1;
+    if (blockLength > 65_536) {
+      log.warn(`ToolCallStreamParser: JSON block exceeds 65KB (${blockLength} bytes), emitting placeholder instead of raw text`);
       pushText(TOOL_OVER_LIMIT_PLACEHOLDER);
-      this.buffer = '';
-      this._oversizeDropped = true;   // M1: 尾部 `"}` 交给全局吞，防裸泄漏
+      if (endIdx !== -1) {
+        this.buffer = this.buffer.slice(endIdx + 1);
+      } else {
+        // Drop the rest of the block by its own balanced brace instead of
+        // swallowing until whatever `}` (or `</tool_call>`) arrives next.
+        this._armOversizeDrop('json', null, this.buffer);
+        this.buffer = '';
+      }
       return true;
     }
-    const endIdx = this._findClosingBrace();
     if (endIdx === -1) return false;
     const jsonStr = this.buffer.slice(0, endIdx + 1);
     this.buffer = this.buffer.slice(endIdx + 1);
@@ -1778,27 +2139,13 @@ export class ToolCallStreamParser {
 
   feed(delta) {
     if (!delta) return { text: '', toolCalls: [], items: [] };
-    // Oversize-drop state: swallow everything until the close marker, so the
-    // trailing `</tool_call>` / `"}` cannot leak into the text stream after
-    // an over-limit tool_call was replaced with the placeholder. Must run
-    // BEFORE sentinel detection (a rebuilt full sentinel would otherwise
-    // flush the held W's as prose).
-    if (this._oversizeDropped) {
-      this.buffer += delta;
-      // B3: 丢弃态 buffer 硬上限 —— 超限直接清空（继续吞语义，防 OOM）
-      if (this.buffer.length > TOOL_XML_BODY_MAX * 2) this.buffer = '';
-      const closed = this.dialect === 'gpt_native'
-        ? this.buffer.includes('}')   // B2: 丢弃态只要出现闭合即恢复（`"}}` 等裸闭合也认）
-        : this.buffer.includes('</tool_call>');
-      if (closed) {
-        this._oversizeDropped = false;
-        this.buffer = '';
-        // B1: 复位所有块状态 —— 否则 inToolCall/inToolResult 僵尸吞掉后续模型文本
-        this.inToolCall = false;
-        this.inToolResult = false;
-        this._toolResultOpenTag = '';
-      }
-      return { text: '', toolCalls: [], items: [] };
+    // V-11 — an abandoned over-limit construct is dropped by its own recorded
+    // terminator, and the bytes after that terminator continue through the
+    // normal path in this same call. That makes the emitted output a function
+    // of the byte stream rather than of where the stream happened to split.
+    if (this._oversizeDrop) {
+      delta = this._consumeOversizeDrop(delta);
+      if (!delta) return { text: '', toolCalls: [], items: [] };
     }
     if (this.dialect !== 'openai_json_xml') {
       this.buffer += delta;
@@ -1814,57 +2161,95 @@ export class ToolCallStreamParser {
         : this.dialect === 'gpt_native'
           ? ['{"function_call"', '{"tool_calls"', '{"tool_call"', '{"function"', '{"name"', '{ "function_call"', '{ "tool_calls"', '{ "name"']
           : ['<|tool_calls_section_begin|>', '<tool_call>'];
-      let earliest = -1;
-      for (const s of sentinels) {
-        const idx = this.buffer.indexOf(s);
-        if (idx !== -1 && (earliest === -1 || idx < earliest)) earliest = idx;
-      }
-      if (earliest === -1) {
-        let holdLen = 0;
+      let text = '';
+      const items = [];
+      // Loop instead of returning after the first pre-sentinel emission: the
+      // held construct can start in the same delta and its over-limit verdict
+      // must be reached now, not on a later feed (which may never come).
+      while (true) {
+        let earliest = -1;
         for (const s of sentinels) {
-          const prefixes = TOOL_STREAM_PREFIXES.get(s);
-          const max = Math.min(s.length - 1, this.buffer.length);
-          for (let len = max; len > 0; len--) {
-            if (this.buffer.endsWith(prefixes[len])) {
-              holdLen = Math.max(holdLen, len);
-              break;
+          const idx = this.buffer.indexOf(s);
+          if (idx !== -1 && (earliest === -1 || idx < earliest)) earliest = idx;
+        }
+        if (earliest === -1) {
+          let holdLen = 0;
+          for (const s of sentinels) {
+            const prefixes = TOOL_STREAM_PREFIXES.get(s);
+            const max = Math.min(s.length - 1, this.buffer.length);
+            for (let len = max; len > 0; len--) {
+              if (this.buffer.endsWith(prefixes[len])) {
+                holdLen = Math.max(holdLen, len);
+                break;
+              }
             }
           }
+          const emitUpto = this.buffer.length - holdLen;
+          if (emitUpto > 0) {
+            const chunk = this.buffer.slice(0, emitUpto);
+            this.buffer = this.buffer.slice(emitUpto);
+            text += chunk;
+            items.push({ type: 'text', text: chunk });
+          }
+          break;
         }
-        const emitUpto = this.buffer.length - holdLen;
-        if (emitUpto > 0) {
-          const text = this.buffer.slice(0, emitUpto);
-          this.buffer = this.buffer.slice(emitUpto);
-          return { text, toolCalls: [], items: [{ type: 'text', text }] };
+        // Sentinel seen — emit any text BEFORE it, hold the rest until flush.
+        if (earliest > 0) {
+          const chunk = this.buffer.slice(0, earliest);
+          this.buffer = this.buffer.slice(earliest);
+          text += chunk;
+          items.push({ type: 'text', text: chunk });
+          continue;
         }
-        return { text: '', toolCalls: [], items: [] };
-      }
-      // Sentinel seen — emit any text BEFORE it, hold the rest until flush.
-      if (earliest > 0) {
-        const text = this.buffer.slice(0, earliest);
-        this.buffer = this.buffer.slice(earliest);
-        return { text, toolCalls: [], items: [{ type: 'text', text }] };
-      }
-      // TOOL-2 — sentinel sits at buffer start (earliest===0): every later
-      // delta appends to the held buffer until flush. Unlike the XML path
-      // (which caps <tool_call>/<tool_result> bodies at TOOL_XML_BODY_MAX),
-      // this branch had no ceiling, so a model that opens a tool-call
-      // sentinel and then streams unbounded text pins it all in memory. Cap
-      // it the same way: once the held buffer exceeds the limit without a
-      // parseable close, flush it as ordinary text and reset so RSS stays
-      // bounded.
-      if (this.buffer.length > TOOL_XML_BODY_MAX) {
-        log.warn(`ToolCallStreamParser: ${this.dialect} sentinel body exceeds 65KB (${this.buffer.length} bytes), emitting placeholder`);
+        // TOOL-2 — sentinel sits at buffer start (earliest===0): every later
+        // delta appends to the held buffer until flush. Unlike the XML path
+        // (which caps <tool_call>/<tool_result> bodies at TOOL_XML_BODY_MAX),
+        // this branch had no ceiling, so a model that opens a tool-call
+        // sentinel and then streams unbounded text pins it all in memory. Cap
+        // it the same way: once the held construct exceeds the limit, replace
+        // it with the placeholder and reset so RSS stays bounded.
+        let kind = 'tag';
+        let close = GLM47_TOOL_CLOSE;
+        if (this.dialect === 'gpt_native') {
+          kind = 'json';
+          close = null;
+        } else if (this.dialect === 'kimi_k2' && this.buffer.startsWith(KIMI_TOOL_SECTION_BEGIN)) {
+          close = KIMI_TOOL_SECTION_END;
+        }
+        // V-11 — decide on the construct's own extent, not on the whole held
+        // buffer: trailing prose must not push a small construct over the cap,
+        // and the terminator is known per construct instead of guessed from
+        // the dialect (the old `gpt_native ? '}' : '</tool_call>'` guess leaked
+        // `}}` and the kimi section-end marker).
+        let constructEnd = -1;
+        if (kind === 'json') {
+          const state = { depth: 0, inStr: false, escaped: false };
+          const end = advanceJsonBraceState(state, this.buffer);
+          if (end !== -1) constructEnd = end + 1;
+        } else {
+          const idx = this.buffer.indexOf(close);
+          if (idx !== -1) constructEnd = idx + close.length;
+        }
+        const overLimit = constructEnd === -1
+          ? this.buffer.length > TOOL_XML_BODY_MAX
+          : constructEnd > TOOL_XML_BODY_MAX;
+        if (!overLimit) break;
+        log.warn(`ToolCallStreamParser: ${this.dialect} sentinel body exceeds 65KB (${constructEnd === -1 ? this.buffer.length : constructEnd} bytes), emitting placeholder`);
+        const tail = constructEnd === -1
+          ? this._armOversizeDrop(kind, close, this.buffer)
+          : this.buffer.slice(constructEnd);
         this.buffer = '';
-        this._oversizeDropped = true;
-        return { text: TOOL_OVER_LIMIT_PLACEHOLDER, toolCalls: [], items: [{ type: 'text', text: TOOL_OVER_LIMIT_PLACEHOLDER }] };
+        text += TOOL_OVER_LIMIT_PLACEHOLDER;
+        items.push({ type: 'text', text: TOOL_OVER_LIMIT_PLACEHOLDER });
+        if (tail === null) break;
+        const rest = this.feed(tail);
+        return {
+          text: text + rest.text,
+          toolCalls: rest.toolCalls,
+          items: items.concat(rest.items),
+        };
       }
-      // 超限丢弃态：吞掉残余直到 JSON 平衡闭合，防 `"}` 等裸泄漏
-      if (this._oversizeDropped) {
-        if (this._findClosingBrace() !== -1) this._oversizeDropped = false;
-        return { text: '', toolCalls: [], items: [] };
-      }
-      return { text: '', toolCalls: [], items: [] };
+      return { text, toolCalls: [], items };
     }
     this.buffer += delta;
     const safeParts = [];
@@ -1891,14 +2276,21 @@ export class ToolCallStreamParser {
     while (true) {
       // ── Inside a <tool_result …>…</tool_result> block — discard body ──
       if (this.inToolResult) {
-        if (this.buffer.length > TOOL_XML_BODY_MAX) {
-          log.warn(`ToolCallStreamParser: <tool_result> body exceeds 65KB (${this.buffer.length} bytes), dropping`);
-          this.buffer = '';
+        const closeIdx = this.buffer.indexOf(TR_CLOSE);
+        // V-11 — cap the discarded body's own extent, not the whole buffer:
+        // trailing prose in the same chunk must not make a small span
+        // over-limit in one split and healthy in another.
+        const bodyLength = closeIdx === -1 ? this.buffer.length : closeIdx;
+        if (bodyLength > TOOL_XML_BODY_MAX) {
+          log.warn(`ToolCallStreamParser: <tool_result> body exceeds 65KB (${bodyLength} bytes), dropping`);
           this.inToolResult = false;
           this._toolResultOpenTag = '';
+          // V-11 — swallow the matching close so it cannot leak as prose, and
+          // keep any bytes that follow it.
+          const tail = this._armOversizeDrop('tag', TR_CLOSE, this.buffer);
+          this.buffer = tail === null ? '' : tail;
           continue;
         }
-        const closeIdx = this.buffer.indexOf(TR_CLOSE);
         if (closeIdx === -1) break;
         this.buffer = this.buffer.slice(closeIdx + TR_CLOSE.length);
         this.inToolResult = false;
@@ -1908,23 +2300,18 @@ export class ToolCallStreamParser {
 
       // ── Inside a <tool_call>…</tool_call> block — parse JSON body ──
       if (this.inToolCall) {
-        if (this.buffer.length > TOOL_XML_BODY_MAX) {
-          log.warn(`ToolCallStreamParser: <tool_call> body exceeds 65KB (${this.buffer.length} bytes), emitting placeholder`);
-          pushText(TOOL_OVER_LIMIT_PLACEHOLDER);
-          this.buffer = '';
-          this._oversizeDropped = true;   // 保持 inToolCall，吞掉残余直到 close，防 close 标记裸泄漏
-          continue;
-        }
-        if (this._oversizeDropped) {
-          // 超限丢弃态：等待 close 到达后整体丢弃，不再尝试解析
-          const closeIdx = this.buffer.indexOf(TC_CLOSE);
-          if (closeIdx === -1) break;
-          this.buffer = this.buffer.slice(closeIdx + TC_CLOSE.length);
-          this.inToolCall = false;
-          this._oversizeDropped = false;
-          continue;
-        }
         const closeIdx = this.buffer.indexOf(TC_CLOSE);
+        const bodyLength = closeIdx === -1 ? this.buffer.length : closeIdx;
+        if (bodyLength > TOOL_XML_BODY_MAX) {
+          log.warn(`ToolCallStreamParser: <tool_call> body exceeds 65KB (${bodyLength} bytes), emitting placeholder`);
+          pushText(TOOL_OVER_LIMIT_PLACEHOLDER);
+          this.inToolCall = false;
+          // V-11 — drop the body by this construct's own close marker, so the
+          // terminator and the bytes after it are resolved on the byte stream.
+          const tail = this._armOversizeDrop('tag', TC_CLOSE, this.buffer);
+          this.buffer = tail === null ? '' : tail;
+          continue;
+        }
         if (closeIdx === -1) break;
         const body = this.buffer.slice(0, closeIdx).trim();
         this.buffer = this.buffer.slice(closeIdx + TC_CLOSE.length);
@@ -2031,6 +2418,7 @@ export class ToolCallStreamParser {
         this._toolResultOpenTag = this.buffer.slice(nextIdx, closeAngle + 1);
         this.buffer = this.buffer.slice(closeAngle + 1);
         this.inToolResult = true;
+        this.consumedToolResultSpan = true;
       } else if (tagType === 'code') {
         this.buffer = this.buffer.slice(nextIdx);
         this.inToolCode = true;
@@ -2044,6 +2432,21 @@ export class ToolCallStreamParser {
   }
 
   flush() {
+    if (this._oversizeDrop) {
+      // V-11 — explicit EOF: an over-limit construct that never reached its
+      // terminator is discarded whole. Regurgitating its partial body or open
+      // marker is exactly the leak the drop state exists to prevent, and doing
+      // it only when the stream ended mid-construct made the output depend on
+      // the chunk boundaries.
+      this._oversizeDrop = null;
+      this.buffer = '';
+      this.inToolCall = false;
+      this.inToolResult = false;
+      this.inToolCode = false;
+      this.inBareCall = false;
+      this._toolResultOpenTag = '';
+      return { text: '', toolCalls: [] };
+    }
     if (this.dialect !== 'openai_json_xml') {
       const parsed = parseNonOpenAIDialectBuffer(this.dialect, this.buffer, this._totalSeen);
       this.buffer = '';
@@ -2074,7 +2477,11 @@ export class ToolCallStreamParser {
       this.inToolResult = false;
       const openTag = this._toolResultOpenTag || TR_PREFIX;
       this._toolResultOpenTag = '';
-      return { text: `${openTag}${remaining}`, toolCalls: [] };
+      // KH-015 — this text is a verbatim regurgitation of a discarded
+      // tool-result span, not prose the model chose to answer with. It is
+      // still returned to the client (TOOL-3), but callers must not run the
+      // salvage pass over it.
+      return { text: `${openTag}${remaining}`, toolCalls: [], discardedToolResult: true };
     }
     if (this.inToolCode) {
       this.inToolCode = false;
@@ -2148,10 +2555,33 @@ export function parseToolCallsFromText(text, options = {}) {
   if (primary.toolCalls.length > 0 || !text || parser.dialect === 'kimi_k2') return primary;
   // Salvage only runs when we'd otherwise return zero tool calls — never
   // overrides the primary parser when it found something.
-  const salvaged = salvageToolCallsFromText(primary.text || text);
+  //
+  // KH-015 — provenance. Salvage scans *only* text the primary parser
+  // emitted as prose. `a.text` (feed) is always prose; `b.text` (flush) is
+  // prose except when it regurgitates an unclosed <tool_result …> block
+  // verbatim (TOOL-3). Once a tool-result span has been consumed, the raw
+  // `text` is off limits: its body was deliberately discarded as tool output,
+  // and re-reading it would resurrect a forged call from that output. So:
+  //   - closed span: primary.text is prose before/after the span (the body
+  //     was never emitted), so scan it;
+  //   - unclosed span: drop the regurgitated tail and scan only a.text;
+  //   - no span: keep the historical `primary.text || text` fallback.
+  let salvageText = primary.text || text;
+  if (parser.consumedToolResultSpan) {
+    salvageText = b.discardedToolResult ? a.text : primary.text;
+  }
+  const salvaged = salvageToolCallsOutsideToolResults(salvageText);
   if (!salvaged.toolCalls.length) return primary;
   log.info(`ToolParser: salvage recovered ${salvaged.toolCalls.length} tool_call(s) the primary parser missed (formats: ${salvaged.formats.join(',')})`);
-  return { text: salvaged.text, toolCalls: salvaged.toolCalls };
+  // TOOL-3: an unclosed <tool_result …> block is regurgitated verbatim by
+  // flush() and must stay in the client-visible text even when salvage also
+  // recovers a legitimate call from the prose before it. salvageText excludes
+  // that tail on purpose (it is discarded tool output, not prose), so append
+  // it back here rather than dropping it.
+  return {
+    text: b.discardedToolResult ? salvaged.text + b.text : salvaged.text,
+    toolCalls: salvaged.toolCalls,
+  };
 }
 
 /**

@@ -1,21 +1,25 @@
 // total_tokens vs OpenAI's arithmetic identity.
 //
-// OpenAI specifies total_tokens == prompt_tokens + completion_tokens. This proxy
-// deliberately breaks that whenever cache_write > 0: the grand total carries
-// generation-side cache-write so per-account cost accounting reflects real spend, while
-// the per-bucket fields keep strict OpenAI/Anthropic semantics (cache_write ships on
-// cache_creation_input_tokens, NOT inside prompt_tokens).
+// The CASCADE path deliberately breaks the identity whenever cache_write > 0: the grand
+// total carries generation-side cache-write so per-account cost accounting reflects real
+// spend, while the per-bucket fields keep strict OpenAI/Anthropic semantics (cache_write
+// ships on cache_creation_input_tokens, NOT inside prompt_tokens). #118 chose that on
+// purpose: putting cache_write inside prompt_tokens made billing relays (one-api /
+// new-api / sub2api) meter it as ordinary input and burn trial quotas in hours.
 //
-// #118 chose that on purpose. The alternative — cache_write inside prompt_tokens — made
-// billing relays (one-api / new-api / sub2api) meter it as ordinary input and burn trial
-// quotas in hours.
+// The CONNECT path no longer breaks it (O2, evidence/ClientSandboxes.md §5.3): the
+// upstream reports a cache write as the prefix it just processed, so prompt_tokens there
+// IS fresh + read + write and the total is prompt + completion. That was the honest
+// count the clients were missing ("3 in" for an 11.5k prompt). WINDSURFAPI_STRICT_USAGE_TOTAL
+// therefore has nothing to restore on the connect front — it is a no-op there, asserted
+// below so a future re-split has to revisit the contract.
 //
-// WINDSURFAPI_STRICT_USAGE_TOTAL=1 restores the identity for clients that validate it.
-// It is OFF by default, and the reason is an asymmetry worth stating: the identity break
-// is cosmetic for almost every consumer, whereas dropping cache_write from the total
-// under-reports real spend, so a relay metering on total_tokens would silently
-// undercharge. Cosmetic beats financial, so spec-strictness is the opt-in rather than the
-// default.
+// On the Cascade front WINDSURFAPI_STRICT_USAGE_TOTAL=1 still restores the identity for
+// clients that validate it. It is OFF by default, and the reason is an asymmetry worth
+// stating: the identity break is cosmetic for almost every consumer, whereas dropping
+// cache_write from the total under-reports real spend, so a relay metering on
+// total_tokens would silently undercharge. Cosmetic beats financial, so spec-strictness
+// is the opt-in rather than the default.
 //
 // The trap this file exists to guard: the operator's OWN spend tally reads the same usage
 // object that goes out on the wire. If accounting metered on total_tokens, opting into
@@ -73,10 +77,16 @@ describe('default: the grand total carries cache-write', () => {
       'and it ships on the Anthropic extension field, never inside prompt_tokens');
   });
 
-  it('connect: same shape from the same inputs', () => {
+  it('connect: prompt_tokens is the full input, so the identity already holds', () => {
+    // O2 (evidence/ClientSandboxes.md §5.3): the connect path used to exclude the
+    // cache write from prompt_tokens, which under-reported an 11.5k prompt as "3 in".
+    // A cache write IS input, so prompt_tokens = fresh + read + write and the total
+    // is prompt + completion with no extra term. The strict flag has nothing left to
+    // restore on this front (see the flag block below).
     const u = normalizeConnectUsage(CONNECT_USAGE);
-    assert.equal(u.prompt_tokens, 1000);
+    assert.equal(u.prompt_tokens, 1500);
     assert.equal(u.total_tokens, 1540);
+    assert.equal(u.total_tokens, u.prompt_tokens + u.completion_tokens);
     assert.equal(u.cache_creation_input_tokens, 500);
   });
 });
@@ -91,10 +101,13 @@ describe('WINDSURFAPI_STRICT_USAGE_TOTAL=1: the identity is restored', () => {
     assert.equal(u.total_tokens, 1040);
   });
 
-  it('connect: total == prompt + completion', () => {
+  it('connect: total == prompt + completion (already true without the flag)', () => {
+    // Since O2 the connect normalizer counts cache-write inside prompt_tokens, so the
+    // flag is a no-op on this front: both modes emit the same honest shape. The
+    // assertion stays so a future change that re-splits the buckets must revisit it.
     const u = normalizeConnectUsage(CONNECT_USAGE);
     assert.equal(u.total_tokens, u.prompt_tokens + u.completion_tokens);
-    assert.equal(u.total_tokens, 1040);
+    assert.equal(u.total_tokens, 1540);
   });
 
   it('cache-write is still REPORTED, just not summed into the total', () => {
@@ -145,8 +158,10 @@ describe('cost accounting stays honest under BOTH shapes', () => {
   it('fullBillableTokens recovers the full cost from either shape', () => {
     delete process.env[ENV_KEY];
     const loose = buildUsageBody(SERVER_USAGE, [], 'x');
+    const connectLoose = normalizeConnectUsage(CONNECT_USAGE);
     process.env[ENV_KEY] = '1';
     const strict = buildUsageBody(SERVER_USAGE, [], 'x');
+    const connectStrict = normalizeConnectUsage(CONNECT_USAGE);
 
     assert.equal(fullBillableTokens(loose), 1540);
     assert.equal(fullBillableTokens(strict), 1540,
@@ -154,6 +169,13 @@ describe('cost accounting stays honest under BOTH shapes', () => {
       + 'from cache_creation_input_tokens');
     assert.notEqual(strict.total_tokens, fullBillableTokens(strict),
       'precondition: under the flag these two genuinely differ, or this test proves nothing');
+
+    // O2: on the connect front cache-write is now INSIDE prompt_tokens. Re-adding it
+    // (the Cascade formula) would double-bill the prefix, so fullBillableTokens must
+    // read the explicit fresh count instead of assuming the old split.
+    for (const [name, u] of [['loose', connectLoose], ['strict', connectStrict]]) {
+      assert.equal(fullBillableTokens(u), 1540, `${name} connect shape must bill the full cost once`);
+    }
   });
 
   it('a usage block with no cache fields still bills its total (pre-existing paths)', () => {

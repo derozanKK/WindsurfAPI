@@ -555,7 +555,10 @@ describe('review regressions: composed stream completion', () => {
     const result = await handleChatCompletions({ model: CASCADE_MODEL, messages: [{ role: 'user', content: 'partial' }], stop: ['END'], stream: true }, { ...base, WindsurfClient: FailingClient });
     const res = fakeResponse(); await result.handler(res);
     assert.equal(streamedContent(res.body), text);
-    assert.equal(res.body.split('data: [DONE]').length - 1, 1);
+    // A06/KH-002: a failure after partial content ends with a structured error
+    // frame, never the clean-finish [DONE] sentinel.
+    assert.equal(res.body.split('data: [DONE]').length - 1, 0);
+    assert.match(res.body, /"error"/);
     assert.ok(!res.body.includes('_windsurf_stop_sequence'));
   });
   it('raw streaming cache enforces stop and retains Messages cause on replay', async () => {

@@ -23,6 +23,7 @@ function boundary(env = {}, localBind = true) {
     windsurfLogin: async email => ({ apiKey: 'offline-key', email, name: 'fixture' }),
     addAccountByKey: () => ({ id: 'offline-account', email: 'a@example.test', status: 'active' }),
     setAccountTokens() {}, setAccountProxy() {}, scheduleAccountWarmup() {},
+    setAccountCredentialEmail() {},
     maskApiKey: () => '[masked]',
     log: { info() {}, warn() {} },
     credentials: {
@@ -31,7 +32,9 @@ function boundary(env = {}, localBind = true) {
     },
   };
   const names = Object.keys(deps).filter(name => name !== 'credentials');
-  let text = ['dashboardClientIp', 'maskEmail', 'credStoreGateOpen', 'processWindsurfLogin']
+  // The credential-store tail lives in finalizeWindsurfLogin (shared by the
+  // password and email-code logins), so the harness must compile it too.
+  let text = ['dashboardClientIp', 'maskEmail', 'credStoreGateOpen', 'finalizeWindsurfLogin', 'processWindsurfLogin']
     .map(functionText).join('\n');
   const dynamicImport = "await import('../devin-connect-credentials.js')";
   assert.equal(text.split(dynamicImport).length - 1, 1);

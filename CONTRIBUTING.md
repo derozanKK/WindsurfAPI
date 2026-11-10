@@ -78,11 +78,12 @@ flowchart TD
 
 项目有完整的自动测试套件，PR 合并前 CI 会自动跑。权威计数口径是
 `npm run test:release`（逐文件进程隔离）。**当前数字见
-[最新交接文档](docs/README.md) 的门禁表，本文不复述** —— 这里此前钉着 v3.9.14 的
+[最终交接摘要 §Verify](docs/HANDOFF-SUMMARY.md) 与
+[发布验收附录 §3](docs/releases/ACCEPTANCE_3.141.592657.md)，本文不复述** —— 这里此前钉着 v3.9.14 的
 "3418 / 261"，而那之后又发了五个版本。一个数字写在不是它权威来源的地方就会烂。
 全量 `npm test` 的总数**不再漂**：2026-09-13 实测，真正的原因不是"输出竞态"而是
-`--test-force-exit` 会在跑完**部分 suite 之后**就让进程以 **0** 退出 —— 同一份字节跑 12 次得到
-**8 个不同的数字（34…72）**，去掉它之后 **10/10 稳定**。该 flag 已从 `package.json`、
+`--test-force-exit` 会在跑完**部分 suite 之后**就让进程以 **0** 退出 —— 同一份字节跑 10 轮得到
+**8 个不同的数字（34…72）**，去掉它之后 **10/10 稳定**（两臂逐轮交错跑，逐轮原始计数在 `939872b` 的 commit message 里，`git show -s --format=%B 939872b` 可复核）。该 flag 已从 `package.json`、
 `scripts/run-test-shard.mjs` 与三个 harness 脚本中移除。**不要加回来**：
 截断是静默的，而挂起会被 shard runner 点名。
 
@@ -102,6 +103,62 @@ for s in test/mutations/*.json; do npm run mutate -- "$s"; done
 - 跑了什么 curl 命令 / smoke 场景
 - dashboard 哪个面板点了
 - 复测了哪些模型（gpt-4o-mini 这类免费模型最方便）
+
+### 审查与合并标准
+
+这个仓库的合并标准此前只以 review 评论形式存在（7 条正式 review：#90 #142 #198 #232 #255 #256 #274，外加 ~40 条长评论；#276 在 2026-10-05 又追加 2 条 CHANGES_REQUESTED → 现为 **9 条 / 8 个 PR**（截至 2026-10-15），最新计数见 [交接文档 §2.1](docs/HANDOFF-2026-10-15.md)，本文不复述）。以下是它的成文版;引文逐字未改,每条附出处。
+
+**元规则 —— 什么才算守卫(RC0):** 守卫只有在**把修复回退后它会变红、且是在生产实际走的那个形状上变红**,才算守卫。—— #252 / #261
+
+- 正面实例(#261,走倒车实测):"**走倒车**实测(这是它算不算守卫的判据):把 `chat.js:3313` 的调用行删掉,新测试**红**"（引文坐标是 2026-09-13 的树；同一调用点现在 `chat.js:3384-3386`——引文逐字未改，只补坐标）
+- 反面实例(#252):"**Non-stream passes by accident, through two unrelated mechanisms.**"
+
+**开 PR 前自答(有一条答不上来,先别开):**
+
+- [ ] 修复键在**失效特征**上,还是键在模型名 / 单个字面量上?(RC4 —— 整类都修了吗,RC5)
+- [ ] 涉及 wire 协议:字段号**来源**注明了没有?未实测的坐标默认关、注释里直说不确定了吗?(RC1)
+- [ ] 你声称"守住了"的东西,把修复回退后测试会红吗?红在生产实际走的那个形状上吗?(元规则)
+- [ ] 测试钉的是上游身份 / 行为,还是只钉了 codec?(RC7)
+- [ ] 要声明漏网?前提是**让它无害**,不是"工具还没建"。(RC8)
+- [ ] 每个数字都带上产生它的命令了吗?跳过的门禁声明了没有(`GATE_INERT_SKIP_PATHS`,见上文「测试」),并且没有被报成绿?(数量规则 / RC10)
+- [ ] 这个 PR 只有一件事吗?无关的 hunk 拿掉了吗 —— CI 绿不是留下它的理由。(RC6)
+- [ ] 常量的依据在哪?注释里的理由对吗?(RC11 / RC12)
+
+#### 十二条拒绝标准
+
+每条 = 一句规范 + 最短逐字引文 + 出处。
+
+1. **RC1 未标定的 wire 坐标不得作为默认值。** "That only proves the decoder reads tag 22. Change the default to `^23` and keep the test writing 22, the suite stays green." —— #256 M1
+2. **RC2 请求侧的 wire 形状要真实抓包;解码侧知识不是证据。** "**这是解码侧的已知事实,推不出请求侧的形状。** ... **给我一段真实 CLI 在「一轮多 call」时的请求帧,哪怕只是 hex,这半我也收。**" —— #267 M1
+3. **RC3 只认观测到的 SKU;不要前缀匹配,不要未锚定正则。** "请把两处都锚成**只认观测到的 SKU**。" —— #266 M5
+4. **RC4 修复要键在失效特征上,绝不能键在模型名上。** "你把修复键在**失效特征**(reasoning-only finish + 有 tools)而不是模型名上,这个选择是对的,而且比「给 swe-1-7 开个特例」耐用得多 —— **本仓库吃过好几次「按模型名硬编码」的亏**。" —— #238
+5. **RC5 修这一类,否则不合入。** "**It fixes a whole class, not one string.**" —— #219;配对理由:类修复同时也是更小的 diff —— "No new export in `identity-neutralize.js`, no new call site in `chat.js` — the net diff ends up smaller than what you have now"
+6. **RC6 一个 PR 一件事;无关的 hunk 即便 CI 绿也否决**(规则本身见上文「Commit & PR」,这里补的是它的判例)。"**Per CONTRIBUTING, one PR per concern; it also keeps `git bisect` honest later.**" —— #219
+7. **RC7 钉住 codec 而非上游身份的测试不算。** "Default-on `^22` / PlanStatus `#19/#20` — I attacked the tests: they pin the codec, not upstream identity, same class as `IMAGE_TAG` `#4`." —— #256 M1
+8. **RC8 声明漏网要的是"无害的前提",不是"工具缺失"。** "可以接受,前提是**给出让它无害的前提**。你给的是「工具还没建」—— 那是「没守卫」,不是「无害」。" —— #242 M2
+9. **RC9 声明的测试结果要在干净 master 上核对;不准确的代价大于失败。** "本仓库合并前会逐条核实提交者的诊断链,所以**测试结论的准确性比它是否通过更重要** —— 一条不实的声明会让整份验证结果都需要重新核对。" —— #232
+10. **RC10 跳过的门禁绝不报成绿。** "**Not treating a skipped gate as green**" —— #256
+11. **RC11 无解释的常量是 blocker;依据是作者的活,数值是维护者的决定。** "请说一下 100m 是怎么来的:是最坏情况实测(多图 + 大 payload),还是取的整档? ... **这个数我倾向由你给依据、我拍板**" —— #265 M2
+12. **RC12 理由写错的注释是缺陷,即使行为是对的。** "注释把理由写错了,而错的理由比没有注释危险:下一个人读到「救援会自然触发」,就不会再去验它。**本仓库栽在这个形状上不止一次(注释把意图写对、实现少一环、而注释读起来完全正确)。**" —— #243 M2
+
+#### 两条作用域规则(效力等同拒绝标准)
+
+1. **本仓库不是通用 OpenAI 兼容多路复用器。** "This repo turns Windsurf / Devin into OpenAI / Anthropic / Gemini. **It is not a generic OpenAI-compatible multiplexer.**" —— #259
+2. **被取代的 PR 关为 superseded,不留着。** "请你把 #267 关成 superseded(或先转 draft,等有一轮多 call 的真实 CLI 请求帧再开)。我这边不替你关。" —— #267
+
+#### 成熟 review 的形态
+
+2026-07-28..09-16 一段的 review 固定产出四样:
+
+1. 测量表:**head SHA + baseline SHA**,并声明 worktree 已隔离;
+2. 发现按 **M1 / M2 / M3** 编号,分级 **blocker / major / nit**;
+3. 显式合并闸门;
+4. 显式列出**没有改什么、以及为什么**。
+
+#### 两条散落别处的规则
+
+- **数字要带上产生它的命令。** 复述一个没重跑过的数字,就是错误主张进入 review 的通道 —— 本项目实测:89/89 条自带运行命令的声明成立;错的声明全是没人重跑的复述。原话:"引用测量日期,否则重新测。"
+- **跳过的门禁绝不报成绿(RC10)。** CI 绿 + 跳过一门,不等于门禁全绿。宿主上合法地不执行测试的文件,用 `GATE_INERT_SKIP_PATHS` 声明(机制见上文「测试」);声明了测试却不执行、又不声明的文件,门禁照红。
 
 ### CI
 
@@ -163,13 +220,15 @@ the routed path, or making parseFields recurse).
 
 The project has a full automated test suite and CI runs it on every PR. The authoritative
 count comes from `npm run test:release` (one process per file). **The current number lives in
-the gate table of the newest handoff ([docs/README.md](docs/README.md) points at it) and is
-deliberately not repeated here** — this spot used to pin "3418 / 261 as of v3.9.14" and five
+the final handoff summary ([docs/HANDOFF-SUMMARY.md](docs/HANDOFF-SUMMARY.md) §Verify) and the
+release acceptance appendix ([docs/releases/ACCEPTANCE_3.141.592657.md](docs/releases/ACCEPTANCE_3.141.592657.md) §3),
+and is deliberately not repeated here** — this spot used to pin "3418 / 261 as of v3.9.14" and five
 releases shipped after that. A number written anywhere other than its authoritative source
 rots. Totals from a plain `npm test` **no longer drift**: measured 2026-09-13, the cause was not
 an "output race" but `--test-force-exit` ending the process after **part of the suites** and
-still exiting **0** — twelve identical runs of one file gave **eight distinct counts (34..72)**,
-and **10/10 stable** without it. The flag was removed from `package.json`,
+still exiting **0** — ten identical runs of one file gave **eight distinct counts (34..72)**,
+and **10/10 stable** without it (both arms interleaved round by round; the per-round raw counts
+are in `939872b`'s commit message — `git show -s --format=%B 939872b`). The flag was removed from `package.json`,
 `scripts/run-test-shard.mjs` and the three harness scripts. **Do not re-add it**: a truncation is
 silent, a hang is named by the shard runner.
 
@@ -191,7 +250,60 @@ the release result includes explicit skips. Mutations print SKIP because they ar
 of this incremental command. Exit 0 is incremental success, 1 a failed check, 2 missing or
 untrustworthy evidence. PR CI deliberately does not run mutations because of their cost.
 
-**Full gate on Linux/POSIX** (Node, npm, Git and Bash installed; clean committed checkout):
+The working-tree scan cannot see a credential that was committed and then deleted — it is
+still in every clone. CI's `history-secrets` job runs `node scripts/history-secret-scan.mjs`
+over every blob in every ref plus the unreachable objects an amend/rebase/force-push leaves
+behind. Reviewed historical findings live in `scripts/history-secret-scan.baseline`, one
+line each with a reason; a new leak is not in that file and fails the job. It is not part of
+`npm run gate`: it walks the whole object database (~15 s on a 1.9k-commit history) and no
+working-tree change can alter its answer.
+
+**A test file that declares tests but executes none has to be declared.** The shard summary
+folds such a file into a skip total, so on a host where 4813 tests ran and 6 files did not, the
+verdict still reads PASS and the only trace is `79 skip` in a detail line. The gate now names
+the files and how many tests each declared, because a total cannot be acted on and a path can.
+
+To be precise about what this does and does not catch: a module that **throws while loading**
+does not slip through. A top-level throw in an imported module makes the file fail
+(`fail 1`), which the `fail` count has always caught. What was invisible is the opposite case
+— deliberate, reason-carrying skips that a reader scanning a green line can mistake for
+coverage.
+
+Partial skips stay legal — platforms legitimately gate fixtures. The real-Git fixtures are the
+standing example: they skip on any host without `git` at a trusted absolute POSIX path, by
+design (`test/git-fixture-env.js`, asserted in `test/git-fixture-availability.test.js`). Declare
+what you accept on your host; the value is host-specific — the sets below are what each host
+*measures*, not a universal list. The measured pair for a POSIX host with no wire base and no
+live credentials is:
+
+```text
+GATE_INERT_SKIP_PATHS=test/wire-byte-identity.test.js;test/devin-connect-relogin-live.test.js
+```
+
+`test/wire-byte-identity.test.js` skips without `WIRE_BASE_TREE` because it is a CI-only
+comparison; `test/devin-connect-relogin-live.test.js` skips its whole suite at the describe
+level when not armed (`RELOGIN_LIVE=1` plus credentials) and reports `tests 0 / suites 1 /
+skipped 0`. A native Windows host measures six (2026-10-26, final tree): it also lacks
+`/usr/bin/git`, so `test/mutate-verify-harness.test.js` and
+`test/self-update-untracked-safety.test.js` execute nothing there (`REAL_GIT` is null;
+`test/git-fixture-env.js` requires git at a trusted absolute POSIX path). `test/detach-soak.test.js`
+is a suite-level skip unless `DETACH_SOAK=1` (it needs a real 120 s TTL), and
+`test/detach-ls-pool-pressure.test.js` skips its POSIX-only pressure arms on Windows
+(`ensureLs` must spawn a shebang fake LS). The full measured Windows set is:
+
+```text
+GATE_INERT_SKIP_PATHS=test/wire-byte-identity.test.js;test/devin-connect-relogin-live.test.js;test/mutate-verify-harness.test.js;test/self-update-untracked-safety.test.js;test/detach-soak.test.js;test/detach-ls-pool-pressure.test.js
+```
+
+Semicolon- or newline-separated, repo-relative, `/` or `\`. The variable is an override with no
+default: unset means accept nothing, so an unreviewed file that starts executing nothing while
+declaring work — the shape the census names — still fails. A module that throws while loading is
+not that shape: it fails the file (`tests 1 / fail 1`, exit 1), which the `fail` count has always
+caught; a file that declares nothing at all is no evidence either. Entries that match nothing are
+reported as `unused` — a stale entry is a claim about the host that has stopped being true.
+
+**Full gate on Linux/POSIX** (Node >= 22.13 — the release gate runs Node 24 — plus npm, Git and
+Bash; clean committed checkout):
 
 ```bash
 set -eu
@@ -273,6 +385,62 @@ checkout while it runs. In your PR description, also include:
 - What curl commands or smoke scenarios you ran
 - Which dashboard panels you clicked through
 - Which models you tested (free ones like `gpt-4o-mini` are easiest)
+
+### Review & merge bar
+
+This repository's merge bar has only ever existed in review comments (7 formal reviews — #90 #142 #198 #232 #255 #256 #274 — plus ~40 long issue comments; #276 added two more CHANGES_REQUESTED on 2026-10-05, so the current count is **9 across 8 PRs** as of 2026-10-15 — the live number lives in handoff §2.1). This is that bar in writing; every quote is verbatim, with its PR.
+
+**Meta-rule — what counts as a guard (RC0):** a guard counts only if **reverting the fix turns it red, and it turns red in the shape production actually takes**. — #252 / #261
+
+- Positive instance (#261, the reverse-the-fix measurement): "**走倒车**实测(这是它算不算守卫的判据):把 `chat.js:3313` 的调用行删掉,新测试**红**" (the quoted coordinate is the 2026-09-13 tree; the same call site is now `chat.js:3384-3386` — the quote stays verbatim, only the coordinate is added)
+- Negative instance (#252): "**Non-stream passes by accident, through two unrelated mechanisms.**"
+
+**Self-check before opening a PR (if one item has no answer, fix that first):**
+
+- [ ] Is the fix keyed on the **failure signature**, not a model name or one literal? (RC4 — did you fix the whole class, RC5)
+- [ ] Wire protocol: is the field-number **source** cited, and are unmeasured coordinates default-off with a comment that says so? (RC1)
+- [ ] For anything you claim is "guarded": does reverting the fix turn the test red — in the shape production takes? (meta-rule)
+- [ ] Do the tests pin upstream identity / behaviour, or only the codec? (RC7)
+- [ ] Declaring a gap? The premise must be that it is harmless, not that the tool is missing. (RC8)
+- [ ] Does every number carry the command that produced it? Is every skipped gate declared (`GATE_INERT_SKIP_PATHS`, see Testing above) and none reported as green? (number rule / RC10)
+- [ ] Is this PR one concern? Are unrelated hunks gone — green CI is not a reason to keep them. (RC6)
+- [ ] Is every constant explained, and every comment's reason true? (RC11 / RC12)
+
+#### The twelve rejection criteria
+
+Each: a one-line rule + the shortest verbatim quote + its PR.
+
+1. **RC1 Unmeasured wire coordinates must not ship as defaults.** "That only proves the decoder reads tag 22. Change the default to `^23` and keep the test writing 22, the suite stays green." — #256 M1
+2. **RC2 A request-side wire shape needs a real capture; decoder-side knowledge is not evidence.** "**这是解码侧的已知事实,推不出请求侧的形状。** ... **给我一段真实 CLI 在「一轮多 call」时的请求帧,哪怕只是 hex,这半我也收。**" — #267 M1
+3. **RC3 Only observed SKUs — no prefix matching, no unanchored regexes.** "请把两处都锚成**只认观测到的 SKU**。" — #266 M5
+4. **RC4 Key the fix on the failure signature, never on the model name.** "你把修复键在**失效特征**(reasoning-only finish + 有 tools)而不是模型名上,这个选择是对的,而且比「给 swe-1-7 开个特例」耐用得多 —— **本仓库吃过好几次「按模型名硬编码」的亏**。" — #238
+5. **RC5 Fix the class, or it does not merge.** "**It fixes a whole class, not one string.**" — #219; paired rationale — the class fix is also the smaller diff: "No new export in `identity-neutralize.js`, no new call site in `chat.js` — the net diff ends up smaller than what you have now"
+6. **RC6 One PR, one concern; unrelated hunks are rejected even when CI is green** (the rule itself is under Commits & PRs above — this adds its case law). "**Per CONTRIBUTING, one PR per concern; it also keeps `git bisect` honest later.**" — #219
+7. **RC7 Tests that pin the codec rather than upstream identity do not count.** "Default-on `^22` / PlanStatus `#19/#20` — I attacked the tests: they pin the codec, not upstream identity, same class as `IMAGE_TAG` `#4`." — #256 M1
+8. **RC8 A declared gap needs a harmless premise, not a missing tool.** "可以接受,前提是**给出让它无害的前提**。你给的是「工具还没建」—— 那是「没守卫」,不是「无害」。" — #242 M2
+9. **RC9 Verify claimed test results on a clean master; an inaccurate claim costs more than a failure.** "本仓库合并前会逐条核实提交者的诊断链,所以**测试结论的准确性比它是否通过更重要** —— 一条不实的声明会让整份验证结果都需要重新核对。" — #232
+10. **RC10 A skipped gate is never reported as green.** "**Not treating a skipped gate as green**" — #256
+11. **RC11 An unexplained constant is a blocker; the author supplies the rationale, the maintainer decides the value.** "请说一下 100m 是怎么来的:是最坏情况实测(多图 + 大 payload),还是取的整档? ... **这个数我倾向由你给依据、我拍板**" — #265 M2
+12. **RC12 A comment whose reason is wrong is a defect, even when the behaviour is right.** "注释把理由写错了,而错的理由比没有注释危险:下一个人读到「救援会自然触发」,就不会再去验它。**本仓库栽在这个形状上不止一次(注释把意图写对、实现少一环、而注释读起来完全正确)。**" — #243 M2
+
+#### The two scope rules (the same force as rejection criteria)
+
+1. **This is not a generic OpenAI-compatible multiplexer.** "This repo turns Windsurf / Devin into OpenAI / Anthropic / Gemini. **It is not a generic OpenAI-compatible multiplexer.**" — #259
+2. **A superseded PR is closed, not left open.** "请你把 #267 关成 superseded(或先转 draft,等有一轮多 call 的真实 CLI 请求帧再开)。我这边不替你关。" — #267
+
+#### The shape of a mature review
+
+Reviews in the 2026-07-28..09-16 period settled into four artifacts:
+
+1. a measurement table: **head SHA + baseline SHA**, with an explicit statement that the worktree was isolated;
+2. findings numbered **M1 / M2 / M3**, graded **blocker / major / nit**;
+3. an explicit merge gate;
+4. an explicit list of **what the reviewer did not change, and why**.
+
+#### Two rules stated elsewhere
+
+- **A number carries the command that produced it.** Restating a figure nobody re-ran is how a wrong claim enters a review — measured on this project: 89 of 89 claims that carried a run command held; every wrong claim was a restatement nobody ran. The source's lesson, verbatim: "引用测量日期,否则重新测。"
+- **A skipped gate is never reported as green (RC10).** Green CI plus a skipped gate is not a green gate. A file that legitimately executes no tests is declared via `GATE_INERT_SKIP_PATHS` (mechanism under Testing above); a file that declares tests, executes none, and is not declared still fails the gate.
 
 ### CI
 

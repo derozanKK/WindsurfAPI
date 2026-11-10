@@ -7,7 +7,7 @@
     {
       "name": "Failover delay drops to zero",
       "file": "src/handlers/chat.js",
-      "anchor": "    const timer = setTimeout(finish, 500);",
+      "anchor": "    const timer = setTimeout(finish, waitMs);",
       "replacement": "    const timer = setTimeout(finish, 0);",
       "expectCaught": true
     },

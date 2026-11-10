@@ -1,4 +1,25 @@
+import { unwrapPastedSecret } from './account-text-parser.js';
+
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+// A whole credential can be one opaque string: a show-auth-token /
+// OneTimeAuthToken value is 47 chars of [A-Za-z0-9_-] (measured live), and the
+// desktop callback is a `windsurf://…?access_token=…` deep link. Without this
+// a token-only line was ERR_FORMAT_INVALID, so a pasted token could not be
+// batch-imported at all (F3/F9).
+const BARE_TOKEN_RE = /^[A-Za-z0-9_\-\.\$\/+=]{40,}$/;
+const ABSOLUTE_URL_RE = /^[a-z][a-z0-9+.\-]*:\/\//i;
+
+function tokenFromLine(line) {
+  if (BARE_TOKEN_RE.test(line)) return line;
+  if (!ABSOLUTE_URL_RE.test(line)) return '';
+  try {
+    return unwrapPastedSecret(line);
+  } catch {
+    // A URL with no token (or a proxy URL) is not a credential; the caller
+    // reports the line as ERR_FORMAT_INVALID exactly as before.
+    return '';
+  }
+}
 
 export class BatchImportParseError extends Error {
   constructor(code, message = code) {
@@ -105,6 +126,10 @@ export function parseBatchImportTextLine(rawLine, lineNumber, parseProxyUrl) {
   if (!line) return null;
   const emailMatch = line.match(EMAIL_RE);
   if (!emailMatch) {
+    const token = tokenFromLine(line);
+    if (token) {
+      return buildEntry({ kind: 'token', lineNumber, raw: rawLine, token, label: '' });
+    }
     return buildIssue({ lineNumber, raw: rawLine, code: 'ERR_FORMAT_INVALID' });
   }
   const email = emailMatch[0];

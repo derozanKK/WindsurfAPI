@@ -11,7 +11,7 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { scryptSync, randomBytes, timingSafeEqual } from 'crypto';
-import { writeJsonAtomic } from './fs-atomic.js';
+import { writeJsonAtomic, restrictFileToOwnerSync } from './fs-atomic.js';
 import { resolve } from 'path';
 import { config, log } from './config.js';
 
@@ -21,7 +21,7 @@ const DEFAULTS = {
   experimental: {
     // Reuse Cascade cascade_id across multi-turn requests when the history
     // fingerprint matches. Big latency win for long conversations but relies
-    // on Windsurf keeping the cascade alive — off by default.
+    // on Windsurf keeping the cascade alive — on by default (#24).
     cascadeConversationReuse: true,
     // Pre-flight rate limit check via server.codeium.com before sending a
     // chat request. Reduces wasted attempts when the account has no message
@@ -204,11 +204,23 @@ function load() {
   }
 }
 
-function persist() {
+function persist({ strict = false } = {}) {
   try {
     writeJsonAtomic(FILE, _state);
+    // SEC-03 follow-up: runtime-config.json holds the plaintext runtime API
+    // key and the scrypt dashboard-password hash. `mode: 0o600` is a POSIX
+    // contract; on Windows the renamed file keeps the inherited directory ACL
+    // (Users/Authenticated Users). Same best-effort icacls pass as
+    // accounts.json — the helper warns and never throws past this point.
+    restrictFileToOwnerSync(FILE, { warn: (m) => log.warn(m) });
   } catch (e) {
     log.warn(`runtime-config: failed to persist: ${e.message}`);
+    // Ordinary setters stay best-effort (a read-only config file must not
+    // break a running process). A CREDENTIAL rotation is different: reporting
+    // success while the file still holds the old key would leave the operator
+    // with a rotated-in-memory / stale-on-disk split, so its caller asks for
+    // the error and rolls back.
+    if (strict) throw e;
   }
 }
 
@@ -750,9 +762,107 @@ export function getCredentials() {
   };
 }
 
+// Test seam for the strict-commit path. Never set from production code.
+let _persistFailureForTests = null;
+export function __setRuntimeConfigPersistFailureForTests(err) {
+  _persistFailureForTests = err || null;
+}
+
+function credentialInputError(message) {
+  const err = new Error(message);
+  err.code = 'ERR_CREDENTIAL_INVALID';
+  return err;
+}
+
+function writeCredentialPatch(patch) {
+  const previous = { ...(_state.credentials || {}) };
+  if (!_state.credentials) _state.credentials = {};
+  Object.assign(_state.credentials, patch);
+  try {
+    if (_persistFailureForTests) throw _persistFailureForTests;
+    persist({ strict: true });
+  } catch (e) {
+    // Nothing reached the file, so nothing may stay in memory either: a key
+    // that only exists in RAM would silently disappear on the next restart.
+    _state.credentials = previous;
+    const err = new Error('ERR_CREDENTIAL_PERSIST_FAILED');
+    err.code = 'ERR_CREDENTIAL_PERSIST_FAILED';
+    err.cause = e;
+    throw err;
+  }
+  return getCredentials();
+}
+
+/**
+ * Rotate the runtime API key and/or dashboard password as ONE transaction.
+ *
+ * V-21 (audit A22): the dashboard route used to call setRuntimeApiKey() while
+ * still validating the password field, so a request that ended in 400 had
+ * already persisted a new chat key. Every input is validated here first; only
+ * a fully valid request mutates state, and both fields are written by a single
+ * atomic file replace. A failed write rolls BOTH fields back and throws
+ * `ERR_CREDENTIAL_PERSIST_FAILED` so the caller cannot report a rotation that
+ * did not happen.
+ *
+ * Input contract (unchanged from the route that used to implement it):
+ *   apiKey            — string (null/undefined mean "clear"); trimmed, must not
+ *                       contain whitespace/control chars, min 8 chars when set.
+ *   dashboardPassword — string (null/undefined mean "clear"); trimmed, a
+ *                       non-empty input that trims to empty is rejected, min 8
+ *                       chars when set. Stored as a scrypt hash.
+ * At least one of the two must be present.
+ */
+export function setRuntimeCredentials(input = {}) {
+  const source = (input && typeof input === 'object') ? input : {};
+  const hasApiKey = Object.prototype.hasOwnProperty.call(source, 'apiKey');
+  const hasPassword = Object.prototype.hasOwnProperty.call(source, 'dashboardPassword');
+  if (!hasApiKey && !hasPassword) {
+    throw credentialInputError('Provide apiKey, dashboardPassword, or both');
+  }
+
+  // ── prepare: validate the complete request before touching anything ──
+  const patch = {};
+  if (hasApiKey) {
+    const v = source.apiKey;
+    if (v != null && typeof v !== 'string') throw credentialInputError('apiKey must be a string');
+    const trimmed = String(v ?? '').trim();
+    // Loose sanity: reject keys with whitespace / control chars. An empty
+    // string is the explicit "clear runtime override" signal.
+    if (trimmed && /[\s\x00-\x1f]/.test(trimmed)) {
+      throw credentialInputError('apiKey must not contain whitespace or control characters');
+    }
+    if (trimmed && trimmed.length < 8) {
+      throw credentialInputError('apiKey must be at least 8 characters');
+    }
+    patch.apiKey = trimmed;
+  }
+  if (hasPassword) {
+    const v = source.dashboardPassword;
+    if (v != null && typeof v !== 'string') throw credentialInputError('dashboardPassword must be a string');
+    const raw = String(v ?? '');
+    // SEC-04: the length gate runs on the TRIMMED value. An all-whitespace
+    // value of >= 8 chars passed the raw-length gate, got hashed, and became
+    // a password the login path can never match. Empty string stays the
+    // explicit "clear the runtime override" signal; a non-empty value that
+    // trims to empty is a blank password, not a clear.
+    const pw = raw.trim();
+    if (raw && !pw) throw credentialInputError('dashboardPassword must not be blank');
+    if (pw && pw.length < 8) throw credentialInputError('dashboardPassword must be at least 8 characters');
+    // Hash BEFORE the commit: scrypt is the expensive step and must not run
+    // against half-applied state.
+    patch.dashboardPasswordHash = pw ? hashPassword(pw) : '';
+  }
+
+  return writeCredentialPatch(patch);
+}
+
 /**
  * Set the runtime API key. Empty string clears the runtime override and
  * lets `config.apiKey` fall back to the env value at call sites.
+ *
+ * Kept as a single-field convenience for callers that only own one credential
+ * (and for tests). The dashboard route uses setRuntimeCredentials() so a
+ * multi-field rotation cannot half-commit.
  */
 export function setRuntimeApiKey(plain) {
   const v = typeof plain === 'string' ? plain.trim() : '';
@@ -764,10 +874,14 @@ export function setRuntimeApiKey(plain) {
 
 /**
  * Set the runtime dashboard password (plaintext input → scrypt hash on
- * disk). Empty string clears the runtime override.
+ * disk). The value is trimmed before hashing for the same reason
+ * setRuntimeApiKey trims: the dashboard form and terminal input both pick up
+ * stray leading/trailing whitespace, and a hash of " pw " can never be
+ * reproduced from a login header that arrives as "pw". Empty (or
+ * whitespace-only, which trims to empty) clears the runtime override.
  */
 export function setRuntimeDashboardPassword(plain) {
-  const v = typeof plain === 'string' ? plain : '';
+  const v = typeof plain === 'string' ? plain.trim() : '';
   if (!_state.credentials) _state.credentials = {};
   _state.credentials.dashboardPasswordHash = v ? hashPassword(v) : '';
   persist();
