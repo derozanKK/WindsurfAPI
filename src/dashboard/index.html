@@ -11461,7 +11461,7 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
             <span class="k">${T('tier')}</span><span class="v"><span class="tier ${this.esc(a.tier || 'unknown')}" style="padding:1px 8px;font-size: 12px">${this.esc(a.tier || 'unknown')}</span>${a.tierManual ? ' <span style="color:var(--text-dim);font-size: 12px">✎ ' + I18n.t('account.tierManualBadge') + '</span>' : ''}</span>
             ${a.balance != null ? `<span class="k">${T('balance')}</span><span class="v"><b style="color: var(--success-text)">$${Number(a.balance).toFixed(2)}</b></span>` : ''}
             <span class="k">${T('start')}</span><span class="v">${fmtDate(planStart)}</span>
-            <span class="k">${T('end')}</span><span class="v">${fmtDate(planEnd)}${trialDaysLeft != null ? ` <span style="color:${trialDaysLeft <= 3 ? 'var(--error)' : 'var(--text-dim)'};font-size: 12px">(${trialDaysLeft}d left)</span>` : ''}</span>
+            <span class="k">${T('end')}</span><span class="v">${fmtDate(planEnd)}${trialDaysLeft != null ? ` <span style="color:${trialDaysLeft <= 3 ? 'var(--error-text)' : 'var(--text-dim)'};font-size: 12px">(${trialDaysLeft}d left)</span>` : (planEnd && Number.isFinite(new Date(planEnd).getTime()) ? (() => { const days = Math.max(0, Math.ceil((new Date(planEnd).getTime() - Date.now()) / 86400000)); return ` <span style="color:${days <= 3 ? 'var(--error-text)' : 'var(--text-dim)'};font-size: 12px">(${T('periodLeft', { days })})</span>`; })() : '')}</span>
             ${resetRow('dailyReset', a.periodStart)}
             ${resetRow('weeklyReset', a.periodEnd)}
             ${overageText ? `<span class="k">${T('overage')}</span><span class="v">${this.esc(overageText)}</span>` : ''}
