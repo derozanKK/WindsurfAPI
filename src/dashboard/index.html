@@ -2913,6 +2913,7 @@ tbody tr:hover td { background: var(--surface-2); }
 .acct-quota-head b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 .acct-quota-head > span:last-child { margin-left: auto; }
 .acct-quota-bar { display: flex; align-items: center; gap: var(--space-4); margin-top: 1px; line-height: 1; }
+.acct-quota-period { margin-top: var(--space-2); font-size: var(--fs-sm); line-height: 1.25; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .acct-quota-label { width: 10px; flex: none; font-size: var(--fs-sm); font-weight: 600; color: var(--text-dim); }
 .acct-quota-track { flex: 1; height: 3px; background: var(--surface-3); border-radius: 2px; overflow: hidden; min-width: 30px; }
 .acct-quota-track.na { outline: 1px dashed var(--text-dim); outline-offset: -1px; }
@@ -9841,7 +9842,33 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
       <div class="acct-quota-head"><b>${this.esc(String(planName).slice(0, 10))}</b> <span style="color:var(--text-dim)">${this.esc(fetchedAgo)}</span>${balanceHtml}</div>
       ${bar(I18n.t('creditsBar.dailyShort'), cr.dailyPercent, dailyTip)}
       ${bar(I18n.t('creditsBar.weeklyShort'), cr.weeklyPercent, weeklyTip)}
+      ${this.renderQuotaPeriod(cr)}
     </div>`;
+  },
+
+  // Plan cycle line under the quota bars: "10/21 – 11/21 · 剩余 10 天". Start and
+  // end come from the credits snapshot (planStart/planEnd, same fields the account
+  // drawer's 订阅信息 card reads); the tooltip spells out both full dates. Empty
+  // when the snapshot has no valid end date, so unprobed accounts stay unchanged.
+  renderQuotaPeriod(cr) {
+    const toMs = (v) => {
+      if (v == null || v === '') return null;
+      const n = Number(v);
+      const ms = Number.isFinite(n) && n > 0 ? (n < 1e12 ? n * 1000 : n) : new Date(v).getTime();
+      return Number.isFinite(ms) ? ms : null;
+    };
+    const endMs = toMs(cr.planEnd);
+    if (endMs == null) return '';
+    const startMs = toMs(cr.planStart);
+    const md = (ms) => { const d = new Date(ms); return `${d.getMonth() + 1}/${d.getDate()}`; };
+    const days = Math.max(0, Math.ceil((endMs - Date.now()) / 86400000));
+    const left = I18n.t('account.detail.plan.periodLeft', { days });
+    const range = startMs != null ? `${md(startMs)} – ${md(endMs)}` : md(endMs);
+    const tip = [
+      startMs != null ? `${I18n.t('account.detail.plan.start')}: ${new Date(startMs).toLocaleDateString()}` : '',
+      `${I18n.t('account.detail.plan.end')}: ${new Date(endMs).toLocaleDateString()} (${left})`,
+    ].filter(Boolean).join('\n');
+    return `<div class="acct-quota-period" title="${this.esc(tip)}">${this.esc(range)} · <span style="color:${days <= 3 ? 'var(--error-text)' : 'var(--text-dim)'}">${this.esc(left)}</span></div>`;
   },
 
   renderModelsCell(a) {
@@ -14734,6 +14761,10 @@ void main(){ vec3 s=texture(u_scene,v_uv).rgb; vec3 g=texture(u_glow,v_uv).rgb; 
   },
 
   esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); },
+  // Attribute-value escape (data-*, title, ...). Same rules as esc(); named
+  // separately because the model-group header in the account drawer calls it,
+  // and it was never defined, which made renderAccountDetail throw.
+  escAttr(s) { return this.esc(s); },
 
   // Reusable inline help "?" with an i18n hover/focus bubble. key resolves
   // tooltip.help.<key>. Escaped text is used for both the bubble and aria-label.
