@@ -36,11 +36,14 @@ import { resolveClineCompat, stripClineNamespace } from './handlers/cline-compat
 import { resolveCcCompat, stripCcNamespace } from './handlers/cc-compat.js';
 import { isExperimentalEnabled, getBackendSwitch } from './runtime-config.js';
 import { resolveModel, getModelInfo } from './models.js';
-import { handleDashboardApi, parseProxyUrl, validateProxyHost, verifyAdminRequest, validateDashboardRequestHost } from './dashboard/api.js';
+import { handleDashboardApi, preflightDashboardRequest, parseProxyUrl, validateProxyHost, verifyAdminRequest, validateDashboardRequestHost, credStoreGateOpen } from './dashboard/api.js';
 import { recordRequest, updateRequest } from './dashboard/request-ring.js';
-import { withStatsScope, finalizeStatsScope } from './dashboard/stats.js';
+import {
+  beginChatRequestLog, finalizeStatsScope, recordAccountAdmissionRejection, requestLogBootId, withStatsScope,
+} from './dashboard/stats.js';
 import { exportRequestToLangfuse } from './langfuse.js';
 import { setAccountProxy } from './dashboard/proxy-config.js';
+import { DEVIN_BROWSER_CALLBACK, handleBrowserLoginCallback } from './dashboard/devin-browser-login.js';
 import { config, log } from './config.js';
 import { getVersionInfo } from './version.js';
 import { callerKeyFromRequest } from './caller-key.js';
@@ -72,6 +75,22 @@ function hasUsableAccount() {
     && !!(process.env.DEVIN_CONNECT_TOKEN || process.env.WINDSURF_API_KEY);
 }
 
+function rejectAccountAdmission(res, requestId, surface) {
+  const status = surface === 'messages' ? 529 : 503;
+  recordAccountAdmissionRejection({ requestId, surface, status, build: VERSION_INFO });
+  if (surface === 'messages') {
+    res.setHeader('request-id', requestId);
+    return json(res, status, withRequestId(status, {
+      type: 'error', error: { type: 'overloaded_error', message: 'No active accounts available, please retry' },
+    }, requestId));
+  }
+  const message = 'No active accounts. POST /auth/login to add accounts.';
+  if (surface === 'gemini') {
+    return json(res, status, { error: { code: status, message, status: 'UNAVAILABLE' } });
+  }
+  return json(res, status, withRequestId(status, { error: { type: 'api_error', message } }, requestId));
+}
+
 // 读取并归一 anthropic-version 请求头。返回生效版本字符串(缺失→默认)。
 // Node 已把头名小写化,直接取 req.headers['anthropic-version']。
 export function resolveAnthropicVersion(req) {
@@ -80,11 +99,28 @@ export function resolveAnthropicVersion(req) {
     log.warn('anthropic-version header missing; defaulting to ' + ANTHROPIC_DEFAULT_VERSION);
     return ANTHROPIC_DEFAULT_VERSION;
   }
+  // S3-F4: the value is echoed back as a response header — a charset-clamped
+  // version keeps unknown/future versions flowing while control bytes and
+  // arbitrary obs-text garbage fall back to the default instead of being
+  // mirrored into the wire (and into warn logs).
+  if (!/^[0-9a-zA-Z._-]{1,64}$/.test(raw)) {
+    log.warn('anthropic-version malformed: ' + headerSafeValue(raw).slice(0, 40) + ' (using default)');
+    return ANTHROPIC_DEFAULT_VERSION;
+  }
   if (!ANTHROPIC_KNOWN_VERSIONS.has(raw)) {
     // 向前兼容:未知/未来版本不拒绝,原样透传。
     log.warn('anthropic-version unrecognized: ' + raw.slice(0, 40) + ' (accepting as-is)');
   }
   return raw;
+}
+
+// Request-controlled strings echoed into response headers (openai-model /
+// anthropic-model / version echoes) must be printable ASCII: Node's header
+// validation throws on control bytes, and on the SSE error path that throw
+// lands inside commit()/finishError where it used to pin the socket open
+// (S3-F1). Non-string values coerce the same way String() would.
+export function headerSafeValue(value, max = 256) {
+  return String(value ?? '').replace(/[^\x20-\x7E]/g, '').slice(0, max);
 }
 
 export function readBody(req) {
@@ -141,6 +177,63 @@ function sendBodyTooLargeIfNeeded(res, err, style = 'openai') {
   return true;
 }
 
+// ─── Inbound Content-Encoding refusal (Q2 T04) ─────────────────────────────
+//
+// readBody() hands the raw bytes to JSON.parse as UTF-8; it has never
+// decompressed anything. A compressed body therefore always ended as a
+// confusing "Invalid JSON" 400 — and any future attempt to "fix" that by
+// inflating the body would hand an attacker a gzip bomb (a few KB on the wire,
+// gigabytes in memory). Refuse the encoding explicitly, BEFORE the body is
+// read, and never decompress: the caller must resend uncompressed.
+//
+// The check keys on the header alone, so it also fires for a chunked request
+// with no Content-Length (nothing about the body's declared size is trusted).
+const SUPPORTED_CONTENT_ENCODINGS = new Set(['', 'identity']);
+
+/** The unsupported Content-Encoding value on a request, or '' when usable. */
+export function unsupportedContentEncoding(req) {
+  const raw = String(req?.headers?.['content-encoding'] ?? '').trim();
+  if (!raw) return '';
+  return SUPPORTED_CONTENT_ENCODINGS.has(raw.toLowerCase()) ? '' : raw;
+}
+
+export function unsupportedContentEncodingPayload(encoding, style = 'openai') {
+  const message = `Content-Encoding "${encoding}" is not supported. Send the request body uncompressed `
+    + '(omit Content-Encoding, or send Content-Encoding: identity). This proxy does not decompress request bodies.';
+  if (style === 'dashboard') {
+    return { ok: false, error: 'unsupported_content_encoding', message };
+  }
+  if (style === 'legacy') {
+    return { error: message, code: 'unsupported_content_encoding' };
+  }
+  if (style === 'anthropic') {
+    return { type: 'error', error: { type: 'unsupported_content_encoding', message } };
+  }
+  if (style === 'gemini') {
+    // Gemini's envelope needs a numeric code + status enum; the shared typed
+    // string rides as `type` for clients that branch on it (unknown fields are
+    // ignored by the Google SDKs).
+    return { error: { code: 415, message, status: 'INVALID_ARGUMENT', type: 'unsupported_content_encoding' } };
+  }
+  return { error: { message, type: 'unsupported_content_encoding' } };
+}
+
+function rejectUnsupportedContentEncoding(req, res, style = 'openai') {
+  const encoding = unsupportedContentEncoding(req);
+  if (!encoding) return false;
+  json(res, 415, unsupportedContentEncodingPayload(encoding, style));
+  return true;
+}
+
+function contentEncodingErrorStyle(path) {
+  if (isAnthropicPath(path)) return 'anthropic';
+  if (typeof path === 'string'
+      && (path === '/v1beta' || path.startsWith('/v1beta/')
+        || GEMINI_GENERATE_PATH_RE.test(path))) return 'gemini';
+  if (typeof path === 'string' && path.startsWith('/auth/')) return 'legacy';
+  return 'openai';
+}
+
 /**
  * Bind an AbortController to the HTTP response so a client hang-up mid-await
  * tears down the in-flight upstream call.
@@ -152,13 +245,78 @@ function sendBodyTooLargeIfNeeded(res, err, style = 'openai') {
  * Retry-After / include_usage). Guard on !writableEnded so a normal end is a
  * no-op.
  */
-export function bindClientAbort(res) {
+export function bindClientAbort(res, lifecycle = null) {
   const abortController = new AbortController();
-  res.on('close', () => { if (!res.writableEnded) abortController.abort(); });
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    const disconnectedAt = lifecycle ? performance.now() : null;
+    abortController.abort();
+    if (lifecycle) {
+      lifecycle.clientDisconnected = true;
+      lifecycle.gatewayAbortEmitted = abortController.signal.aborted;
+      lifecycle.disconnectedAt = disconnectedAt;
+    }
+  });
   return abortController;
 }
 
-export function extractToken(req) {
+// ─── Credential carriers are SURFACE-scoped (Q2 T03) ───────────────────────
+//
+// Every accepted carrier used to authenticate every route: a Gemini query key
+// (`?key=`) or `x-goog-api-key` opened /v1/chat/completions, and `x-api-key`
+// opened any route. That let a credential minted for one protocol be replayed
+// against another (and put a chat POST's key in the URL, where proxies log it).
+// The carriers are now matched to the surface that actually defines them:
+//
+//   openai   : Authorization: Bearer only            (chat/completions/responses)
+//   messages : Bearer + x-api-key                    (Anthropic SDK shape)
+//   models   : Bearer + x-api-key + x-goog-api-key + ?key
+//   gemini   : Bearer + x-goog-api-key + ?key        (Google GenAI SDK shape)
+//   operator : Bearer + x-api-key                    (/auth/* — unchanged operator flow)
+//   any      : every carrier                          (direct callers + /health)
+//
+// `any` is the default so a pure-function caller that does not know a route is
+// not silently narrowed; the router always passes the surface explicitly.
+const CREDENTIAL_CARRIERS = {
+  openai: ['bearer'],
+  messages: ['bearer', 'x-api-key'],
+  models: ['bearer', 'x-api-key', 'x-goog-api-key', 'query'],
+  gemini: ['bearer', 'x-goog-api-key', 'query'],
+  operator: ['bearer', 'x-api-key'],
+  any: ['bearer', 'x-api-key', 'x-goog-api-key', 'query'],
+};
+
+// A Gemini generate call is Gemini-native ONLY at its documented prefixes:
+// /v1beta/models/{m}:generateContent and the /v1/models/{m}:generateContent
+// alias. Left-anchored so an embedded `/models/x:generateContent` tail inside
+// another route (e.g. /v1/messages/models/…) cannot pull the request onto the
+// Gemini carrier set or into handleGemini (S2-F1).
+const GEMINI_GENERATE_PATH_RE = /^\/v1(?:beta)?\/models\/[^:/]+:(generateContent|streamGenerateContent)$/;
+
+/**
+ * Which carrier set applies to a request path. Operator surfaces (/auth/*) and
+ * /health keep their historical carriers: the audit's scoping rule is about the
+ * protocol API surfaces, and narrowing operator auth would break the documented
+ * account-management flow.
+ */
+export function credentialSurfaceFor(path) {
+  const p = typeof path === 'string' ? path : '';
+  if (p === '/v1/messages' || p.startsWith('/v1/messages/')) return 'messages';
+  // A generate call is Gemini-native even when it rides the /v1/models alias:
+  // `/v1/models/{model}:generateContent` must use the Gemini carrier set, not
+  // the looser `models` set, or x-api-key (an Anthropic carrier) would reach
+  // handleGemini through the alias while /v1beta rejects it. Checked BEFORE the
+  // `/v1/models/` prefix for exactly that reason.
+  if (GEMINI_GENERATE_PATH_RE.test(p)) return 'gemini';
+  if (p === '/v1/models' || p.startsWith('/v1/models/')) return 'models';
+  if (p === '/v1beta' || p.startsWith('/v1beta/')) return 'gemini';
+  if (p === '/health' || p === '/auth' || p.startsWith('/auth/')) return 'operator';
+  return 'openai';
+}
+
+export function extractToken(req, surface = 'any') {
+  const carriers = CREDENTIAL_CARRIERS[surface] || CREDENTIAL_CARRIERS.any;
+  const allows = (carrier) => carriers.includes(carrier);
   // Anthropic SDK + OAI SDK compatibility: accept either header.
   const authHeader = String(req.headers['authorization'] || '').trim();
   // TOK-3 (audit P3): a comma used to blanket-clear the token — so a caller
@@ -169,22 +327,30 @@ export function extractToken(req) {
   // duplicate/injected `Bearer a, Bearer b` can't smuggle a second credential,
   // a stray comma no longer nukes auth, and — because we fall through when the
   // Bearer segment is empty — x-api-key still works.
-  const m = authHeader.match(/^Bearer\s+(.+)$/i);
+  const m = allows('bearer') && authHeader.match(/^Bearer\s+(.+)$/i);
   if (m) {
     const first = m[1].split(',')[0].trim();
     if (first) return first;
   }
-  const xApiKey = req.headers['x-api-key'] || '';
-  if (xApiKey) return xApiKey;
+  if (allows('x-api-key')) {
+    // HTTP/2 keeps header padding the HTTP/1.1 parser strips; trim so the two
+    // front ends compare the same credential (S2-F5).
+    const xApiKey = String(req.headers['x-api-key'] || '').trim();
+    if (xApiKey) return xApiKey;
+  }
   // Gemini-native auth: the Google GenAI SDK sends the key as `x-goog-api-key`
-  // or a `?key=` query param, not Bearer/x-api-key. Accept both so real Gemini
-  // clients can hit /v1beta/models/*:generateContent without a custom header.
-  const xGoog = String(req.headers['x-goog-api-key'] || '').trim();
-  if (xGoog) return xGoog;
-  try {
-    const qKey = new URL(req.url, 'http://localhost').searchParams.get('key');
-    if (qKey) return qKey.trim();
-  } catch { /* malformed url → no query key */ }
+  // or a `?key=` query param, not Bearer/x-api-key. Accept both only where a
+  // Gemini client can legitimately send them.
+  if (allows('x-goog-api-key')) {
+    const xGoog = String(req.headers['x-goog-api-key'] || '').trim();
+    if (xGoog) return xGoog;
+  }
+  if (allows('query')) {
+    try {
+      const qKey = new URL(req.url, 'http://localhost').searchParams.get('key');
+      if (qKey) return qKey.trim();
+    } catch { /* malformed url → no query key */ }
+  }
   return '';
 }
 
@@ -326,21 +492,18 @@ export async function serveChatStream(res, result, {
   }
 }
 
-async function route(req, res) {
+async function route(req, res, scope) {
   const { method } = req;
   let path = req.url.split('?')[0];
   // Tolerate a doubled `/v1/v1/` prefix some clients emit.
   if (path.startsWith('/v1/v1/')) path = path.slice(3);
 
-  // Fallback request id for every exit that never reaches a route handler.
-  //
-  // Measured 2026-09-13 (L8 smoke lane): each route generated its own id and set its
-  // own header, so the auth gate (`:412`), every 404 fallback (`:378`, `:397`, `:469`)
-  // and the Gemini branch answered with NO request id. An operator holding only the
-  // client-side error text could not match it to a log line. The per-route sites keep
-  // their own ids (they override this header via writeHead) — this only guarantees the
-  // pre-dispatch paths are never id-less. `x-request-id` is the vendor-neutral name the
-  // other routes already emit; Anthropic's own `request-id` header still wins where set.
+  // Allocate an ID before any early exit. Chat, Responses and Messages also
+  // pass it into their handlers, so the public header can name a routing trace.
+  if (method === 'GET' && path === DEVIN_BROWSER_CALLBACK && process.env.DEVIN_BROWSER_LOGIN === '1') {
+    return handleBrowserLoginCallback(req, res);
+  }
+
   const fallbackRequestId = 'req_' + randomUUID();
   res.setHeader('x-request-id', fallbackRequestId);
 
@@ -383,7 +546,7 @@ async function route(req, res) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, x-goog-api-key, anthropic-version',
     });
     return res.end();
   }
@@ -398,12 +561,13 @@ async function route(req, res) {
       commitDate: VERSION_INFO.commitDate,
       branch: VERSION_INFO.branch,
       buildSource: VERSION_INFO.source,
+      requestLogBootId,
       pid: process.pid,
       uptime: Math.round(process.uptime()),
       accounts: counts,
     };
     const qs = new URL(req.url, 'http://localhost').searchParams;
-    if (qs.get('verbose') === '1' && validateApiKey(extractToken(req))) {
+    if (qs.get('verbose') === '1' && validateApiKey(extractToken(req, 'operator'))) {
       try {
         const { poolStats } = await import('./conversation-pool.js');
         const { cacheStats } = await import('./cache.js');
@@ -456,8 +620,17 @@ async function route(req, res) {
   }
 
   if (path.startsWith('/dashboard/api/')) {
+    const subpath = path.slice('/dashboard/api'.length);
+    // S03/G05: run the Host/mutation/lockout/auth gate BEFORE reading the
+    // body. Previously the whole (up to MAX_BODY_SIZE) body was buffered and
+    // JSON-parsed before handleDashboardApi's gate ran, so an unauthenticated
+    // caller could force 10 MiB of work per request. handleDashboardApi skips
+    // its copy of the gate when this preflight already passed; direct callers
+    // (unit tests, in-process handlers) still get it there.
+    if (!preflightDashboardRequest(method, subpath, req, res)) return;
     let body = {};
     if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+      if (rejectUnsupportedContentEncoding(req, res, 'dashboard')) return;
       let raw;
       try {
         raw = await readBody(req);
@@ -476,7 +649,6 @@ async function route(req, res) {
         }
       }
     }
-    const subpath = path.slice('/dashboard/api'.length);
     return handleDashboardApi(method, subpath, body, req, res);
   }
 
@@ -529,17 +701,57 @@ async function route(req, res) {
     if (!validateDashboardRequestHost(req, res)) return;
   }
 
-  if (!validateApiKey(extractToken(req))) {
+  const credentialSurface = credentialSurfaceFor(path);
+  const presentedToken = extractToken(req, credentialSurface);
+  if (!validateApiKey(presentedToken)) {
     // v2.0.61 (#110): clearer error so operators know the issue is
     // configuration (no API_KEY set on a public-bind instance) rather
     // than a bad client header. The chat client side rarely shows a
     // verbose error so we cram the diagnosis into the message itself.
-    const tokenSent = !!extractToken(req);
+    const tokenSent = !!presentedToken;
+    // Name only the carriers this surface actually accepts (T03). Telling a chat
+    // caller to retry with x-api-key — which the same gate now rejects there —
+    // would send them in a loop.
+    const carrierHint = credentialSurface === 'gemini'
+      ? '`Authorization: Bearer <key>`, `x-goog-api-key: <key>` or `?key=<key>`'
+      : credentialSurface === 'models'
+        ? '`Authorization: Bearer <key>`, `x-api-key: <key>`, `x-goog-api-key: <key>` or `?key=<key>`'
+        : credentialSurface === 'messages' || credentialSurface === 'operator'
+          ? '`Authorization: Bearer <key>` or `x-api-key: <key>`'
+          : '`Authorization: Bearer <key>`';
     const message = tokenSent
       ? 'Invalid API key. Either the key is wrong, or the server has API_KEY configured to a different value than the one your client sent.'
-      : 'Missing API key. This server runs in fail-closed mode: requests must include `Authorization: Bearer <key>` (or `x-api-key: <key>`) matching the configured API_KEY env var. If you intend to run open (no auth), bind the server to localhost (HOST=127.0.0.1).';
+      : `Missing API key. This server runs in fail-closed mode: requests must include ${carrierHint} matching the configured API_KEY env var. If you intend to run open (no auth), bind the server to localhost (HOST=127.0.0.1).`;
+    // Q2 T02: the Anthropic SDK parses ONLY the Anthropic error envelope and
+    // reads the request id from the `request-id` header. The shared gate used to
+    // answer every family with the OpenAI {error:{type:'auth_error'}} body and
+    // no Anthropic header, so a Claude client saw an unparseable 401. Keep the
+    // OpenAI shape byte-identical; Gemini got its own envelope below (M10).
+    if (isAnthropicPath(path)) {
+      res.setHeader('request-id', fallbackRequestId);
+      return json(res, 401, withRequestId(401, {
+        type: 'error',
+        error: { type: 'authentication_error', message },
+      }, fallbackRequestId));
+    }
+    // M10: Gemini-surface clients (Google GenAI SDK, generateContent on either
+    // the /v1beta or the /v1/models alias) parse only the Google error
+    // envelope — {error:{code,message,status:'UNAUTHENTICATED'}}. The shared
+    // OpenAI auth_error body is as unparseable to them as it was to Anthropic
+    // SDKs before Q2 T02. geminiError owns the vocabulary.
+    if (credentialSurface === 'gemini') {
+      res.setHeader('request-id', fallbackRequestId);
+      return json(res, 401, withRequestId(401, geminiError(401, null, message).body, fallbackRequestId));
+    }
     return json(res, 401, withRequestId(401, { error: { message, type: 'auth_error' } }, fallbackRequestId));
   }
+
+  // Q2 T04: refuse a compressed request body before any route reads it. The
+  // check sits after the credential wall (an unauthenticated caller still gets
+  // the 401 it earned) and before every no-account/route guard, so the answer
+  // does not depend on pool state.
+  if ((method === 'POST' || method === 'PUT' || method === 'PATCH')
+      && rejectUnsupportedContentEncoding(req, res, contentEncodingErrorStyle(path))) return;
 
   // ─── Auth management (admin — gated by API key above) ──
 
@@ -611,7 +823,7 @@ async function route(req, res) {
         if (!proxyStr) return null;
         const parsed = parseProxyUrl(proxyStr);
         if (!parsed) {
-          log.warn(`auth/login: ignoring invalid proxy format: ${String(proxyStr).slice(0, 80)}`);
+          log.warn('auth/login: ignoring invalid proxy format');
           return null;
         }
         await validateProxyHost(parsed);
@@ -641,7 +853,13 @@ async function route(req, res) {
             } else if (acct.token) {
               result = await addAccountByPastedSecret(acct.token, acct.label);
             } else if (acct.email && acct.password) {
-              result = await addAccountByEmail(acct.email, acct.password);
+              // Consent is per ROW: a batch-level flag must not retain every
+              // password in the file. The locality gate is the same one the
+              // dashboard login uses — a loopback bind behind a proxy is not a
+              // trusted local caller.
+              result = await addAccountByEmail(acct.email, acct.password, {
+                storeCredential: credStoreGateOpen(acct.storeCredential, req),
+              });
             } else {
               results.push({ error: 'Missing credentials' });
               continue;
@@ -666,7 +884,12 @@ async function route(req, res) {
       } else if (body.token) {
         account = await addAccountByPastedSecret(body.token, body.label);
       } else if (body.email && body.password) {
-        account = await addAccountByEmail(body.email, body.password);
+        // Login permission is not retention consent: only an explicit
+        // storeCredential:true that also passes the trusted-local / remote
+        // opt-in gate may write the password.
+        account = await addAccountByEmail(body.email, body.password, {
+          storeCredential: credStoreGateOpen(body.storeCredential, req),
+        });
       } else {
         return json(res, 400, { error: 'Provide api_key, token, or email+password' });
       }
@@ -702,9 +925,7 @@ async function route(req, res) {
 
   if (path === '/v1/chat/completions' && method === 'POST') {
     if (!hasUsableAccount()) {
-      return json(res, 503, {
-        error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
-      });
+      return rejectAccountAdmission(res, fallbackRequestId, 'chat_completions');
     }
 
     let body;
@@ -720,28 +941,34 @@ async function route(req, res) {
     }
 
     const reqStartedAt = Date.now();
-    const token = extractToken(req);
+    const token = extractToken(req, 'openai');
     const callerKey = callerKeyFromRequest(req, token, body);
     // Thread a client-disconnect AbortSignal into the handler context so a
     // caller that hangs up mid-flight tears down the in-flight upstream call
     // and — on the DEVIN_CONNECT path — stops the failover loop from hopping
     // fresh pooled accounts to a dead socket. Guard on !writableEnded so the
     // normal end-of-response 'close' is a no-op.
-    const abortController = bindClientAbort(res);
+    const lifecycle = body.stream === true
+      ? { clientDisconnected: null, gatewayAbortEmitted: false, connect: null }
+      : null;
+    const abortController = bindClientAbort(res, lifecycle);
     // One absolute deadline + upstream-turn budget per request, owned by the
     // route. Layers (queue admission, cascade poll, connect retries) receive
     // the remaining time and may only shorten their own bounds.
     const budget = createRequestBudget({ stream: body.stream === true });
+    const requestId = fallbackRequestId;
+    const onConnectDispatch = beginChatRequestLog(scope, requestId, body.model, VERSION_INFO, lifecycle);
     const result = await handleChatCompletions(body, {
       callerKey,
       nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
       signal: abortController.signal,
       budget,
+      traceId: requestId,
+      onConnectDispatch,
       clineCompat,
       ccCompat,
     });
     const processingMs = Date.now() - reqStartedAt;
-    const requestId = 'req_' + randomUUID();
     const ringRow = recordRequest({
       id: requestId,
       model: body.model,
@@ -754,7 +981,7 @@ async function route(req, res) {
     });
     const modelHeaders = {
       'x-request-id': requestId,
-      'openai-model': body.model || '',
+      'openai-model': headerSafeValue(body.model),
       // Actual upstream processing time — hvoy.ai and similar verifiers
       // treat a flat "0" as a fingerprint of a faking proxy.
       'openai-processing-ms': String(processingMs),
@@ -771,13 +998,18 @@ async function route(req, res) {
       // by the wrapper) and flushed with the first real frame.
       const commitMs = resolveStreamCommitMs();
       const streamHeaders = { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers };
+      const updateRing = streamRingDone(ringRow, reqStartedAt, res);
       await serveChatStream(res, result, {
         headers: streamHeaders,
         requestId,
         commitMs,
-        onDone: streamRingDone(ringRow, reqStartedAt, res),
+        onDone(stream) {
+          if (stream?.failure) scope.chatLog.failureCode = streamFailureClass(stream.failure);
+          updateRing(stream);
+        },
       });
     } else {
+      if (result.status >= 400) scope.chatLog.failureCode = streamFailureClass(result.body?.error);
       for (const [k, v] of Object.entries(modelHeaders)) res.setHeader(k, v);
       if (result.headers) {
         for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
@@ -793,9 +1025,7 @@ async function route(req, res) {
 
   if (path === '/v1/completions' && method === 'POST') {
     if (!hasUsableAccount()) {
-      return json(res, 503, {
-        error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
-      });
+      return rejectAccountAdmission(res, fallbackRequestId, 'completions');
     }
 
     let body;
@@ -808,7 +1038,7 @@ async function route(req, res) {
     }
 
     const reqStartedAt = Date.now();
-    const token = extractToken(req);
+    const token = extractToken(req, 'openai');
     const callerKey = callerKeyFromRequest(req, token, body);
     const abortController = bindClientAbort(res);
     const budget = createRequestBudget({ stream: false });
@@ -834,7 +1064,7 @@ async function route(req, res) {
     });
     const modelHeaders = {
       'x-request-id': requestId,
-      'openai-model': body.model || '',
+      'openai-model': headerSafeValue(body.model),
       'openai-processing-ms': String(processingMs),
       'openai-version': '2020-10-01',
       'openai-organization': 'org-windsurf-proxy',
@@ -857,9 +1087,7 @@ async function route(req, res) {
 
   if (path === '/v1/responses' && method === 'POST') {
     if (!hasUsableAccount()) {
-      return json(res, 503, {
-        error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
-      });
+      return rejectAccountAdmission(res, fallbackRequestId, 'responses');
     }
 
     let body;
@@ -872,10 +1100,28 @@ async function route(req, res) {
     }
 
     const reqStartedAt = Date.now();
-    const token = extractToken(req);
+    const token = extractToken(req, 'openai');
     const callerKey = callerKeyFromRequest(req, token, body);
     const abortController = bindClientAbort(res);
     const budget = createRequestBudget({ stream: body.stream === true });
+    const requestId = fallbackRequestId;
+    const onConnectDispatch = beginChatRequestLog(scope, requestId, body.model, VERSION_INFO, null, 'responses');
+    const responseLog = {
+      inputToolResults: Array.isArray(body.input)
+        ? body.input.filter(item => item?.type === 'function_call_output' || item?.type === 'custom_tool_call_output').length
+        : 0,
+      outputToolCalls: null,
+      outputText: null,
+      terminal: null,
+    };
+    scope.chatLog.responses = responseLog;
+    const onResponsesTerminal = (status, output) => {
+      if (!['completed', 'incomplete'].includes(status) || !Array.isArray(output)) return;
+      responseLog.terminal = status;
+      responseLog.outputToolCalls = output.filter(item => item?.type === 'function_call' || item?.type === 'custom_tool_call').length;
+      responseLog.outputText = output.some(item => item?.type === 'message' && Array.isArray(item.content)
+        && item.content.some(part => part?.type === 'output_text' && typeof part.text === 'string' && part.text.trim()));
+    };
     const result = await handleResponses(body, {
       context: {
         callerKey,
@@ -883,10 +1129,12 @@ async function route(req, res) {
         ccCompat,
         signal: abortController.signal,
         budget,
+        traceId: requestId,
+        onConnectDispatch,
+        onResponsesTerminal,
       },
     });
     const processingMs = Date.now() - reqStartedAt;
-    const requestId = 'req_' + randomUUID();
     const ringRow = recordRequest({
       id: requestId,
       model: body.model,
@@ -899,7 +1147,7 @@ async function route(req, res) {
     });
     const modelHeaders = {
       'x-request-id': requestId,
-      'openai-model': body.model || '',
+      'openai-model': headerSafeValue(body.model),
       'openai-processing-ms': String(processingMs),
       'openai-version': '2020-10-01',
       'openai-organization': 'org-windsurf-proxy',
@@ -907,6 +1155,7 @@ async function route(req, res) {
     if (result.stream) {
       const commitMs = resolveStreamCommitMs();
       const streamHeaders = { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers };
+      const updateRing = streamRingDone(ringRow, reqStartedAt, res);
       await serveChatStream(res, result, {
         headers: streamHeaders,
         requestId,
@@ -924,9 +1173,13 @@ async function route(req, res) {
             ...(error?.code ? { code: error.code } : {}),
           },
         }),
-        onDone: streamRingDone(ringRow, reqStartedAt, res),
+        onDone(stream) {
+          if (stream?.failure) scope.chatLog.failureCode = streamFailureClass(stream.failure);
+          updateRing(stream);
+        },
       });
     } else {
+      if (result.status >= 400) scope.chatLog.failureCode = streamFailureClass(result.body?.error);
       for (const [k, v] of Object.entries(modelHeaders)) res.setHeader(k, v);
       if (result.headers) {
         for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
@@ -935,6 +1188,7 @@ async function route(req, res) {
       // request_id injection as /v1/chat/completions.
       normalizeOpenAIErrorBody(result.body, result.status);
       json(res, result.status, withRequestId(result.status, result.body, requestId));
+      if (result.body?.object === 'response') onResponsesTerminal(result.body.status, result.body.output);
     }
     return;
   }
@@ -949,7 +1203,7 @@ async function route(req, res) {
   if ((method === 'GET' || method === 'DELETE') && path.startsWith('/v1/responses/')) {
     const responseId = path.slice('/v1/responses/'.length);
     if (/^[A-Za-z0-9_-]{1,128}$/.test(responseId)) {
-      const token = extractToken(req);
+      const token = extractToken(req, 'openai');
       // Identity for a BODYLESS request.
       //
       // The original comment here claimed the ip/ua fingerprint was "exactly what a
@@ -1062,7 +1316,7 @@ async function route(req, res) {
   if (path === '/v1/messages' && method === 'POST') {
     if (!hasUsableAccount()) {
       // D2: see count_tokens above — transient capacity → 529 overloaded_error.
-      return json(res, 529, { type: 'error', error: { type: 'overloaded_error', message: 'No active accounts available, please retry' } });
+      return rejectAccountAdmission(res, fallbackRequestId, 'messages');
     }
     let body;
     try { body = JSON.parse(await readBody(req)); } catch (err) {
@@ -1076,14 +1330,14 @@ async function route(req, res) {
     // validity (ephemeral type, ttl ∈ {5m,1h}, ≤4 breakpoints) at the entry.
     const invalid = validateMessagesRequest(body);
     if (invalid) return json(res, invalid.status, invalid.body);
-    const token = extractToken(req);
+    const token = extractToken(req, 'messages');
     const callerKey = callerKeyFromRequest(req, token, body);
     // G1: read the anthropic-version request header (warn+default when missing,
     // accept-as-is when unknown). Passed into context as a seam for future
     // version-gated behavior; the translation layer does not branch on it today.
     const anthropicVersion = resolveAnthropicVersion(req);
     const reqStartedAt = Date.now();
-    const requestId = 'req_' + randomUUID();
+    const requestId = fallbackRequestId;
     const abortController = bindClientAbort(res);
     const budget = createRequestBudget({ stream: body.stream === true });
     const result = await handleMessages(body, {
@@ -1093,6 +1347,7 @@ async function route(req, res) {
       ccCompat,
       signal: abortController.signal,
       budget,
+      traceId: requestId,
     });
     const processingMs = Date.now() - reqStartedAt;
     const ringRow = recordRequest({
@@ -1107,7 +1362,7 @@ async function route(req, res) {
     });
     const anthropicHeaders = {
       'request-id': requestId,
-      'anthropic-model': body.model || '',
+      'anthropic-model': headerSafeValue(body.model),
       // G1: echo the effective version back so clients can confirm it.
       'anthropic-version': anthropicVersion,
     };
@@ -1155,9 +1410,9 @@ async function route(req, res) {
   //   ?alt=sse switches to an SSE stream (preferred by newer SDKs).
   // The {model} segment can carry dots/dashes; the method is the suffix
   // after the final ':'. A v1 alias path is accepted too.
-  if (method === 'POST' && /\/models\/[^:/]+:(generateContent|streamGenerateContent)$/.test(path)) {
+  if (method === 'POST' && GEMINI_GENERATE_PATH_RE.test(path)) {
     if (!hasUsableAccount()) {
-      return json(res, 503, { error: { code: 503, message: 'No active accounts. POST /auth/login to add accounts.', status: 'UNAVAILABLE' } });
+      return rejectAccountAdmission(res, fallbackRequestId, 'gemini');
     }
     const parsed = parseGeminiPath(path);
     if (!parsed) {
@@ -1173,7 +1428,7 @@ async function route(req, res) {
     }
     const wantStream = parsed.method === 'streamGenerateContent';
     const alt = new URL(req.url, 'http://localhost').searchParams.get('alt');
-    const token = extractToken(req);
+    const token = extractToken(req, credentialSurfaceFor(path));
     const callerKey = callerKeyFromRequest(req, token, body);
     const reqStartedAt = Date.now();
     const geminiHeaders = { 'request-id': 'req_' + randomUUID() };
@@ -1258,12 +1513,15 @@ export function startServer() {
       // concurrent requests would race. The final response status is stamped on
       // the last attempt before the scope closes.
       await withStatsScope(async (scope) => {
+        scope.received = { wallMs: Date.now(), monotonicMs: performance.now() };
         try {
-          await route(req, res);
+          await route(req, res, scope);
         } finally {
           // A throw before headers is answered by the outer catch below; only a
           // response that actually went out carries a status worth recording.
           if (res.headersSent || res.writableEnded) scope.status = res.statusCode;
+          const lifecycle = scope.chatLog?.lifecycle;
+          if (lifecycle?.clientDisconnected === null && res.writableEnded) lifecycle.clientDisconnected = false;
           finalizeStatsScope(scope);
           exportRequestToLangfuse(scope, { method: req.method, path: String(req.url || '').split('?')[0] });
         }

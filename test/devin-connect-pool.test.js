@@ -1,6 +1,9 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { addAccountByKey, getApiKey, getRpmStats, removeAccount, getAccountList, __setReloginDeps, __resetReloginState } from '../src/auth.js';
+import {
+  addAccountByKey, getApiKey, getRpmStats, removeAccount, getAccountList,
+  __setReloginDeps, __resetReloginState, setAccountCredentialEmail,
+} from '../src/auth.js';
 import { finalizeConnectAccount } from '../src/handlers/chat.js';
 import { setBreakerTunables } from '../src/runtime-config.js';
 import { getStats } from '../src/dashboard/stats.js';
@@ -99,7 +102,7 @@ describe('finalizeConnectAccount', () => {
     }
   });
 
-  it('F2: a 429 WITH a reset window cools account-wide for the real window, ignoring rlBurstMs', () => {
+  it('F2: a 429 WITH a reset window cools the throttled selector for the real window, ignoring rlBurstMs', () => {
     setBreakerTunables({ rlBurstMs: 15000 });
     try {
       const acct = seed('rl-window');
@@ -108,13 +111,13 @@ describe('finalizeConnectAccount', () => {
         { id: acct.id, apiKey: acct.apiKey },
         { model: 'swe-1-6-slow', startTime: t0, err: Object.assign(new Error('resets in 3h'), { code: 'RATE_LIMITED', resetMs: 3 * 60 * 60 * 1000 }) },
       );
-      // The DEVIN_CONNECT pool selects with modelKey=null (acquireConnectAccount →
-      // getApiKey(triedKeys, null, ...)), and isRateLimitedForModel only consults
-      // _modelRateLimits when modelKey is truthy — so the reset window MUST land on
-      // the account-wide rateLimitedUntil to be visible to selection, not on a
-      // model-scoped cooldown the pool never reads for this path.
-      assert.ok(acct.rateLimitedUntil > t0 + 2 * 60 * 60 * 1000, 'account-wide cooldown honours the 3h window');
-      assert.ok(!(acct._modelRateLimits?.['swe-1-6-slow'] > t0), 'no dead model-scoped cooldown for a path selected with modelKey=null');
+      // T10: the reset window is scoped to the throttled model/selector, not the
+      // whole account. Connect selection consults the selector dimension through
+      // isCooledForRequest (it no longer relies on rateLimitedUntil alone), so a
+      // model-scoped window IS visible to the pool while every other model stays
+      // eligible on the same account.
+      assert.ok(acct._modelRateLimits?.['swe-1-6-slow'] > t0 + 2 * 60 * 60 * 1000, 'selector cooldown honours the 3h window');
+      assert.ok(!(acct.rateLimitedUntil > t0), 'the account-wide dimension must stay clear');
     } finally {
       setBreakerTunables({ rlBurstMs: null });
     }
@@ -122,15 +125,19 @@ describe('finalizeConnectAccount', () => {
 
   it('fires a background re-login on UNAUTHORIZED when auto-relogin is configured', async () => {
     const acct = seed('relogin-trigger');
-    acct.email = `relogin-${acct.id}@example.com`;
+    const loginEmail = `relogin-${acct.id}@example.test`;
+    setAccountCredentialEmail(acct.id, loginEmail);
     acct.method = 'email';
     process.env.DEVIN_CONNECT_AUTO_RELOGIN = '1';
     __resetReloginState();
     let loginCalls = 0;
     __setReloginDeps({
       isCredStoreEnabled: () => true,
-      getCredential: () => 'pw',
-      windsurfLogin: async () => { loginCalls++; return { apiKey: 'devin-session-token$RECOVERED' }; },
+      getCredential: email => email === loginEmail ? 'pw' : null,
+      windsurfLogin: async () => {
+        loginCalls++;
+        return { apiKey: 'devin-session-token$RECOVERED', identityEmail: loginEmail };
+      },
     });
     finalizeConnectAccount(
       { id: acct.id, apiKey: acct.apiKey },
@@ -147,14 +154,18 @@ describe('finalizeConnectAccount', () => {
 
   it('does not re-login on UNAUTHORIZED when auto-relogin is off', async () => {
     const acct = seed('relogin-off');
-    acct.email = `off-${acct.id}@example.com`;
+    const loginEmail = `off-${acct.id}@example.test`;
+    setAccountCredentialEmail(acct.id, loginEmail);
     delete process.env.DEVIN_CONNECT_AUTO_RELOGIN;
     __resetReloginState();
     let loginCalls = 0;
     __setReloginDeps({
       isCredStoreEnabled: () => true,
-      getCredential: () => 'pw',
-      windsurfLogin: async () => { loginCalls++; return { apiKey: 'x' }; },
+      getCredential: email => email === loginEmail ? 'pw' : null,
+      windsurfLogin: async () => {
+        loginCalls++;
+        return { apiKey: 'devin-session-token$OFFFIXTURE', identityEmail: loginEmail };
+      },
     });
     finalizeConnectAccount(
       { id: acct.id, apiKey: acct.apiKey },

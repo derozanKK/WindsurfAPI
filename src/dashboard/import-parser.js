@@ -1,3 +1,5 @@
+import { isIPv6 } from 'node:net';
+import { domainToASCII } from 'node:url';
 import { unwrapPastedSecret } from './account-text-parser.js';
 
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
@@ -49,29 +51,56 @@ function getFirstString(obj, keys) {
   return '';
 }
 
-function normalizeProxy(rawProxy, parseProxyUrl) {
-  if (!rawProxy) return { proxyRaw: null, proxy: null };
-  if (typeof rawProxy === 'object' && !Array.isArray(rawProxy)) {
-    const host = toTrimmedString(rawProxy.host);
-    const port = Number.parseInt(rawProxy.port, 10);
-    if (!host || !Number.isInteger(port) || port <= 0) {
-      return { error: 'ERR_PROXY_FORMAT_INVALID' };
-    }
-    return {
-      proxyRaw: `${toTrimmedString(rawProxy.type || 'http')}://${host}:${port}`,
-      proxy: {
-        type: toTrimmedString(rawProxy.type || 'http'),
-        host,
-        port,
-        username: toTrimmedString(rawProxy.username),
-        password: toTrimmedString(rawProxy.password),
-      },
-    };
+const PROXY_TYPES = new Set(['http', 'https', 'socks', 'socks5', 'socks5h']);
+const DNS_LABEL = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/i;
+const NON_HOST_ASCII = /[^A-Za-z0-9._\u0080-\u{10FFFF}-]/u;
+// IDNA checks the two contextual joiners. Other invisible formatting and
+// controls do not belong in the public display label.
+const UNSAFE_DISPLAY = /[\s\p{Cc}\p{Cs}]|(?![\u200C\u200D])\p{Cf}/u;
+
+// Only bare hostnames and IP literals belong in a public proxy label.
+// DNS resolution and the private-address policy still run before use.
+export function redactedProxyLabel(proxy) {
+  if (!proxy || typeof proxy.host !== 'string') return null;
+  const { host, port } = proxy;
+  const type = typeof proxy.type === 'string' ? proxy.type.toLowerCase() : '';
+  if (!PROXY_TYPES.has(type) || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const address = host.replace(/^\[([^\]]+)\]$/, '$1');
+  if (isIPv6(address)) {
+    // A link-local scope belongs to the connection, not to its public label.
+    const [ip] = address.split('%');
+    return `${type}://[${ip}]:${port}`;
   }
-  const proxyRaw = toTrimmedString(rawProxy);
+  if (UNSAFE_DISPLAY.test(host) || NON_HOST_ASCII.test(host) || NON_HOST_ASCII.test(host.normalize('NFKC'))) return null;
+  const ascii = domainToASCII(host);
+  const name = ascii.replace(/\.$/, '');
+  if (name.length > 253 || !name.split('.').every(label => DNS_LABEL.test(label))) return null;
+  // Node's host parser must consume the entire input. An appended label must
+  // survive and change the result, even if the input already ends in .invalid.
+  const suffixed = domainToASCII(`${host}.invalid`);
+  if (suffixed === ascii || !suffixed.endsWith('.invalid')) return null;
+  return `${type}://${host}:${port}`;
+}
+
+function normalizeProxy(rawProxy, parseProxyUrl) {
+  if (rawProxy == null) return { proxyRaw: null, proxy: null };
+  if (typeof rawProxy === 'object' && !Array.isArray(rawProxy)) {
+    const port = toTrimmedString(rawProxy.port);
+    const proxy = {
+      type: toTrimmedString(rawProxy.type || 'http').toLowerCase(),
+      host: typeof rawProxy.host === 'string' ? rawProxy.host.trim() : '',
+      port: /^\d+$/.test(port) ? Number(port) : NaN,
+      username: toTrimmedString(rawProxy.username),
+      password: toTrimmedString(rawProxy.password),
+    };
+    const proxyRaw = redactedProxyLabel(proxy);
+    return proxyRaw ? { proxyRaw, proxy } : { error: 'ERR_PROXY_FORMAT_INVALID' };
+  }
+  if (typeof rawProxy !== 'string') return { error: 'ERR_PROXY_FORMAT_INVALID' };
+  const proxyRaw = rawProxy.trim();
   if (!proxyRaw) return { proxyRaw: null, proxy: null };
   const proxy = parseProxyUrl(proxyRaw);
-  if (!proxy) return { error: 'ERR_PROXY_FORMAT_INVALID' };
+  if (!redactedProxyLabel(proxy)) return { error: 'ERR_PROXY_FORMAT_INVALID' };
   return { proxyRaw, proxy };
 }
 
@@ -191,7 +220,7 @@ export function parseBatchImportJsonItem(item, lineNumber, parseProxyUrl) {
   const label = getFirstString(item, ['label', 'name', 'note']) || email;
   const normalizedProxy = normalizeProxy(readCaseInsensitive(item, 'proxy'), parseProxyUrl);
   if (normalizedProxy.error) {
-    return buildIssue({ lineNumber, raw: JSON.stringify(item), code: normalizedProxy.error, label });
+    return buildIssue({ lineNumber, code: normalizedProxy.error });
   }
 
   if (token) {

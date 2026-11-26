@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runDevinAcpProcess } from '../src/devin-acp.js';
 
@@ -133,6 +133,32 @@ rl.on('line', line => {
 });
 
 describe('Devin ACP runner — process + protocol failure paths', () => {
+  for (const [scenario, result] of [
+    ['a different major', { protocolVersion: 2 }],
+    ['an omitted version', {}],
+    ['a non-integer version', { protocolVersion: '1' }],
+  ]) {
+    it(`stops after initialize when a peer selects ${scenario}`, async () => {
+      const script = installFakeAcp(`${HANDSHAKE}
+import { appendFileSync } from 'node:fs';
+rl.on('line', line => {
+  const { id, method } = JSON.parse(line);
+  appendFileSync(new URL('methods.log', import.meta.url), method + '\\n');
+  if (method === 'initialize') {
+    send({ jsonrpc: '2.0', id, result: ${JSON.stringify(result)} });
+  } else {
+    send({ jsonrpc: '2.0', id, error: { code: -32601, message: 'unexpected method' } });
+  }
+});
+`);
+      await assert.rejects(
+        () => runDevinAcpProcess('hi', { modelKey: 'swe-1.6', apiKey: 'fixture' }),
+        { status: 502, type: 'backend_protocol_error', code: 'ACP_PROTOCOL_VERSION', retryable: false },
+      );
+      assert.equal(readFileSync(join(dirname(script), 'methods.log'), 'utf8'), 'initialize\n');
+    });
+  }
+
   it('maps a non-zero CLI exit to 502 backend_error', async () => {
     installFakeAcp(`
 process.exit(3);
@@ -185,7 +211,7 @@ setTimeout(() => {}, 2000);
 
   it('times out a stalled prompt with 504 backend_timeout', async () => {
     // Handshake completes, but session/prompt never resolves. DEVIN_TIMEOUT_MS
-    // drives the per-request timer (runTimeoutMs() has a 1000ms floor, so this
+    // sets the turn deadline (runTimeoutMs() has a 1000ms floor, so this
     // must stay >= 1000 or it silently falls back to the 10-minute default).
     installFakeAcp(`${HANDSHAKE}
 rl.on('line', line => {
@@ -230,36 +256,73 @@ rl.on('line', line => {
 });
 
 describe('Devin ACP runner — request_permission auto-decline + content shapes', () => {
-  it('auto-declines session/request_permission so the agent never blocks on local tools', async () => {
-    // The runner must reply {outcome:'cancelled'} to permission prompts (it
-    // exposes no local fs/terminal). If it failed to, the fake would hang and
-    // the test would time out instead of returning REPLY.
-    installFakeAcp(`${HANDSHAKE}
-let asked = false;
+  const allow = { optionId: 'allow', name: 'Allow', kind: 'allow_once' };
+  const rejectOnce = { optionId: 'decline', name: 'Decline', kind: 'reject_once' };
+  const rejectAlways = { optionId: 'deny', name: 'Deny', kind: 'reject_always' };
+  const requests = [
+    { id: 0, options: [allow, rejectAlways, rejectOnce] },
+    { id: 'always', options: [allow, rejectAlways] },
+    { id: 'allow-only', options: [allow] },
+    { id: 'missing-options' },
+    { id: 'invalid-id', options: [{ ...rejectOnce, optionId: '' }] },
+    { id: 'ambiguous-id', options: [allow, { ...rejectOnce, optionId: allow.optionId }] },
+  ];
+
+  for (const streamed of [false, true]) {
+    it(`auto-declines permission with an advertised reject option or RPC error (${streamed ? 'streamed' : 'buffered'})`, async () => {
+      // The stub echoes the exact permission frames it receives as text after
+      // every request is answered. It never executes a tool.
+      installFakeAcp(`${HANDSHAKE}
+const requests = ${JSON.stringify(requests)};
+const answers = [];
+let promptId;
+function ask() {
+  const { id, options } = requests[answers.length];
+  send({
+    jsonrpc: '2.0', id, method: 'session/request_permission',
+    params: { sessionId: 'session-1', toolCall: { toolCallId: 'stub' }, options },
+  });
+}
 rl.on('line', line => {
   const msg = JSON.parse(line);
   if (msg.method === 'initialize') { send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, authMethods: [{ id: 'windsurf-api-key' }] } }); return; }
   if (msg.method === 'authenticate') { send({ jsonrpc: '2.0', id: msg.id, result: {} }); return; }
   if (msg.method === 'session/new') { send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'session-1' } }); return; }
   if (msg.method === 'session/prompt') {
-    // Ask for permission first; only continue once the client answers.
-    send({ jsonrpc: '2.0', id: 9001, method: 'session/request_permission', params: { sessionId: 'session-1', toolCall: { name: 'write_file' } } });
+    promptId = msg.id;
+    ask();
     return;
   }
-  // The client's permission answer (id 9001) comes back as a result line.
-  if (msg.id === 9001 && msg.result) {
-    asked = true;
-    if (msg.result.outcome !== 'cancelled') { send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_message_chunk', content: { text: 'WRONG_OUTCOME' } } } }); }
-    else { update({ sessionUpdate: 'agent_message_chunk', content: { text: 'REPLY' } }); }
-    // resolve the original prompt (id captured implicitly as 4 in the runner's sequence)
-    send({ jsonrpc: '2.0', id: 4, result: { stopReason: 'end_turn' } });
+  if (msg.id !== requests[answers.length]?.id) return;
+  answers.push(msg);
+  if (answers.length < requests.length) {
+    ask();
     return;
   }
+  update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify(answers) } });
+  send({ jsonrpc: '2.0', id: promptId, result: { stopReason: 'end_turn' } });
 });
 `);
-    const result = await runDevinAcpProcess('do a thing', { modelKey: 'swe-1.6', apiKey: 'k' });
-    assert.equal(result.text, 'REPLY');
-  });
+      const chunks = [];
+      const result = await runDevinAcpProcess('hi', {
+        modelKey: 'swe-1.6', apiKey: 'k',
+        ...(streamed && { onChunk: chunk => chunks.push(chunk) }),
+      });
+      const replies = JSON.parse(result.text);
+      assert.deepEqual(replies.slice(0, 2), [
+        { jsonrpc: '2.0', id: 0, result: { outcome: { outcome: 'selected', optionId: rejectOnce.optionId } } },
+        { jsonrpc: '2.0', id: 'always', result: { outcome: { outcome: 'selected', optionId: rejectAlways.optionId } } },
+      ]);
+      for (const { id } of requests.slice(2)) {
+        const reply = replies.find(frame => frame.id === id);
+        assert.deepEqual(Object.keys(reply).sort(), ['error', 'id', 'jsonrpc']);
+        assert.equal(reply.jsonrpc, '2.0');
+        assert.equal(reply.error.code, -32602);
+        assert.ok(reply.error.message);
+      }
+      if (streamed) assert.deepEqual(chunks, [{ kind: 'message', text: result.text }]);
+    });
+  }
 
   it('joins array-of-parts content blocks into the reply text', async () => {
     installFakeAcp(`${HANDSHAKE}

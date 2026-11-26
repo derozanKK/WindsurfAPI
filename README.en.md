@@ -6,8 +6,10 @@
 
 > Turn Windsurf / Devin's 100+ AI models (Claude, GPT, Gemini, DeepSeek, Kimi, GLM, SWE…) into OpenAI / Anthropic / Gemini standard APIs. Zero npm runtime dependencies.
 
-> **History Ledger** · Every commit laid out: 1387 commits, 196 releases, 82 PRs, 180 issues (the ledger's own frozen scope — **its numbers stop at v3.9.34 / 2026-09-15**) — timeline, contributor analysis, Git tree (vertical / horizontal / ring), and a full account of every mistake along the way. [**Open the interactive ledger**](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html) (zero-dependency, pure vanilla).
+> **Project history & evidence** · Browse PRs, issues, commits, releases and tags, with development milestones, contributor roles and source coverage. Expand the original visualization for the snapshot through 2026-09-15. [Open the project history](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html#history)
 
+
+[Roadmap](docs/ROADMAP.md) · [v3.2.11 release notes and signed upgrade](docs/releases/RELEASE_NOTES_3.2.11.md)
 
 <p align="center">
   <a href="https://github.com/dwgx/WindsurfAPI/stargazers"><img src="https://img.shields.io/github/stars/dwgx/WindsurfAPI?style=for-the-badge&logo=github&color=f5c518" alt="Stars"></a>&nbsp;
@@ -163,6 +165,8 @@ cd WindsurfAPI
 bash setup.sh          # Create directories · Set permissions · Generate .env
 node src/index.js
 ```
+
+> Note: this project is not published to npm. `npm i windsurf-api` installs an **unrelated third-party package** — always install via the git/Docker path above.
 
 Dashboard: `http://YOUR_IP:3003/dashboard`
 
@@ -386,7 +390,7 @@ In your client's settings for **Custom OpenAI Compatible**:
 | `CODEIUM_EMAIL` | empty | Email for Windsurf account authentication. |
 | `CODEIUM_PASSWORD` | empty | Password for Windsurf account authentication. |
 | `CODEIUM_API_URL` | `https://server.self-serve.windsurf.com` | Windsurf cloud API endpoint. |
-| `DEFAULT_MODEL` | `claude-sonnet-4.6` | The model to use if `model` is not specified. Must be a name the active backend can resolve. Unmapped Connect names return 400 `model_not_found` unless `WINDSURFAPI_STRICT_MODEL=0`, which degrades to a free selector the live catalog **actually exposes** — and still returns 400 when there is none, instead of falling back to `swe-1-6-slow`, which the catalog no longer carries. |
+| `DEFAULT_MODEL` | `claude-sonnet-4.6` | The model to use if `model` is not specified. Must be a name the active backend can resolve. Unmapped Connect names return 400 `model_not_found`; there is no silent degrade to a free selector. |
 | `MAX_TOKENS` | `8192` | Default maximum number of response tokens. |
 | `LOG_LEVEL` | `info` | Console level: debug / info / warn / error. JSONL files and Dashboard still receive all levels. |
 | `LOG_RETENTION_DAYS` | `0` (off) | Application JSONL retention in UTC calendar days including today; e.g. `14`. Cleanup at startup and hourly. Restart after changes. |
@@ -408,7 +412,7 @@ In your client's settings for **Custom OpenAI Compatible**:
 | `WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF` | empty | Set to `1` to force native bridge off. |
 | `WINDSURFAPI_SPECIAL_AGENT_BACKEND` | empty | Optional lab-only special-agent backend. Set `devin-cli` to test `swe-1.6`, `swe-1.6-fast`, `adaptive`, and `arena-*` through Devin CLI instead of direct Cascade. This is not a normal catalog-model fix. |
 | `DEVIN_CLI_PATH` | `devin` | Devin CLI executable path. Docker/macOS deployments must install or mount it themselves. |
-| `DEVIN_CLI_MODE` | `print` | `print` uses conservative `devin -p`; `acp` is an experimental ACP stdio backend using upstream Windsurf account-pool apiKeys. |
+| `DEVIN_CLI_MODE` | `print` | `print` uses `devin -p`. `acp` selects the experimental ACP stdio backend using upstream Windsurf account-pool API keys. To check model selection, filter the operator API logs for `Devin ACP model selection` and the internal `Chat[<id>]` request ID. The record distinguishes the launch argument, the session setting submitted, and the value the peer acknowledged. `backend_confirmed_model: null` means the serving model is unknown. |
 | `DEVIN_MAX_PROCS` | `1` | Maximum concurrent Devin CLI processes. |
 | `DASHBOARD_PASSWORD` | empty | Dashboard password. Empty is fail-closed even on localhost. Local open panel requires `DASHBOARD_ALLOW_NO_AUTH=1`. |
 | `ALLOW_PRIVATE_PROXY_HOSTS` | empty | Set to `1` to allow private/internal IPs (e.g., `192.168.x.x`, `10.x.x.x`) in proxy tests and login. Leave empty to only allow public addresses (default). |
@@ -658,6 +662,8 @@ A: No. Long thinking / long output is cut at roughly 236-243 seconds — that's 
 
 Huge thanks to the following folks who sent pull requests or systematically audited the code:
 
+**Security acknowledgments**: thanks to [fishfish](https://github.com/fishfish57) for two responsible **CWE-1333** (event-loop blocking) disclosures — the quadratic scans in the client-identity neutralizer (reported 2026-11-08) and the unbounded JSON Schema `pattern` evaluation in `src/json-schema.js` (reported 2026-11-10). Tracked as [GHSA-fx5f-49jr-fw6r](https://github.com/dwgx/WindsurfAPI/security/advisories/GHSA-fx5f-49jr-fw6r) (identity neutralizer) and [GHSA-r7v2-3h32-f5g6](https://github.com/dwgx/WindsurfAPI/security/advisories/GHSA-r7v2-3h32-f5g6) (JSON Schema `pattern`), both CVSS 6.5 and published; both fixed in **3.141.592661** (`patched_versions: >= 3.141.592661`). Disclosure policy: [SECURITY.md](SECURITY.md).
+
 - [@dd373156](https://github.com/dd373156) — [PR #1](https://github.com/dwgx/WindsurfAPI/pull/1)
   Fixed the Pro tier model-merge logic: the hardcoded table wasn't picking up dynamically-fetched cloud models, so Pro accounts couldn't see newly-released models in Cursor / Cherry Studio.
 - [@colin1112a](https://github.com/colin1112a) — [PR #13](https://github.com/dwgx/WindsurfAPI/pull/13)
@@ -703,7 +709,7 @@ MIT License. See [LICENSE](LICENSE).
 
 ## Release and Secret Boundary
 
-Release automation may publish Docker images and GitHub Releases. The current release is **v3.141.592658**; the repository carries 228 git tags and 218 release-note files (2026-10-30). Every release from v3.10.0 attaches a `SHA256SUMS` manifest covering the four published assets (Windows exe/zip, macOS arm64 binary/zip) and signs the four assets and the manifest with **cosign keyless** signing (GitHub OIDC; no private key or signing secret in the repository). From v3.141.592657 the Docker image digest (`image-digest.txt`) and the source-OTA provenance statement (`release-attestation.json`) are also each signed with a `.sigstore.json` bundle. Each signed blob ships a single `.sigstore.json` bundle (signature, Fulcio certificate and Rekor inclusion proof in one file). The signature proves the bytes were produced by this repository's release workflow for a `v*` tag; it does not prove human review or a reproducible build, and anyone who can rewrite the repository/tag can re-sign. Verify before running a download: `node scripts/verify-release-assets.mjs <download-dir>` (requires cosign), or follow [docs/RELEASE-SIGNING.md](docs/RELEASE-SIGNING.md) to verify `SHA256SUMS.sigstore.json` with `cosign verify-blob` and then run `sha256sum -c SHA256SUMS` (`shasum -a 256 -c` on macOS; `Get-FileHash` on Windows). The manifest uses the flat asset names, so all files can sit in one directory; v3.9.53 recorded `dist-windows/` / `dist-macos/` paths, and releases before v3.10.0 are unsigned. The Docker image is signed by digest and its digest is published as `image-digest.txt`; the dashboard's Docker update resolves the tag through the daemon and refuses to pull or deploy unless it equals that signed digest. The git self-update path does not download binaries, but it verifies the release's `release-attestation.json` (tag→commit/tree and every asset's SHA-256, cosign-signed); `WINDSURFAPI_UPDATE_ATTESTATION=warn` is the default (missing material logs a warning), and `required` refuses. See docs/RELEASE-SIGNING.md for the trust boundary and the OTA checks. Keep tokens, API keys, cookies, and provider credentials out of issues, pull requests, logs, and committed config. If a report needs authentication details, share only redacted metadata and reproduction steps.
+Release automation may publish Docker images and GitHub Releases. This release is **v3.2.11**, with 223 release-note files. CHANGELOG's **231** is a "published namespace" count — `git tag | wc -l` minus the unpublished tags this checkout actually carries (`docs/releases/UNPUBLISHED-TAGS.txt`) minus this release's own tag — so it is **not** the remote tag total. Take that from `git ls-remote --tags origin` (annotated tags also list a `^{}` line, so do not count lines blindly). `v3.141.592660` is a public tag whose Release/CI failed on the 230-vs-229 tag count and produced zero assets; `v3.141.592659` was never published — its local tag freezes on the unfixed `d5519da3`. Every release from v3.10.0 attaches a `SHA256SUMS` manifest covering the four published assets (Windows exe/zip, macOS arm64 binary/zip) and signs the four assets and the manifest with **cosign keyless** signing (GitHub OIDC; no private key or signing secret in the repository). From v3.141.592657 the Docker image digest (`image-digest.txt`) and the source-OTA provenance statement (`release-attestation.json`) are also each signed with a `.sigstore.json` bundle. Each signed blob ships a single `.sigstore.json` bundle (signature, Fulcio certificate and Rekor inclusion proof in one file). The signature proves the bytes were produced by this repository's release workflow for a `v*` tag; it does not prove human review or a reproducible build, and anyone who can rewrite the repository/tag can re-sign. Verify before running a download: `node scripts/verify-release-assets.mjs <download-dir>` (requires cosign), or follow [docs/RELEASE-SIGNING.md](docs/RELEASE-SIGNING.md) to verify `SHA256SUMS.sigstore.json` with `cosign verify-blob` and then run `sha256sum -c SHA256SUMS` (`shasum -a 256 -c` on macOS; `Get-FileHash` on Windows). The manifest uses the flat asset names, so all files can sit in one directory; v3.9.53 recorded `dist-windows/` / `dist-macos/` paths, and releases before v3.10.0 are unsigned. The Docker image is signed by digest and its digest is published as `image-digest.txt`; the dashboard's Docker update resolves the tag through the daemon and refuses to pull or deploy unless it equals that signed digest. The git self-update path does not download binaries, but it verifies the release's `release-attestation.json` (tag→commit/tree and every asset's SHA-256, cosign-signed); `WINDSURFAPI_UPDATE_ATTESTATION=warn` is the default (missing material logs a warning), and `required` refuses. See docs/RELEASE-SIGNING.md for the trust boundary and the OTA checks. Keep tokens, API keys, cookies, and provider credentials out of issues, pull requests, logs, and committed config. If a report needs authentication details, share only redacted metadata and reproduction steps.
 
 ---
 

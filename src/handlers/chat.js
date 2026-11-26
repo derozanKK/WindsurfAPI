@@ -1,3 +1,4 @@
+import { boundResetMs, MAX_RATE_RESET_MS, parseGoResetMs, quotaResetDelay } from '../reset-hints.js';
 /**
  * POST /v1/chat/completions — OpenAI-compatible chat completions.
  * Routes to RawGetChatMessage (legacy) or Cascade (premium) based on model type.
@@ -5,7 +6,7 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError, acquireLsUseOrThrow, detachedClaimLostError, classifyCascadeEnd } from '../client.js';
-import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountInternal, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, markSelectorIneligible, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, isAllConnectAccountsUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, getDroughtSummary, getConnectFreeFallbackSelectors, reLoginAccount as _reLoginAccount, getAccountCount, hasConnectEntitledAccount, recordAccountSpend, recordAccountAttempt, ensureDeviceSeed, requestReauthCheck, getConnectSelectorImageCapabilityForAccount } from '../auth.js';
+import { getApiKey, acquireAccountByKey, releaseAccountById, currentApiKeyForId, getAccountInternal, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, markSelectorIneligible, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, isAllConnectAccountsUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, isConnectSelectorBlockedByDrought, isConnectFreeOnlyDroughtAdmission, getDroughtSummary, getConnectFreeFallbackSelectors, reLoginAccount as _reLoginAccount, getAccountCount, hasConnectEntitledAccount, isConnectSelectorUnavailableForAll, recordAccountSpend, recordAccountAttempt, ensureDeviceSeed, requestReauthCheck, getConnectSelectorImageCapabilityForAccount } from '../auth.js';
 
 import { isStickyEnabled, setStickyBinding, peekStickyBinding } from '../account/sticky-session.js';
 import { resolveModel, getModelInfo, pickRateLimitFallback, isModelDisabledUpstream, getModelCaps } from '../models.js';
@@ -15,14 +16,24 @@ import { config, log } from '../config.js';
 import { leakTraceEnabled, thinkMarkersIn, leakSample } from '../leak-trace.js';
 import { safeAccountRef, safeKeyRef, safeLogValue } from '../log-safety.js';
 import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited } from '../dashboard/stats.js';
+import { markReportedUsage } from '../reported-usage.js';
 import { extractIntentFromNarrative, detectToolIntentInNarrative, maskNonActionableRegions } from './intent-extractor.js';
 import { isModelAllowed } from '../dashboard/model-access.js';
 import { cacheKey as computeCacheKey, cacheGet, cacheSet, isCacheEnabled } from '../cache.js';
+import { cacheGeneration, resolveReasoningEffort } from '../cache.js';
 import { isExperimentalEnabled, getBreakerTunable, strictUsageTotal } from '../runtime-config.js';
 import { budgetExceededError, isBudgetExceededError } from '../request-budget.js';
 import { checkOutboundHistory, historyBudgetErrorMessage, HISTORY_BUDGET_ERROR_CODE } from '../history-budget.js';
 import { neutralizeClientIdentity, neutralizeMessageContent } from './identity-neutralize.js';
 import { chatServerSideToolUnsupported, firstUnsupportedServerToolType, forEachTool } from '../server-side-tools.js';
+// Tool-name charset hygiene on the OpenAI Chat surface (Q1 audit G1). The
+// Anthropic (messages.js) and Responses (responses.js) surfaces have built this
+// map since tool hygiene shipped; this surface never imported it, so an invalid
+// client tool name (`mcp::x`, `a.b`, `tool with space`) reached the Connect wire
+// and the upstream answered with a misleading `invalid_argument` ("an internal
+// error occurred") mid-stream. Same helper, same map shape, same reverse leg.
+import { buildToolNameMap, restoreToolName } from '../tool-names.js';
+import { toolHygieneEnabled } from '../tool-ids.js';
 import { normalizeStop, applyStop, StopSequenceGate } from '../stop-sequences.js';
 import { normalizeToolCallArgs, recordArgRepair } from './cline-compat.js';
 
@@ -62,11 +73,11 @@ import { acpVisionEnabled } from '../devin-acp.js';
 import { selectBackend, usesCascadeFlow } from '../backend-router.js';
 import { toChatCompletion as _toChatCompletion, streamChatCompletion as _streamChatCompletion } from '../devin-connect-openai.js';
 import { resolveConnectSelector, DROUGHT_SAFE_SELECTORS, getConnectSelectorImageCapability } from '../devin-connect-models.js';
-import { getToolDefTags, parseToolCallTagMap, isParallelToolCallsHintIgnored, stripImageParts, findFilePartInMessages, unsupportedFilePartError } from '../devin-connect.js';
+import { getToolDefTags, parseToolCallTagMap, isParallelToolCallsHintIgnored, isToolChoicePassthroughEnabled, getImageFieldTag, stripImageParts, findFilePartInMessages, unsupportedFilePartError, messageText as connectMessageText } from '../devin-connect.js';
 import { recordRateLimitBurstEvent, RATE_LIMIT_BURST_WINDOW_MS } from '../rate-limit-burst.js';
 import { isRouterModel, assignModel as _assignModel } from '../devin-connect-catalog.js';
 import { bumpConnect } from '../devin-connect-metrics.js';
-import { resolveSessionId as resolveConnectSessionId, commitAfterResponse as commitConnectSession, getSessionModelConfig as getSessionConnectModelConfig, getSessionReasoningTrail as getSessionConnectReasoningTrail } from '../session-continuity.js';
+import { canonicalize as canonicalizeConnectHistory, resolveSessionBinding as resolveConnectSessionBinding, commitSessionBinding as commitConnectSession, isSessionReuseEnabled } from '../session-continuity.js';
 import { newTraceId, traceClientRequest, traceRouting, traceClientResponse, traceEnabled } from '../trace.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import {
@@ -97,8 +108,12 @@ const HEARTBEAT_MS = 15_000;
 // ../stream-writer.js — one implementation for every SSE exit. A slow reader
 // gets a bounded wait, not an unbounded one: a half-open client (stops reading,
 // keeps TCP open) never emits 'drain', so without a ceiling the poll loop and
-// the account checkout would be pinned for the life of the connection. Two
-// minutes is eight heartbeat periods. Override with WINDSURFAPI_MAX_DRAIN_MS.
+// the account checkout would be pinned for the life of the connection. The
+// bound is proportional — a fixed 30s plus the time the bytes written so far
+// need at a minimum client rate — so a stalled 4KB frame aborts early while a
+// slow reader of a multi-megabyte frame keeps its full budget. Override the
+// fixed part with WINDSURFAPI_MAX_DRAIN_MS, the rate with
+// WINDSURFAPI_MIN_CLIENT_RATE_BPS.
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 const IP_RATE_LIMIT_BURST_FLOOR_MS = 30_000;
@@ -256,6 +271,21 @@ function queueTimeoutRetryAfterMs(temporaryUnavailable, rateLimited) {
   if (temporaryUnavailable.allUnavailable && temporaryUnavailable.retryAfterMs > 0) return temporaryUnavailable.retryAfterMs;
   if (rateLimited.allLimited && rateLimited.retryAfterMs > 0) return rateLimited.retryAfterMs;
   return QUEUE_RETRY_MS;
+}
+
+// Shared 429 for a pool that EXISTS but cannot lease this request. The preflight
+// (before the queue wait) and the post-wait lease check are the same verdict, so
+// they must produce the same documented surface: 429 rate_limit_exceeded with the
+// Retry-After header and the body's retry_after_ms derived from ONE clamped
+// second count (F3) — a client scheduling from either reads the same number.
+function connectPoolUnavailableFailure(message, retryAfterMs) {
+  const retryAfterSec = clientRetryAfterSeconds(retryAfterMs);
+  bumpConnect('pool_exhausted');
+  return {
+    status: 429,
+    headers: { 'Retry-After': String(retryAfterSec) },
+    body: { error: { message, type: 'rate_limit_exceeded', retry_after_ms: retryAfterSec * 1000 } },
+  };
 }
 
 // Clamp every admission/attempt wait to the route's remaining budget. A layer
@@ -494,6 +524,65 @@ function toolNameList(tools) {
   return tools.map(t => t?.function?.name || t?.name || '').filter(Boolean);
 }
 
+// Tool names a conversation's HISTORY already carries. The Anthropic surface
+// collects these before building its name map (messages.js historyToolNames)
+// because a replayed assistant `tool_use` is re-encoded upstream: under the
+// native Connect path it becomes a #6 ChatToolCall whose `name` the upstream
+// validates against the declared #10 ToolDefs. A history name the map does not
+// cover would therefore be sent as "a tool that was never declared".
+function historyToolNamesOf(messages) {
+  const names = [];
+  if (!Array.isArray(messages)) return names;
+  for (const m of messages) {
+    if (m?.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
+    for (const tc of m.tool_calls) {
+      const name = tc?.function?.name || tc?.name;
+      if (typeof name === 'string' && name) names.push(name);
+    }
+  }
+  return names;
+}
+
+// Apply the wire names to the history's assistant tool_calls. Fresh objects, never
+// in-place mutation: the same `messages` array is re-passed on retry/failover and
+// is the caller's input. `wireName` is the request-scoped lookup.
+function renameHistoryToolNames(messages, wireName) {
+  if (!Array.isArray(messages)) return messages;
+  let changed = false;
+  const out = messages.map((m) => {
+    if (m?.role !== 'assistant' || !Array.isArray(m.tool_calls) || !m.tool_calls.length) return m;
+    let localChanged = false;
+    const calls = m.tool_calls.map((tc) => {
+      const raw = tc?.function?.name || tc?.name;
+      if (typeof raw !== 'string' || !raw) return tc;
+      const wire = wireName(raw);
+      if (!wire || wire === raw) return tc;
+      localChanged = true;
+      return tc?.function ? { ...tc, function: { ...tc.function, name: wire } } : { ...tc, name: wire };
+    });
+    if (!localChanged) return m;
+    changed = true;
+    return { ...m, tool_calls: calls };
+  });
+  return changed ? out : messages;
+}
+
+// `tool_choice` carries a tool NAME when the caller forces one, so it has to be
+// rewritten with the same request-scoped map as the declarations. Strings
+// ('auto'/'required'/'none') and shapes without a name pass through untouched —
+// the upstream contract check (validateToolChoiceContract) already ran against
+// the CALLER's spelling, which is what the caller can see.
+function mapToolChoiceToWire(toolChoice, wireName) {
+  if (!toolChoice || typeof toolChoice !== 'object') return toolChoice;
+  const raw = toolChoice.function?.name || toolChoice.name;
+  if (typeof raw !== 'string' || !raw) return toolChoice;
+  const wire = wireName(raw);
+  if (!wire || wire === raw) return toolChoice;
+  return toolChoice.function
+    ? { ...toolChoice, function: { ...toolChoice.function, name: wire } }
+    : { ...toolChoice, name: wire };
+}
+
 export function summarizeToolRoutingDiagnostics({ tools, effectiveTools, toolChoice, toolRouting, preambleBudget = null }) {
   const requested = toolNameList(tools);
   const effective = toolNameList(effectiveTools);
@@ -592,7 +681,8 @@ function requestLogSummary(text, limit = 220) {
 }
 
 export function chatStreamError(message, type = 'upstream_error', code = null, extra = null) {
-  return { error: { message: sanitizeText(message || 'Upstream stream error'), type, code, ...(extra || {}) } };
+  const { retry_after_ms, ...fields } = extra || {};
+  return { error: { message: sanitizeText(message || 'Upstream stream error'), type, code, ...fields, ...clientResetFields(retry_after_ms) } };
 }
 
 // O12: OpenAI chat.completion / chat.completion.chunk bodies carry
@@ -791,7 +881,7 @@ export function finishPartialStreamAfterError({ id, created, model, send, res, i
         message: message || 'Upstream stream ended before completion (response is incomplete)',
         type,
         ...(code ? { code } : {}),
-        ...(Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? { retry_after_ms: retryAfterMs } : {}),
+        ...clientResetFields(retryAfterMs),
       },
     })
     : undefined;
@@ -893,6 +983,17 @@ export function detectFabricatedToolResult(text, { lastUserText = '' } = {}) {
  * model produces invalid JSON (the response still flows, parsing is the
  * caller's responsibility).
  */
+// CPU bound (S1 audit): the balanced-block scan below is O(starts × length) —
+// a reply of bare '{' characters walks the whole tail once per start (measured:
+// 64 KiB ≈ 6.2 s, ~4× per doubling), and every candidate that does close costs a
+// JSON.parse as large as the span scanned to reach it. Cap the work at 512
+// start positions and 4 MiB of cumulative inner scanning — the byte budget
+// bounds total parse effort too, since each candidate is a slice of what was
+// already scanned. Past either bound the trimmed fallback is returned, the
+// same answer an exhausted scan produces.
+const JSON_EXTRACT_MAX_STARTS = 512;
+const JSON_EXTRACT_MAX_SCAN_BYTES = 4 * 1024 * 1024;
+
 function extractJsonPayload(text) {
   if (!text) return text;
   // 1. Fenced code block — most common with Cascade
@@ -903,15 +1004,19 @@ function extractJsonPayload(text) {
   }
   // 2. Scan for the first balanced {...} or [...] block that parses
   const trimmed = text.trim();
+  let starts = 0;
+  let scanned = 0;
   for (let start = 0; start < trimmed.length; start++) {
     const ch = trimmed[start];
     if (ch !== '{' && ch !== '[') continue;
+    if (++starts > JSON_EXTRACT_MAX_STARTS || scanned >= JSON_EXTRACT_MAX_SCAN_BYTES) return trimmed;
     const open = ch;
     const close = ch === '{' ? '}' : ']';
     let depth = 0;
     let inStr = false;
     let escape = false;
     for (let i = start; i < trimmed.length; i++) {
+      if (++scanned > JSON_EXTRACT_MAX_SCAN_BYTES) return trimmed;
       const c = trimmed[i];
       if (escape) { escape = false; continue; }
       if (c === '\\' && inStr) { escape = true; continue; }
@@ -1265,6 +1370,11 @@ export function stabilizeJsonPayload(text, messages) {
  * and the Connect wire have no such control), so the only honest options are to
  * check the answer and say so, or to stay silent — and silence is what let a
  * `strict` request return a body the caller's own validator rejects.
+ *
+ * A violation carries `unable: true` + `code` when the validator could not form
+ * a judgement at all (a `pattern` exhausted its execution budget, or a pattern
+ * / value / schema passed a size cap). That is NOT the model failing the
+ * schema, and the surfaces below must not report it as such.
  */
 export function structuredOutputViolation(text, schema) {
   if (!schema || typeof schema !== 'object') return null;
@@ -1272,21 +1382,47 @@ export function structuredOutputViolation(text, schema) {
   const parsed = safeJsonParse(extractJsonPayload(text));
   if (parsed === undefined) return { path: '$', message: 'the response is not valid JSON' };
   const verdict = validateJsonSchema(parsed, schema);
-  return verdict.ok ? null : { path: verdict.path, message: verdict.message };
+  if (verdict.ok) return null;
+  if (verdict.unable) {
+    return { path: verdict.path, message: verdict.message, unable: true, code: verdict.code };
+  }
+  return { path: verdict.path, message: verdict.message };
+}
+
+/**
+ * Message and code for a typed structured-output failure.
+ *
+ * One wording for all four surfaces. The two cases must not share a sentence:
+ * "the model's answer does not conform" is a statement about the model, and it
+ * is false when what happened is that this proxy could not finish judging.
+ */
+export function structuredOutputFailure(violation) {
+  if (violation && violation.unable) {
+    return {
+      code: 'STRUCTURED_OUTPUT_UNVALIDATED',
+      message: `The proxy could not validate the model's answer against the requested JSON Schema within its execution budget (${violation.path}: ${violation.message}).`
+        + ' The answer may or may not conform; this proxy cannot enforce structured output at the upstream, so it will not return an unjudged payload as a conforming one.',
+    };
+  }
+  return {
+    code: 'STRUCTURED_OUTPUT_NOT_CONFORMING',
+    message: `The model's answer does not conform to the requested JSON Schema (${violation.path}: ${violation.message}).`
+      + ' This proxy cannot enforce structured output at the upstream, so it reports the mismatch instead of returning a payload that violates the schema.',
+  };
 }
 
 /** The typed failure returned when a schema-constrained turn does not conform. */
 function structuredOutputError(violation) {
+  const { message, code } = structuredOutputFailure(violation);
   return {
     // 5xx: the request was valid, the upstream answer was not. A 4xx would blame
     // the caller for a schema this proxy accepted.
     status: 502,
     body: {
       error: {
-        message: `The model's answer does not conform to the requested JSON Schema (${violation.path}: ${violation.message}).`
-          + ' This proxy cannot enforce structured output at the upstream, so it reports the mismatch instead of returning a payload that violates the schema.',
+        message,
         type: 'server_error',
-        code: 'STRUCTURED_OUTPUT_NOT_CONFORMING',
+        code,
       },
     },
   };
@@ -1353,10 +1489,61 @@ export function hasPerUserScope(callerKey) {
 // Keep both existing key sites gated without moving either snapshot in time.
 // The outer key must still precede fallback/body rewrites; the inner fallback
 // key must still describe the rewritten body. The cache module's public key
-// function remains unconditional for its other callers.
-function cacheKey(body, callerKey) {
+// function remains unconditional for its other callers. The routing identity
+// (third arg) threads through untouched — it only reshapes the hashed body.
+function cacheKey(body, callerKey, identity, keepReasoningSeparate = false) {
   if (!isCacheEnabled() || !hasPerUserScope(callerKey)) return null;
-  return computeCacheKey(body, callerKey);
+  const key = computeCacheKey(body, callerKey, identity);
+  // Text promoted for another route must not replay as final Gemini content.
+  return keepReasoningSeparate ? `gemini:${key}` : key;
+}
+
+// The Cascade generation this body routes to RIGHT NOW: resolved model key +
+// thinking-sibling route + router-canonical effort — the same expression the
+// inner handler dispatches on (chat.js `resolveEffectiveModelKey(resolveModel(
+// mergeReasoningEffortIntoModel(body.model, body)), isThinkingRequested(body))`).
+// The response cache keys THIS, not the raw spelling: flat vs nested
+// `reasoning.effort` produced equal raw keys while routing to different
+// Cascade variants, and a warm cache replayed the first variant's answer for
+// the second (BLUE-CACHE P2). Pure function of (body, catalog) — the wrapper's
+// pre-rewrite key and the inner's post-rewrite key for the same body agree by
+// construction, which keeps the H-3 original/fallback slot roles intact.
+// Exported for tests that pre-seed a cache slot the real handler will look up.
+export function cascadeCacheIdentity(body, resolvedModel = undefined) {
+  const reqModel = mergeReasoningEffortIntoModel(body.model, body);
+  const wantThinking = isThinkingRequested(body);
+  return {
+    // B1: bind the policy-resolved generation — when the access fallback
+    // retargets a blocked request to the operator's default model, the cache
+    // key must describe the model that actually serves it, not the blocked
+    // spelling (otherwise a policy switch replays stale answers). The outer
+    // pre-policy key stays caller-derived and is not reused in that case.
+    model: resolvedModel ?? resolveEffectiveModelKey(resolveModel(reqModel || config.defaultModel), wantThinking),
+    thinking: wantThinking,
+    effort: normalizeReasoningEffortValue(body),
+  };
+}
+
+// The connect generation this body routes to. The selector derives
+// deterministically from (raw model spelling, canonical effort) via
+// mergeReasoningEffortIntoModel + resolveConnectSelector, and the response
+// echoes the requested name — keying the raw spelling keeps alias display
+// names truthful on replay. The one extra output-affecting knob is the
+// opt-in sequential preference: the encoder emits #11 disable_parallel_tool_calls
+// only when DEVIN_CONNECT_TOOL_CHOICE=1 AND parallel_tool_calls === false
+// (the exact expression below mirrors devin-connect.js buildGetChatMessageRequest).
+// With the switch off the field is dropped, so opposite preferences are
+// default-equivalent and must keep sharing one slot.
+function connectCacheIdentity(body, selector = undefined) {
+  return {
+    // B1: the resolved upstream selector is the generation's identity. When the
+    // access policy retargets a blocked request to the default model, keying
+    // the raw request spelling would replay the retargeted answer under the
+    // original name after the policy changes back.
+    model: selector,
+    effort: normalizeReasoningEffortValue(body),
+    connectSequential: isToolChoicePassthroughEnabled() && body.parallel_tool_calls === false,
+  };
 }
 
 function isToolSensitiveOpusModel(modelKey = '') {
@@ -1394,7 +1581,7 @@ export function isToolEmulatedReusableModel(modelKey = '') {
 export function isThinkingRequested(body) {
   const thinkingType = body?.thinking?.type;
   if (thinkingType && thinkingType !== 'disabled') return true;
-  if (body?.reasoning_effort) return true;
+  if (resolveReasoningEffort(body)) return true;
   return false;
 }
 
@@ -1458,8 +1645,8 @@ export function shouldUseCascadeReuse({ useCascade, emulateTools, modelKey, allo
 // reference to `body` into streamResponse / nonStreamResponse where it
 // wasn't in scope, ReferenceError'ing every stream finish (#93 follow-up
 // reported by zhangzhang-bit).
-export function shouldFallbackThinkingToText({ routingModelKey, wantThinking, accText, accThinking, hasToolCalls }) {
-  if (hasToolCalls) return false;
+export function shouldFallbackThinkingToText({ routingModelKey, wantThinking, accText, accThinking, hasToolCalls, keepReasoningSeparate = false }) {
+  if (keepReasoningSeparate || hasToolCalls) return false;
   if (accText && accText.length) return false;
   if (!accThinking || !accThinking.length) return false;
   if (routingModelKey && /thinking/i.test(routingModelKey)) return false;
@@ -1504,7 +1691,7 @@ function hasAnswerableUserContent(message) {
 }
 
 function strictReuseRetryMs(availability) {
-  return Math.max(1000, availability?.retryAfterMs || CASCADE_REUSE_STRICT_RETRY_MS);
+  return Math.max(1000, boundedClientResetMs(availability?.retryAfterMs) || CASCADE_REUSE_STRICT_RETRY_MS);
 }
 
 function strictReuseMessage(model, retryMs, reason = 'temporarily unavailable') {
@@ -1634,10 +1821,21 @@ function repairedPathForKey(key, path) {
 }
 
 function extractRequestedReadPath(messages) {
-  const text = recentUserText(messages);
+  // CPU bound (S1 audit), two layers. The window: the bare-path pattern ran on
+  // the full last user message, and the second alternative
+  //   [A-Za-z0-9._-]+(?:[\\/][A-Za-z0-9._-]+)*\.[A-Za-z0-9]{1,12}
+  // is O(n²) on a long unbroken run of [A-Za-z0-9._-] — the `+` re-tries every
+  // split before the mandatory `\.ext` — so a pasted token/base64 blob of a
+  // few hundred KiB stalled the event loop for seconds per repair (measured:
+  // 128 KiB ≈ 9.8 s). 200_000 matches the bound the NLU entry points already
+  // use; a repair source is best-effort, so the head of the message is enough.
+  // The caps inside the pattern (a real path segment is ≤255 chars, a real
+  // path is far under 64 separators deep) bound the per-position backtracking
+  // that made the run quadratic; every realistic path still matches whole.
+  const text = recentUserText(messages).slice(0, 200_000);
   if (!text) return '';
   const backtick = [...text.matchAll(/`([^`\r\n]+)`/g)].map(m => m[1]);
-  const bare = [...text.matchAll(/((?:[A-Za-z]:[\\/]|\/|~[\\/]|\.{1,2}[\\/])[^"'`<>\s]+|[A-Za-z0-9._-]+(?:[\\/][A-Za-z0-9._-]+)*\.[A-Za-z0-9]{1,12})/g)].map(m => m[1]);
+  const bare = [...text.matchAll(/((?:[A-Za-z]:[\\/]|\/|~[\\/]|\.{1,2}[\\/])[^"'`<>\s]+|[A-Za-z0-9._-]{1,255}(?:[\\/][A-Za-z0-9._-]{1,255}){0,63}\.[A-Za-z0-9]{1,12})/g)].map(m => m[1]);
   for (const candidate of [...backtick, ...bare]) {
     const tail = internalWorkspaceTail(candidate);
     if (tail !== null) return tail || '';
@@ -1735,7 +1933,15 @@ export function repairToolCallArguments(tc, messages) {
   // the user named in order to FORBID it; reading it as the intended command turns
   // a prohibition into an instruction. Same masking the NLU layer uses, so the two
   // cannot drift apart on what counts as actionable.
-  const source = maskNonActionableRegions(maskDocumentSpans(latestRealUserText(messages)));
+  //
+  // CPU bound (S1 audit): maskNonActionableRegions rebuilds the string once per
+  // masked region — K negated clauses or fences on an n-char text is O(K×n) —
+  // and this was the only caller feeding it untruncated text. The NLU entry
+  // points cap at 200_000 for exactly this reason (intent-extractor.js
+  // detectToolIntentInNarrative / extractIntentFromNarrative); a repair source
+  // is best-effort, so the same head-of-message window applies here.
+  const source = maskNonActionableRegions(maskDocumentSpans(
+    latestRealUserText(messages).slice(0, 200_000)));
   for (const { command: requested, bounded } of extractRequestedBashCommands(source)) {
     if (bounded && isSafeCommandCompletion(current, requested)) {
       // Every surviving expansion is logged, because one shape CANNOT be
@@ -1757,25 +1963,14 @@ export function repairToolCallArguments(tc, messages) {
 }
 
 export function parseRateLimitCooldownMs(message = '') {
-  const reset = String(message || '').match(/resets?\s+in\s*:?\s*((?:(?:\d+)\s*[hms]\s*)+)/i);
-  if (reset) {
-    let total = 0;
-    for (const part of reset[1].matchAll(/(\d+)\s*([hms])/gi)) {
-      const n = Number(part[1]);
-      const unit = part[2].toLowerCase();
-      if (unit === 'h') total += n * 60 * 60 * 1000;
-      else if (unit === 'm') total += n * 60 * 1000;
-      else total += n * 1000;
-    }
-    if (total > 0) return total;
-  }
-  const m = String(message || '').match(/(?:retry (?:after|in)|after)\s+(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)/i);
+  const reset = parseGoResetMs(message);
+  if (reset !== null) return reset;
+  const m = String(message || '').match(/(?:retry (?:after|in)|after)\s+(\d+(?:\.\d+)?)\s*(milliseconds?|msecs?|ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh])\b/i);
   if (m) {
     const n = Number(m[1]);
     const unit = m[2].toLowerCase();
-    if (unit.startsWith('h')) return n * 60 * 60 * 1000;
-    if (unit.startsWith('m')) return n * 60 * 1000;
-    return n * 1000;
+    const scale = /^(?:ms|milli)/.test(unit) ? 1 : unit.startsWith('h') ? 3600000 : unit.startsWith('m') ? 60000 : 1000;
+    return Math.min(MAX_RATE_RESET_MS, n * scale);
   }
   if (/about an hour|in an hour|try again in.*hour/i.test(message)) return 60 * 60 * 1000;
   return null;
@@ -1826,11 +2021,22 @@ export function rateLimitBurstCooldownMs({ message = '', retryAfterMs = 0, apiKe
 //   ceil  = rlClientBackoffCeilMs  (def 600000 → pure safety, only shortens absurd
 //           hints; never lengthens a normal one)
 // Returns whole seconds (the Retry-After header unit) so header + body agree.
+function boundedClientResetMs(value, env = process.env) {
+  const ms = boundResetMs(typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()) ? Number(value) : value);
+  if (!(ms > 0)) return null;
+  const ceiling = getBreakerTunable('rlClientBackoffCeilMs', env);
+  return ceiling > 0 ? Math.min(ms, ceiling) : ms;
+}
+
+export function clientResetFields(value) {
+  const ms = boundedClientResetMs(value);
+  return ms === null ? {} : { retry_after_ms: ms };
+}
+
 export function clientRetryAfterSeconds(retryAfterMs, env = process.env) {
   const floorMs = getBreakerTunable('rlClientBackoffFloorMs', env);
   const ceilMs = getBreakerTunable('rlClientBackoffCeilMs', env);
-  let ms = Number(retryAfterMs);
-  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  let ms = boundResetMs(Number(retryAfterMs)) ?? 0;
   if (floorMs > 0) ms = Math.max(ms, floorMs);
   if (ceilMs > 0) ms = Math.min(ms, ceilMs);
   return Math.max(1, Math.ceil(ms / 1000));
@@ -2063,6 +2269,33 @@ function scanUserMessageForBareCwd(messages) {
     return cand;
   };
 
+  // Pass-2 strip: remove every `<system-reminder>…</system-reminder>` pair
+  // with a cursor-advancing scan. The regex equivalent
+  // `content.replace(/<system-reminder\b[\s\S]*?<\/system-reminder>\s*/gi,'')`
+  // is O(K×n) — each of K unterminated open tags makes the lazy `[\s\S]*?`
+  // re-search the whole tail for a closer that is not there (measured: 512 KiB
+  // of bare opens ≈ 2.1 s of synchronous event-loop time, ~4× per doubling).
+  // Offsets only move forward, so this stays O(n) at any input size. Output is
+  // byte-identical to the regex: a pair drops its span plus the whitespace
+  // after the closer; an open with no closer keeps the tail.
+  const REMINDER_OPEN = /<system-reminder\b/gi;
+  const REMINDER_CLOSE = /<\/system-reminder>\s*/gi;
+  const stripSystemReminderBlocks = (text) => {
+    let out = '';
+    let cursor = 0;
+    for (;;) {
+      REMINDER_OPEN.lastIndex = cursor;
+      const open = REMINDER_OPEN.exec(text);
+      if (!open) break;
+      REMINDER_CLOSE.lastIndex = open.index + open[0].length;
+      const close = REMINDER_CLOSE.exec(text);
+      if (!close) break;
+      out += text.slice(cursor, open.index);
+      cursor = close.index + close[0].length;
+    }
+    return out + text.slice(cursor);
+  };
+
   for (const m of messages) {
     if (m?.role !== 'user') continue;
     let content;
@@ -2084,7 +2317,7 @@ function scanUserMessageForBareCwd(messages) {
     // those wrappers and try again with a slightly bigger window (the prose
     // that follows tends to be longer than the raw input).
     if (!/<system-reminder\b/i.test(content)) continue;
-    const stripped = content.replace(/<system-reminder\b[\s\S]*?<\/system-reminder>\s*/gi, '');
+    const stripped = stripSystemReminderBlocks(content);
     const wrapped = tryMatch(stripped.slice(0, 500));
     if (wrapped) return wrapped;
   }
@@ -2160,6 +2393,39 @@ export function shouldLiftCallerEnv(modelKey, { emulateTools, env = process.env 
   if (String(env.WINDSURFAPI_ENV_LIFT ?? '1').trim().toLowerCase() === '0') return false;
   if (isWeakEmulationModel(modelKey)) return false;
   return true;
+}
+
+// Is this a message body whose ENTIRE content is text: a string, or an array of
+// standard `{type:'text', text}` parts with no image/file/malformed entry?
+// Used by the direct Connect instruction path: only such a Chat `developer`
+// message may be promoted to the instruction channel, and only such a system
+// message may be folded to wire text before identity neutralization. Mixed
+// content keeps its existing per-part handling — a non-text block must not be
+// silently stringified into the system prompt.
+export function isPureTextMessageContent(content) {
+  if (typeof content === 'string') return true;
+  if (!Array.isArray(content)) return false;
+  return content.every((p) => p && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string');
+}
+
+// OpenAI's `developer` role is the declared instruction channel (Codex and the
+// o-series send it). The direct Connect branch used to pass it through as a
+// caller-role message, so devin-connect.js encoded its text into a USER frame
+// (#3 source=1) and the instruction priority was lost. Promote pure-text
+// developer turns to `role:'system'` in the same array position: the existing
+// builder then puts them on protobuf #2, in instruction order, and keeps its
+// own collapse options (DEVIN_CONNECT_COLLAPSE_SYSTEM) in control. Returns the
+// input reference when nothing was promoted; promoted turns are shallow copies,
+// so body.messages and the caller's objects are never mutated.
+export function promoteDeveloperInstructions(messages) {
+  if (!Array.isArray(messages) || !messages.some((m) => m?.role === 'developer')) return messages;
+  let changed = false;
+  const out = messages.map((m) => {
+    if (m?.role !== 'developer' || !isPureTextMessageContent(m.content)) return m;
+    changed = true;
+    return { ...m, role: 'system' };
+  });
+  return changed ? out : messages;
 }
 
 // Inject a tool-description preamble into the system prompt of a message
@@ -2310,6 +2576,13 @@ export { strictUsageTotal };
  */
 
 export function buildUsageBody(serverUsage, messages, completionText, thinkingText = '', cachePolicy = null) {
+  const reported = serverUsage && Object.hasOwn(serverUsage, 'reportedUsage') ? serverUsage.reportedUsage : serverUsage;
+  const report = reported && {
+    fresh_input_tokens: reported.inputTokens,
+    output_tokens: reported.outputTokens,
+    cache_read_input_tokens: reported.cacheReadTokens,
+    cache_creation_input_tokens: reported.cacheWriteTokens,
+  };
   if (serverUsage && (serverUsage.inputTokens || serverUsage.outputTokens)) {
     const inputTokens = serverUsage.inputTokens || 0;
     const outputTokens = serverUsage.outputTokens || 0;
@@ -2354,7 +2627,7 @@ export function buildUsageBody(serverUsage, messages, completionText, thinkingTe
       ephemeral_5m_input_tokens: cachePolicy?.has1h ? 0 : cacheWrite,
       ephemeral_1h_input_tokens: cachePolicy?.has1h ? cacheWrite : 0,
     };
-    return {
+    return markReportedUsage({
       prompt_tokens: promptTokens,
       completion_tokens: outputTokens,
       total_tokens: totalTokens,
@@ -2378,11 +2651,11 @@ export function buildUsageBody(serverUsage, messages, completionText, thinkingTe
         cache_write_tokens: cacheWrite,
         output_tokens: outputTokens,
       },
-    };
+    }, report);
   }
   const prompt = estimateTokens(messages);
   const completion = Math.max(1, Math.ceil(((completionText || '').length + (thinkingText || '').length) / 4));
-  return {
+  return markReportedUsage({
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + completion,
@@ -2392,7 +2665,7 @@ export function buildUsageBody(serverUsage, messages, completionText, thinkingTe
     // O11: completion here already folds thinkingText into the chars/4 estimate,
     // so reasoning_tokens is the thinking portion of that same total (⊆ completion).
     completion_tokens_details: { reasoning_tokens: estimateReasoningTokens(thinkingText, completion) },
-  };
+  }, report);
 }
 
 // ── DEVIN_CONNECT account lifecycle ──────────────────────────────────
@@ -2453,14 +2726,19 @@ export function __resetConnectDeps() {
 // (e.g. a fable) off a free account, which the upstream rejects as
 // permission_denied. modelKey stays null — connect selectors are a different
 // namespace from the Cascade catalog and must not hit the catalog model-allow filter.
-async function acquireConnectAccount(signal, callerKey, selector = null, budget = null) {
+async function acquireConnectAccount(signal, callerKey, selector = null, budget = null, opts = {}) {
   // Empty pool (single-token deploy: only WINDSURF_API_KEY/DEVIN_CONNECT_TOKEN
   // in env) → there is nothing to wait for. Return null immediately for the
   // env-token fallback instead of blocking QUEUE_MAX_WAIT_MS on every request.
   if (getAccountCount().total === 0) return null;
+  // `waitForAccount` stays injectable through the same context seam the Cascade
+  // path uses (context.waitForAccount at the handler). Production passes the
+  // real function; a test can answer the queue window deterministically without
+  // sleeping QUEUE_MAX_WAIT_MS.
+  const { waitForAccount: waitFn = waitForAccount, ...waitOpts } = opts;
   const tried = [];
-  const acct = await waitForAccount(tried, signal, budgetWaitMs(budget, QUEUE_MAX_WAIT_MS), null, callerKey, selector);
-  return acct; // may be null → env-token fallback
+  const acct = await waitFn(tried, signal, budgetWaitMs(budget, QUEUE_MAX_WAIT_MS), null, callerKey, selector, waitOpts);
+  return acct; // may be null → env-token fallback (only when no pool existed at admission)
 }
 
 // Cross-account failover for DEVIN_CONNECT. When the current account's token is
@@ -2476,7 +2754,7 @@ async function acquireConnectAccount(signal, callerKey, selector = null, budget 
 // just stall the request for QUEUE_MAX_WAIT_MS before failing. We take whatever
 // untried account is selectable after a bounded failover pause, or give up.
 // This helper is never called for the initial, successful acquisition.
-async function acquireConnectFailover(triedKeys, signal, callerKey, selector = null, budget = null) {
+async function acquireConnectFailover(triedKeys, signal, callerKey, selector = null, budget = null, opts = {}) {
   if (signal?.aborted) return null;
   // Match Cascade's 500ms first backoff, but keep a fixed per-hop budget.
   // Wait before acquisition so an idle timer never holds an account reservation.
@@ -2494,7 +2772,7 @@ async function acquireConnectFailover(triedKeys, signal, callerKey, selector = n
     signal?.addEventListener('abort', finish, { once: true });
   });
   if (signal?.aborted) return null;
-  return getApiKey(triedKeys, null, callerKey, selector);
+  return getApiKey(triedKeys, null, callerKey, selector, opts);
 }
 
 // Prompt-cache affinity for the DEVIN_CONNECT path.
@@ -2523,7 +2801,7 @@ async function acquireConnectFailover(triedKeys, signal, callerKey, selector = n
 // entitlement a caller alternating between a free-reachable and a paid selector
 // cleared and re-created that slot every request and got zero affinity. getApiKey
 // already receives the selector, so both sides agree.
-export function bindConnectSticky(callerKey, acct, selector = null) {
+export function bindConnectSticky(callerKey, acct, selector = null, usage = undefined) {
   if (!callerKey || !acct?.id || !isStickyEnabled()) return;
   // Same per-user-scope gate every Cascade sticky write sits behind (via
   // reuseEnabled → !sharedApiKeyNoScope, chat.js hasPerUserScope / SEC-W2):
@@ -2536,8 +2814,18 @@ export function bindConnectSticky(callerKey, acct, selector = null) {
   // cascade reuse.
   if (!hasPerUserScope(callerKey)) return;
   try {
-    setStickyBinding(callerKey, null, acct.id, currentApiKeyForId(acct.id, acct.apiKey), selector);
+    setStickyBinding(callerKey, null, acct.id, currentApiKeyForId(acct.id, acct.apiKey), selector, usage);
   } catch { /* affinity is best-effort — never fail a served request over it */ }
+}
+
+// Internal adapter contract: a translated stream can publish delivery-dependent
+// state only after its own terminal egress settles. A Symbol keeps this hook out
+// of JSON request bodies. Direct Chat has no hook and keeps its existing timing.
+export const DEFER_STREAM_DELIVERY = Symbol('deferStreamDelivery');
+function publishStreamDelivery(context, effect) {
+  const defer = context?.[DEFER_STREAM_DELIVERY];
+  if (typeof defer === 'function') defer(effect);
+  else effect();
 }
 
 // How many times a single DEVIN_CONNECT request may hop to a fresh pooled
@@ -2794,26 +3082,29 @@ export function finalizeConnectAccount(acct, { model, selector = null, startTime
       // snapshot views of "is this account quota-dry?" consistent; a later
       // balance-recovery snapshot then clears it. 30-min cooldown default bounds
       // the re-probe rate without a hard disable (quota refills per billing cycle).
-      markQuotaExhausted(apiKey, 30 * 60 * 1000);
+      const now = Date.now();
+      const observedDelay = quotaResetDelay(live.credits, err.quotaPeriod, now);
+      markQuotaExhausted(apiKey, Math.max(1000, observedDelay ?? 30 * 60 * 1000), now);
       bumpConnect('quota_exhausted');
     }
     else if (err.code === 'RATE_LIMITED') {
       // Honor an explicit upstream reset window when the classifier parsed one
-      // (e.g. "message rate limit ... Resets in: 3h0m0s" → err.resetMs). Apply it
-      // ACCOUNT-WIDE (modelKey=null), not model-scoped: acquireConnectAccount
-      // selects the pool via getApiKey(triedKeys, null, ...) with modelKey=null,
-      // and isRateLimitedForModel only consults _modelRateLimits when modelKey is
-      // truthy — so a model-scoped cooldown is structurally invisible to
-      // DEVIN_CONNECT selection and the pool immediately re-picks the account that
-      // just 429'd, ignoring the reset window entirely. (The account-wide choice is
-      // still right for a hard reset window, but note the premise has narrowed
-      // since: isCooledForRequest also honors the connect-selector dimension now,
-      // so rateLimitedUntil is no longer the ONLY dimension a modelKey=null lookup
-      // sees.) Falls back to a burst cooldown when no window was given (generic
-      // 429 with no retry-after); F2: that burst duration is the `rlBurstMs`
-      // tunable (default 300000 = the historical 5min).
+      // (e.g. "message rate limit ... Resets in: 3h0m0s" → err.resetMs). Scope it
+      // to the model/selector that was throttled, NOT the account: a 429 for one
+      // model is no evidence about the others, and the old account-wide write
+      // benched a healthy account for every other model it could still serve.
+      // The old account-wide choice existed because connect selection calls
+      // getApiKey(triedKeys, null, ...) with modelKey=null and
+      // isRateLimitedForModel only consults _modelRateLimits for a truthy key —
+      // so a model-scoped cooldown used to be structurally invisible. That
+      // premise is gone: isCooledForRequest also checks the connect-selector
+      // dimension, which is exactly what this write keys on (`selector || model`,
+      // the same dimension the CAPACITY arm below uses). Falls back to a burst
+      // cooldown when no window was given (generic 429 with no retry-after);
+      // F2: that burst duration is the `rlBurstMs` tunable (default 300000 =
+      // the historical 5min).
       if (Number.isFinite(err.resetMs) && err.resetMs > 0) {
-        markRateLimited(apiKey, err.resetMs, null, 'r');
+        markRateLimited(apiKey, err.resetMs, selector || model, 'r');
       } else {
         markRateLimited(apiKey, getBreakerTunable('rlBurstMs'), null);
       }
@@ -3043,14 +3334,14 @@ export function finalizeConnectAccount(acct, { model, selector = null, startTime
  * MUST run before the first getApiKey below, because that call is what clears the pin —
  * once it returns, there is nothing left to wait for.
  *
- * @returns {Promise<{acct: object|null, aborted: boolean}>} `acct` is the pinned account
- *   when the wait succeeded. `aborted` is true only when the caller disconnected DURING a
- *   wait this function actually performed — see the note at its use site for why that has
- *   to be distinguishable from an ordinary give-up.
+ * @returns {Promise<{acct: object|null, aborted: boolean, waited?: boolean}>}
+ *   `acct` is the pinned account after a successful wait. `aborted` indicates
+ *   cancellation of the pin wait. `waited` marks a completed wait without a checkout.
  */
-async function waitForOwnPin(tried, signal, modelKey, callerKey, connectSelector) {
+async function waitForOwnPin(tried, signal, modelKey, callerKey, connectSelector, opts = {}, queueDeadline = Infinity) {
   const NO_WAIT = { acct: null, aborted: false };
-  const budgetMs = getBreakerTunable('stickyQueueOnPinMs');
+  const started = Date.now();
+  const budgetMs = Math.min(getBreakerTunable('stickyQueueOnPinMs'), queueDeadline - started);
   if (!budgetMs || budgetMs <= 0) return NO_WAIT;
   if (!callerKey || !isStickyEnabled()) return NO_WAIT;
 
@@ -3078,46 +3369,56 @@ async function waitForOwnPin(tried, signal, modelKey, callerKey, connectSelector
   // Compare the account's OWN stated recovery against the budget.
   if (!Number.isFinite(avail.retryAfterMs) || avail.retryAfterMs > budgetMs) return NO_WAIT;
 
-  const deadline = Date.now() + budgetMs;
-  const started = Date.now();
+  const deadline = started + budgetMs;
+  // An RPM entry falls out only after its timestamp crosses the cutoff.
+  const recoveryDelay = avail.reason === 'rpm_full'
+    ? Math.floor(avail.retryAfterMs) + 1
+    : Math.ceil(avail.retryAfterMs);
+  let recoveryProbeAt = Date.now() + recoveryDelay;
+  let waited = false;
   while (Date.now() < deadline) {
     if (signal?.aborted) return { acct: null, aborted: true };
-    await new Promise(r => setTimeout(r, Math.min(QUEUE_RETRY_MS, Math.max(50, deadline - Date.now()))));
+    const now = Date.now();
+    const wakeAt = Math.min(now + QUEUE_RETRY_MS, recoveryProbeAt, deadline);
+    await new Promise(r => setTimeout(r, Math.max(1, wakeAt - now)));
+    waited = true;
     if (signal?.aborted) return { acct: null, aborted: true };
+    const resumedAt = Date.now();
+    if (resumedAt >= deadline) break;
+    // Use the estimated recovery once. A failed probe resumes ordinary polling.
+    if (wakeAt === recoveryProbeAt || resumedAt >= recoveryProbeAt) recoveryProbeAt = Infinity;
     // pinOnly: reuses the real usability test, and cannot answer with a substitute or
     // clear the pin on a miss.
-    const acct = getApiKey(tried, modelKey, callerKey, connectSelector, { pinOnly: true });
+    const acct = getApiKey(tried, modelKey, callerKey, connectSelector, { ...opts, pinOnly: true });
     if (acct) {
       log.info(`[sticky] QUEUE-ON-PIN served the pinned account after ${Date.now() - started}ms (reason was ${avail.reason})`);
       return { acct, aborted: false };
     }
   }
   log.info(`[sticky] QUEUE-ON-PIN gave up after ${Date.now() - started}ms (reason ${avail.reason}) — rotating`);
-  return NO_WAIT;
+  return waited ? { ...NO_WAIT, waited } : NO_WAIT;
 }
 
-async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null, callerKey = null, connectSelector = null) {
+async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null, callerKey = null, connectSelector = null, opts = {}) {
   const deadline = Date.now() + maxWaitMs;
-  const pinWait = await waitForOwnPin(tried, signal, modelKey, callerKey, connectSelector);
+  const pinWait = await waitForOwnPin(tried, signal, modelKey, callerKey, connectSelector, opts, deadline);
   if (pinWait.acct) return pinWait.acct;
-  // Aborted DURING a wait we chose to perform. The pre-existing contract below is "if an
-  // account is free, serve it even if the signal is aborted" — the abort check sits inside
-  // the retry loop, so a first-try success is handed back regardless. That is fine when
-  // the call is instantaneous, but queue-on-pin deliberately spent up to a second first,
-  // so continuing here would acquire an account — pushing an RPM reservation and an
-  // in-flight count — for a caller we now KNOW has gone. Bail instead, which is also what
-  // the loop below would do on its next iteration.
+  // A completed pin wait consumes the queue budget. The first immediate lookup
+  // remains available with a zero budget or a pre-aborted signal.
   if (pinWait.aborted) return null;
-  let acct = getApiKey(tried, modelKey, callerKey, connectSelector);
+  if (pinWait.waited && (signal?.aborted || Date.now() >= deadline)) return null;
+  let acct = getApiKey(tried, modelKey, callerKey, connectSelector, opts);
   while (!acct) {
     if (signal?.aborted) return null;
-    if (Date.now() >= deadline) return null;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
     if (callerKey && isStickyEnabled() && isExperimentalEnabled('stickyNoFallback')) {
       log.info('[sticky] NO-FALLBACK waitForAccount — bound account unavailable, failing immediately');
       return null;
     }
-    await new Promise(r => setTimeout(r, QUEUE_RETRY_MS));
-    acct = getApiKey(tried, modelKey, callerKey, connectSelector);
+    await new Promise(r => setTimeout(r, Math.min(QUEUE_RETRY_MS, remaining)));
+    if (signal?.aborted || Date.now() >= deadline) return null;
+    acct = getApiKey(tried, modelKey, callerKey, connectSelector, opts);
   }
   return acct;
 }
@@ -3130,6 +3431,25 @@ async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, mode
 // two fields, the user's `xhigh` knob is silently dropped (zhqsuo's #115
 // followup: log shows `model=gpt-5.5-medium reasoning=xhigh`).
 //
+// Router-canonical reasoning-effort value, shared by routing AND cache-key
+// construction so the two can never disagree again (BLUE-CACHE P2). Truthy
+// flat-over-nested precedence (a blank flat value must NOT shadow a nested
+// one), trimmed + lowercased, with the `minimal` → `none` catalog spelling
+// applied. null when absent or blank.
+export function normalizeReasoningEffortValue(body) {
+  let raw;
+  try {
+    // A hostile body can carry effort spellings with no primitive coercion
+    // (Object.create(null) or throwing toString/valueOf) — keying must not
+    // throw on them; treat as no effort.
+    raw = String(body?.reasoning_effort || body?.reasoning?.effort || '').toLowerCase().trim();
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  return raw === 'minimal' ? 'none' : raw;
+}
+
 // Merge logic: the effort field is folded into the model id ONLY when the id
 // carries no effort suffix. An explicit suffix in the requested model is the
 // caller's tier selection and is AUTHORITATIVE — neither `reasoning.effort` nor
@@ -3138,11 +3458,7 @@ async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, mode
 // catalog model; anything else returns reqModel unchanged.
 export function mergeReasoningEffortIntoModel(reqModel, body) {
   if (!reqModel || typeof reqModel !== 'string') return reqModel;
-  const effort = String(
-    body?.reasoning_effort
-    || body?.reasoning?.effort
-    || ''
-  ).toLowerCase().trim();
+  const effort = normalizeReasoningEffortValue(body);
   if (!effort) return reqModel;
   const VALID = new Set(['minimal', 'none', 'low', 'medium', 'high', 'xhigh', 'max']);
   if (!VALID.has(effort)) return reqModel;
@@ -3161,12 +3477,12 @@ export function mergeReasoningEffortIntoModel(reqModel, body) {
     const suffix = '-' + (e === 'minimal' ? 'none' : e);
     if (reqModel.toLowerCase().endsWith(suffix)) return reqModel;
   }
-  const normalizedEffort = effort === 'minimal' ? 'none' : effort;
   // Try the merged form. resolveModel returns the model key if it exists,
   // unchanged input otherwise; getModelInfo returns null for unknown models.
   // Both checks together guard against accidentally inventing a model that
-  // doesn't exist in the catalog.
-  const merged = `${reqModel}-${normalizedEffort}`;
+  // doesn't exist in the catalog. `effort` is already router-canonical
+  // (lowercased, minimal→none) — normalizeReasoningEffortValue did it.
+  const merged = `${reqModel}-${effort}`;
   const resolved = resolveModel(merged);
   if (resolved && getModelInfo(resolved)) return merged;
   return reqModel;
@@ -3176,20 +3492,18 @@ export function mergeReasoningEffortIntoModel(reqModel, body) {
  * v2.0.85 (#126 KLFDan0534 + #128 wnfilm) — server-side auto-fallback
  * on rate_limit_exceeded.
  *
- * Default ON. When the inner handler returns 429 with a `fallback_model`
- * field (set by chat.js + stream.js when the whole pool is rate-limited
- * on a high-effort variant like `claude-opus-4-7-max`), the wrapper
- * silently retries the request against the suggested lower-effort
- * variant. The caller sees a successful response under the original
- * model name (we restore it post-flight) so existing client code is
- * unaffected.
+ * Default OFF (release-candidate policy): a silent retry against a
+ * lower-effort variant returns a successful response under the ORIGINAL
+ * model name, which is a silent model swap — the exact contract the
+ * owner rejected. A pool that cannot serve the requested variant now
+ * surfaces its 429 (with the `fallback_model` hint) instead of
+ * impersonating it. The machinery stays reachable for operators who
+ * explicitly opt back in via `WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT=1`.
  *
  * Stream requests are NOT auto-retried — by the time the inner
  * handler decides to error, no chunks have been written yet but the
  * caller flow is harder to rewind. Stream callers see the 429 with
  * the same `fallback_model` hint and can retry client-side.
- *
- * Disable via `WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT=0`.
  */
 export function shouldAutoFallback(body, context, result) {
   if (body?.stream) return false;
@@ -3205,7 +3519,9 @@ export function shouldAutoFallback(body, context, result) {
   // — see context.__aliasModelKey threading). This means the next
   // turn from the client (under the original model name) finds the
   // cascade in the pool and reuse stays intact across the fallback.
-  if (process.env.WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT === '0') return false;
+  // → release-candidate (owner decision): default OFF, opt-in '=1', so an
+  // unservable model reports the error rather than silently swapping.
+  if (process.env.WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT !== '1') return false;
   const err = result?.body?.error;
   if (!err) return false;
   if (err.type !== 'rate_limit_exceeded') return false;
@@ -3249,8 +3565,15 @@ export async function handleChatCompletions(body, context = {}) {
   // successful fallback writes into the cache slot the NEXT identical
   // original-model request will look up, instead of the fallback-model
   // slot that the next request will miss.
-  const originalCkey = cacheKey(body, context.callerKey || body.__callerKey || '');
-  const result = await _handleChatCompletionsInner(body, { ...context, traceId, __originalCkey: originalCkey });
+  // BLUE-CACHE P2: the key carries the effective routed identity, not the raw
+  // spelling — the next identical original-model request resolves the same
+  // identity, so the fallback's alias write and that request's lookup agree.
+  const originalCkey = cacheKey(body, context.callerKey || body.__callerKey || '', cascadeCacheIdentity(body), context.keepReasoningSeparate === true);
+  // A model fallback is another attempt of the same request. Keep the
+  // generation from its first cache lookup across both attempts.
+  let requestCacheGeneration;
+  const captureCacheGeneration = () => (requestCacheGeneration ??= cacheGeneration());
+  const result = await _handleChatCompletionsInner(body, { ...context, traceId, __originalCkey: originalCkey }, captureCacheGeneration);
   if (traceEnabled()) traceClientResponse(traceId, { status: result?.status, stream: !!result?.stream, ms: Date.now() - traceStart, cached: !!result?.__cached });
   if (shouldAutoFallback(body, context, result)) {
     // v2.0.88 (audit H-1) — `body.model` is the RAW request string; the
@@ -3274,6 +3597,7 @@ export async function handleChatCompletions(body, context = {}) {
       // will actually look up. __originalCkey threads through so
       // cacheSet writes also go to the original-model cache slot.
       { ...context, __fallbackAttempt: true, __aliasModelKey: originalRoutingKey, __originalCkey: originalCkey },
+      captureCacheGeneration,
     );
     // Restore original model id in the response body so client code
     // matching on `response.model === requested model` still works.
@@ -3299,16 +3623,22 @@ export async function handleChatCompletions(body, context = {}) {
   return result;
 }
 
-async function _handleChatCompletionsInner(body, context = {}) {
+async function _handleChatCompletionsInner(body, context, captureCacheGeneration) {
   // Reuse the trace id as reqId so log lines Chat[<id>] correlate 1:1 with the
   // <traceId>/ trace dir. Falls back to a random short id when untraced.
   const reqId = context.traceId || Math.random().toString(36).slice(2, 8);
+  const keepReasoningSeparate = context.keepReasoningSeparate === true;
   const {
     stream = false,
     tools,
-    tool_choice,
     response_format,
   } = body;
+  // `tool_choice` is `let`, not a destructured const: the DEVIN_CONNECT branch
+  // rewrites a FORCED tool name to the upstream charset (G1) once it has built the
+  // request-scoped name map, and the preamble/description builders downstream must
+  // see the same spelling the #10 ToolDefs advertise. Validation and the Cascade
+  // path read the caller's spelling, which is what the caller can see.
+  let tool_choice = body.tool_choice;
   // F3 (evidence/DataAuditTools/findings.md): this route had no tool-type gate at
   // all. Every consumer filters `type === 'function'` — the text preamble in
   // tool-emulation.js and the native #10 ToolDef encoder in devin-connect.js — so
@@ -3505,9 +3835,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // Both dimensions are independent; a dimension set to 0 is disabled.
   // See src/history-budget.js for the units and the default rationale.
   {
-    const history = checkOutboundHistory(messages);
+    const history = checkOutboundHistory(messages, { tools: effectiveTools });
     if (!history.ok) {
-      log.warn(`Chat[${reqId}]: outbound history over budget — turns=${history.measured.turns}/${history.budget.maxTurns} bytes=${history.measured.bytes}/${history.budget.maxBytes} (overTurns=${history.overTurns} overBytes=${history.overBytes}); rejecting before the upstream call`);
+      const b = history.measured.breakdown || {};
+      log.warn(`Chat[${reqId}]: outbound history over budget — turns=${history.measured.turns}/${history.budget.maxTurns} bytes=${history.measured.bytes}/${history.budget.maxBytes} (messages=${b.messages || 0} tools=${b.tools || 0}; overTurns=${history.overTurns} overBytes=${history.overBytes}); rejecting before the upstream call`);
       return {
         status: 413,
         body: {
@@ -3762,8 +4093,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
         created: Math.floor(Date.now() / 1000),
         model: reqModelName,
         modelKey: routingModelKey,
+        requestId: reqId,
         messages: acpMessages,
         callerKey,
+        signal: context.signal,
+        budget: context.budget,
       }, context.specialAgent || {});
     }
     // Live free selectors are the ONLY sound degrade targets (#258 residual): the
@@ -3798,10 +4132,17 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // validator — invalid_argument, now surfaced as 400 REQUEST_REJECTED; before
     // the 2026-10-25 mapping fix it read as UPSTREAM_INTERNAL and charged the
     // account's health). Reject early with 400 instead of guessing.
-    // The whitelist ceiling is the catalog snapshot (devin-catalog-snapshot.json);
-    // set WINDSURFAPI_STRICT_MODEL=0 to restore the legacy silent-degrade if the
-    // snapshot is stale and a genuinely-live selector is being rejected.
-    if (!mapped && String(process.env.WINDSURFAPI_STRICT_MODEL || '1') !== '0') {
+    // The whitelist ceiling is the catalog snapshot (devin-catalog-snapshot.json).
+    // There is no opt-out: an unmapped selector must never silently degrade to
+    // the free tier (release-candidate owner decision). If the snapshot is
+    // stale the fix is to refresh it, not to widen this gate.
+    //
+    // One carve-out: opt-in router names (`adaptive`/`arena-*` under
+    // DEVIN_CONNECT_ASSIGN_MODEL=1) also resolve mapped:false, but they are not
+    // "unresolvable" — the AssignModel RPC assigns a concrete model_uid below.
+    // Rejecting them here would disable the router feature outright.
+    const routerCandidate = process.env.DEVIN_CONNECT_ASSIGN_MODEL === '1' && isRouterModel(reqModelName);
+    if (!mapped && !routerCandidate) {
       log.warn(`Chat[${reqId}]: DEVIN_CONNECT rejecting unmapped model "${safeLogValue(reqModelName)}" (not in catalog whitelist) — 400 model_not_found`);
       return {
         status: 400,
@@ -3893,6 +4234,14 @@ async function _handleChatCompletionsInner(body, context = {}) {
         },
       };
     }
+    // The gate above admitted this request; WHY matters for account selection.
+    // When the only reason is "the selector is free on at least one account", the
+    // account that executes must be one where it is free RIGHT NOW — otherwise the
+    // gate's whole purpose (do not burn quota) is inverted by the scheduler. The
+    // predicate lives in auth.js next to the gate so the two cannot disagree, and
+    // the flag rides every acquisition path below (queue wait, sticky pin, failover
+    // hops, degraded serve) through getApiKey's single admission check.
+    const freeOnlyDroughtAdmission = isConnectFreeOnlyDroughtAdmission(selector);
     // Tool calling: connect selectors have no native function-calling slot, so
     // we emulate exactly like the Cascade path — inject the tool protocol into
     // the prompt (normalizeMessagesForCascade folds role:tool history and
@@ -3914,9 +4263,73 @@ async function _handleChatCompletionsInner(body, context = {}) {
     const _trim = nativeToolFlag
       ? { tools: effectiveTools, trimmed: false, kept: Array.isArray(effectiveTools) ? effectiveTools.length : 0, dropped: 0 }
       : trimToolsForWeakModel(effectiveTools, reqModelName, { toolChoice: tool_choice });
-    const connectTools = _trim.tools;
+    let connectTools = _trim.tools;
     if (_trim.trimmed) log.warn(`Chat[${reqId}]: DEVIN_CONNECT weak model ${safeLogValue(reqModelName)} — trimmed tools ${effectiveTools.length}→${_trim.kept} (dropped ${_trim.dropped}) to avoid upstream overload`);
     const emulateTools = Array.isArray(connectTools) && connectTools.length > 0;
+    // G1 (Q1 audit §7): the upstream accepts only `^[A-Za-z0-9_-]{1,64}$` tool
+    // names and rejects anything else with a MISLEADING `invalid_argument`
+    // ("an internal error occurred", mid-stream) — so `mcp::x`, `a.b` or
+    // `tool with space` looked like a proxy bug. messages.js and responses.js
+    // already rewrite names through buildToolNameMap; this surface did not, and
+    // it is the one every OpenAI-shaped client (Codex, Cline, omp) uses.
+    //
+    // The rewrite is reversible and request-scoped, and it must cover BOTH legs:
+    //  - declarations (#10 ToolDef AND the prompt preamble the model reads) so the
+    //    model can only ever emit a legal name;
+    //  - history (assistant `tool_calls[].function.name`, re-encoded natively as
+    //    #6 ChatToolCall) so a follow-up turn does not name a tool the upstream
+    //    considers undeclared;
+    //  - `tool_choice.function.name` (#12) so a forced call names the same tool
+    //    the definitions advertise.
+    // Every valid name (incl. `mcp__a__b`) maps to itself, so a client that
+    // already sends legal names sees a byte-identical request.
+    const toolNameMap = toolHygieneEnabled()
+      ? buildToolNameMap([
+        ...toolNameList(connectTools),
+        ...toolNameList(effectiveTools),
+        ...historyToolNamesOf(messages),
+      ])
+      : null;
+    const wireToolName = (n) => (toolNameMap && typeof n === 'string' && n
+      ? (toolNameMap.toUpstream.get(n) ?? n)
+      : n);
+    if (toolNameMap) {
+      const renamed = connectTools.map((t) => {
+        const raw = t?.function?.name || t?.name;
+        const wire = wireToolName(raw);
+        if (!wire || wire === raw) return t;
+        return t?.function ? { ...t, function: { ...t.function, name: wire } } : { ...t, name: wire };
+      });
+      if (renamed.some((t, i) => t !== connectTools[i])) {
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT tool names rewritten to the upstream charset (${connectTools.length} tool(s))`);
+        connectTools = renamed;
+      }
+      messages = renameHistoryToolNames(messages, wireToolName);
+      // Same map for a FORCED tool_choice (#12) and for every builder downstream
+      // that names the tool (the prompt preamble, the description preamble). It is
+      // rewritten HERE rather than at the `connectParams` literal so the preamble
+      // cannot disagree with the #10 ToolDefs.
+      tool_choice = mapToolChoiceToWire(tool_choice, wireToolName);
+    }
+    // Client-visible leg: the upstream echoes (or reverse-looks-up) the WIRE name,
+    // so every name leaving this handler is mapped back through toClient. No-op
+    // for names the caller sent legally, and null when hygiene is off.
+    const clientToolName = (n) => (toolNameMap ? restoreToolName(n, toolNameMap) : n);
+    // Non-stream twin of the frame rewrite above: the adapter's completion body
+    // carries the upstream's (wire) name. Restore before anything downstream reads
+    // it — the caller's response, the session-continuity pair-chain (built from
+    // `connectMessages`, which is caller-shaped) and the response cache.
+    const restoreOutToolNames = (out) => {
+      if (!toolNameMap) return out;
+      const calls = out?.body?.choices?.[0]?.message?.tool_calls;
+      if (Array.isArray(calls)) {
+        for (const tc of calls) {
+          const name = tc?.function?.name;
+          if (typeof name === 'string' && name) tc.function.name = clientToolName(name);
+        }
+      }
+      return out;
+    };
     // Double-send guard (#49): when the native ToolDef gate is calibrated, tools
     // also ride natively in the #10 `tools` field (connectParams.tools below), so
     // re-describing them in the prompt preamble is redundant and gives the model
@@ -3979,6 +4392,12 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // The tools branch is unchanged: nativeStructured's normalizer already
     // repairs, and the text-emulation branch must keep its bytes (it folds
     // results into user turns, so there is no role=4 frame to order).
+    // Declared `developer` → instruction channel, BEFORE prompt composition so
+    // the preamble/normalizer see one consistent system channel. Pure-text only;
+    // mixed or non-text developer content keeps its historical USER-frame
+    // behavior (never promoted). ACP/special-agent reroutes returned above and
+    // Cascade never reaches this block.
+    messages = promoteDeveloperInstructions(messages);
     let connectMessages = emulateTools
       ? normalizeMessagesForCascade(messages, connectTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble, stripOrphans: nativeDefsOn, nativeStructured })
       : nativeFlag
@@ -4047,9 +4466,25 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // devin-connect.js's wire-time messageText(), so the identity fingerprint this
     // step exists to strip reached Devin verbatim on the single most common
     // Codex path.
+    //
+    // GRANULARITY: the wire's system boundary is `messageText()` — one `\n` per
+    // part boundary, and ONE `\n` between two system messages (devin-connect.js
+    // #2). Neutralizing part by part cannot see a trigger split across parts
+    // ("… You are Claude Code, " | "Anthropic's official CLI …"), so a single
+    // PURE-TEXT system message is folded to exactly the text the wire will carry
+    // and neutralized once. Two independent system messages are NOT joined here:
+    // their boundary stays a builder decision (default join, or COLLAPSE_SYSTEM
+    // wrapping), and per-message neutralization never rewrites across it. Mixed
+    // content keeps the per-part helper contract. Unchanged text preserves the
+    // original message/array reference; the off switch returns the input as-is.
     if (Array.isArray(connectMessages)) {
       connectMessages = connectMessages.map((m) => {
         if (m?.role !== 'system') return m;
+        if (isPureTextMessageContent(m.content)) {
+          const folded = connectMessageText(m.content);
+          const neut = neutralizeClientIdentity(folded);
+          return neut === folded ? m : { ...m, content: neut };
+        }
         const neut = neutralizeMessageContent(m.content);
         return neut === m.content ? m : { ...m, content: neut };
       });
@@ -4066,9 +4501,13 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // uncacheable, so no cross-user sharing).
     let __sCkey = null;
     let __sHit = null;
+    let cacheWriteGeneration = null;
     try {
-      __sCkey = cacheKey(body, callerKey);
-      __sHit = __sCkey ? cacheGet(__sCkey) : null;
+      __sCkey = cacheKey(body, callerKey, connectCacheIdentity(body, selector), keepReasoningSeparate);
+      if (__sCkey) {
+        cacheWriteGeneration = captureCacheGeneration();
+        __sHit = cacheGet(__sCkey);
+      }
       if (__sHit) log.info('[STREAM-CACHE-HIT] ckey=' + __sCkey);
     } catch (e) { log.info('[STREAM-CACHE-ERR] pre ' + (e && e.message)); }
 
@@ -4087,7 +4526,13 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // gets the queue benefit via acquireConnectAccount below. A cache hit skips
     // both: it is already the answer, and charging RPM for it would exhaust the
     // pool under exactly the retry storm the cache exists to absorb.
-    if (!__sHit && getAccountCount().total > 0) {
+    //
+    // `poolAtAdmission` is the boundary this request was admitted against: a
+    // cache hit needs no pool at all, but once a real pool existed the request
+    // must hold a lease before dispatch. The post-wait check below re-reads that
+    // decision, not the live count (the pool can drain while the request queues).
+    const poolAtAdmission = !__sHit && getAccountCount().total > 0;
+    if (poolAtAdmission) {
       // No account entitled to this selector? (e.g. a paid selector like a fable
       // with only free-tier accounts in the pool.) Fail fast with a clear 403
       // instead of routing to an unentitled account and eating an upstream
@@ -4118,7 +4563,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // acquired null, which is indistinguishable from "no pool" and fell through to
       // the un-accounted env token. Ask the scheduler's own admission predicate
       // (read-only) so that shape fails fast instead.
-      const adm = isAllConnectAccountsUnavailable(selector);
+      const adm = isAllConnectAccountsUnavailable(selector, { freeOnly: freeOnlyDroughtAdmission });
       // L2: when degraded-serve is on, DON'T fast-429 a fully-throttled pool here.
       // Fall through to acquireConnectAccount → getApiKey, which will degrade-serve
       // the least-bad transiently-cooled account (pickDegradedFallback) instead of
@@ -4131,27 +4576,92 @@ async function _handleChatCompletionsInner(body, context = {}) {
       const throttled = rl.allLimited || tu.allUnavailable;
       const degradable = getBreakerTunable('degradedServe') && rl.allLimited && !tu.allUnavailable;
       if ((throttled && !degradable) || (!throttled && adm.allUnavailable)) {
+        // Owner decision (release candidate): when every entitled account's
+        // upstream catalog has latched this selector out ("model no longer
+        // available for this account"), the miss is permanent — answer the
+        // non-retryable model_unavailable instead of a retryable 429 the
+        // client would keep hammering.
+        if (!throttled && isConnectSelectorUnavailableForAll(selector)) {
+          log.info(`Chat[${reqId}]: DEVIN_CONNECT selector "${selector}" unavailable on every entitled account → 403 model_unavailable`);
+          bumpConnect('model_unavailable');
+          return {
+            status: 403,
+            body: { error: {
+              message: `Model \`${reqModelName}\` is no longer available on any entitled DEVIN_CONNECT account (upstream catalog dropped it for the whole pool). This is not retryable; choose a different model from GET /v1/models.`,
+              type: 'invalid_request_error',
+              param: 'model',
+              code: 'model_unavailable',
+            } },
+          };
+        }
         const retryAfterMs = rl.retryAfterMs || tu.retryAfterMs || adm.retryAfterMs || 60000;
         // F3: clamp the advertised Retry-After so an agent client's auto-retry
         // backs off usefully (floor) and is never frozen by an over-long window
         // (ceil). header + body report the SAME clamped value.
         const retryAfterSec = clientRetryAfterSeconds(retryAfterMs);
         log.info(`Chat[${reqId}]: DEVIN_CONNECT pool exhausted (${throttled ? 'all accounts rate-limited/unavailable' : 'no account admitted for the selector — maintenance / in-flight cap / latch'}) → 429 retry_after=${retryAfterMs}ms (advertised ${retryAfterSec}s)`);
-        bumpConnect('pool_exhausted');
+        return connectPoolUnavailableFailure(
+          throttled
+            ? `All DEVIN_CONNECT accounts are temporarily rate-limited. Retry in ~${retryAfterSec}s.`
+            : `No DEVIN_CONNECT account is currently selectable for \`${reqModelName}\` (maintenance, in-flight cap, or model unavailable for the pool). Retry in ~${retryAfterSec}s.`,
+          retryAfterMs,
+        );
+      }
+    }
+    const ccAcct = __sHit ? null : await acquireConnectAccount(context.signal, callerKey, selector, context.budget || null, { freeOnly: freeOnlyDroughtAdmission, waitForAccount: waitForAccountFn });
+    // Pooled admission contract (P0-2): a request admitted against a real pool
+    // MUST hold a lease before dispatch. `acquireConnectAccount` resolves null
+    // for two unrelated states — "no pool existed" (handled above; the operator's
+    // standalone env-token deploy is legitimate) and "the wait ended with no
+    // slot" (queue timeout, abort, or the pool stopped admitting this selector).
+    // Only the former may continue un-accounted. Falling through here with a
+    // pooled request would put an un-tracked env-token call behind a request the
+    // preflight already promised would be leased, and the preflight above cannot
+    // see a pool that emptied or latched during the async wait.
+    //
+    // The check sits BEFORE connectParams/image work, so neither the streaming
+    // nor the buffered path prepares an adapter for an unacquired request.
+    if (poolAtAdmission && !ccAcct) {
+      if (context.signal?.aborted) {
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT client disconnected while waiting for a pooled account — not dispatching`);
+        return { status: 499, body: { error: { message: 'Client closed request', type: 'client_disconnect', code: 'client_disconnect' } } };
+      }
+      // Same budget surface as the existing connect failover gate: the deadline
+      // (or the turn cap) stopped admission before any upstream work.
+      if (context.budget && !context.budget.canStartAttempt()) {
+        const stop = budgetExceededError(`request budget exhausted while waiting for a DEVIN_CONNECT account (${context.budget.describe()})`);
+        log.warn(`Chat[${reqId}]: ${stop.message}`);
+        const { status, type } = connectErrorToHttp('DEADLINE_EXCEEDED');
+        return { status, body: { error: { message: stop.message, type, code: 'DEADLINE_EXCEEDED' } } };
+      }
+      const temporary = isAllTemporarilyUnavailable(null, selector);
+      const rateLimited = isAllRateLimited(null, selector);
+      const retryAfterMs = queueTimeoutRetryAfterMs(temporary, rateLimited);
+      const retryAfterSec = clientRetryAfterSeconds(retryAfterMs);
+      const limited = temporary.allUnavailable || rateLimited.allLimited;
+      // Same permanent-miss split as the preflight arm: a selector latched out
+      // on every entitled account is not retryable pool pressure.
+      if (!limited && isConnectSelectorUnavailableForAll(selector)) {
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT selector "${selector}" unavailable on every entitled account after queue wait → 403 model_unavailable`);
+        bumpConnect('model_unavailable');
         return {
-          status: 429,
-          headers: { 'Retry-After': String(retryAfterSec) },
+          status: 403,
           body: { error: {
-            message: throttled
-              ? `All DEVIN_CONNECT accounts are temporarily rate-limited. Retry in ~${retryAfterSec}s.`
-              : `No DEVIN_CONNECT account is currently selectable for \`${reqModelName}\` (maintenance, in-flight cap, or model unavailable for the pool). Retry in ~${retryAfterSec}s.`,
-            type: 'rate_limit_exceeded',
-            retry_after_ms: retryAfterSec * 1000,
+            message: `Model \`${reqModelName}\` is no longer available on any entitled DEVIN_CONNECT account (upstream catalog dropped it for the whole pool). This is not retryable; choose a different model from GET /v1/models.`,
+            type: 'invalid_request_error',
+            param: 'model',
+            code: 'model_unavailable',
           } },
         };
       }
+      log.info(`Chat[${reqId}]: DEVIN_CONNECT pooled admission ended without an account lease (${limited ? 'pool rate-limited/unavailable' : 'queue window elapsed'}) → 429 retry_after=${retryAfterMs}ms (advertised ${retryAfterSec}s)`);
+      return connectPoolUnavailableFailure(
+        limited
+          ? `All DEVIN_CONNECT accounts are temporarily rate-limited. Retry in ~${retryAfterSec}s.`
+          : `No DEVIN_CONNECT account became available for \`${reqModelName}\` within the queue window (pool busy or selector unavailable). Retry in ~${retryAfterSec}s.`,
+        retryAfterMs,
+      );
     }
-    const ccAcct = __sHit ? null : await acquireConnectAccount(context.signal, callerKey, selector, context.budget || null);
     // Upstream-declared image capability (GetCliModelConfigs #5, the same bit
     // /v1/models advertises). Until this gate no request path read it, so an
     // image was forwarded to a model the same server had just told the client
@@ -4245,9 +4755,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // response pair chain so a multi-turn dialog reuses ONE session_id instead of
     // minting a fresh randomUUID per call — which the upstream velocity limiter
     // reads as N brand-new sessions. Resolves BEFORE dispatch on the client's own
-    // history; returns null (⇒ fresh per-request uuid, byte-identical to today) when
-    // the gate is off. Uses connectMessages so the fingerprint reflects exactly what
-    // rides the wire.
+    // history only for an admitted caller scope. Without that scope or with reuse
+    // off, the adapter mints its ordinary per-request UUID. Uses connectMessages
+    // so the fingerprint reflects exactly what rides the wire.
     // T2 (Thinking-core): incoming reasoning as fallback continuity source —
     // anthropic-in thinking rides the body as __incomingThinking (messages.js
     // captures it before the drop); openai/responses-in still carry
@@ -4263,22 +4773,33 @@ async function _handleChatCompletionsInner(body, context = {}) {
         }
       }
     }
-    const connectSessionId = resolveConnectSessionId(callerKey || '', connectMessages);
-    if (connectSessionId) {
+    const hasCallerScope = hasPerUserScope(callerKey);
+    // With image transport disabled, continuity follows only the text/tools
+    // that can reach the model. Keep connectParams.messages for the adapter.
+    const stripped = hasCallerScope && !__sHit && getImageFieldTag() === 0 && isSessionReuseEnabled()
+      ? stripImageParts(connectMessages) : null;
+    const continuityMessages = stripped?.messages ?? connectMessages;
+    const emptyAfterStrip = stripped?.dropped && !canonicalizeConnectHistory(continuityMessages).some(
+      event => event.kind === 'tool_result' || event.kind === 'tool_call'
+        || (event.role === 'user' && event.kind === 'text' && event.payload.trim()),
+    );
+    const scopedSession = hasCallerScope && !emptyAfterStrip;
+    const connectSession = scopedSession && !__sHit ? resolveConnectSessionBinding(callerKey, continuityMessages) : null;
+    if (connectSession) {
+      const { sessionId: connectSessionId, modelConfig, reasoningTrail } = connectSession;
       connectParams.sessionId = connectSessionId;
-      const modelCfg = getSessionConnectModelConfig(callerKey || '', connectMessages);
-      if (modelCfg) connectParams.sessionModelConfig = { id: modelCfg.configId, turn: modelCfg.turn };
-      const reasoningTrail = getSessionConnectReasoningTrail(callerKey || '', connectMessages);
+      if (modelConfig) connectParams.sessionModelConfig = modelConfig;
       if (reasoningTrail) connectParams.continuityTrail = reasoningTrail;
-      log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelCfg ? ` model_config=stable turn=${modelCfg.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
-    } else {
-      // O3: name the source on the DEFAULT path too. Without this line an operator
-      // cannot tell a fresh-per-request uuid (#16) from a lost reuse hit, and the
-      // upstream velocity limiter sees every turn as a new session.
-      log.debug(`Chat[${reqId}]: DEVIN_CONNECT session_id source=fresh-per-request (DEVIN_CONNECT_SESSION_REUSE off)`);
+      log.info(`Chat[${reqId}]: DEVIN_CONNECT session reuse active → session_id=${connectSessionId}${modelConfig ? ` model_config=stable turn=${modelConfig.turn}` : ''} acct=${ccAcct?.account?.id || 'env-token'}`);
+    } else if (!__sHit) {
+      let reason = 'DEVIN_CONNECT_SESSION_REUSE off';
+      if (!hasCallerScope) reason = 'no per-user or session scope';
+      else if (emptyAfterStrip) reason = 'no input identity after disabling images';
+      else if (isSessionReuseEnabled()) reason = 'image content identity unavailable';
+      log.debug(`Chat[${reqId}]: DEVIN_CONNECT session_id source=fresh-per-request (${reason})`);
       if (!_connectSessionSourceNoted) {
         _connectSessionSourceNoted = true;
-        log.info(`Chat[${reqId}]: DEVIN_CONNECT session_id source=fresh-per-request (DEVIN_CONNECT_SESSION_REUSE off — every request mints a new #16; enable it for multi-turn continuity)`);
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT session_id source=fresh-per-request (${reason})`);
       }
     }
     if (ccAcct) {
@@ -4327,6 +4848,14 @@ async function _handleChatCompletionsInner(body, context = {}) {
     if (Number.isFinite(body.top_p)) completionOverrides.topP = body.top_p;
     if (Number.isFinite(body.top_k)) completionOverrides.topK = body.top_k;
     if (Number.isFinite(max_tokens)) completionOverrides.maxTokens = max_tokens;
+    // G02: the Responses surface forwards `text.verbosity` as a top-level
+    // `verbosity` (responses.js). `buildCompletionConfig` has no verbosity
+    // field, so this is accepted and intentionally a no-op on the wire —
+    // carried here so the caller's value is not silently dropped at the proxy
+    // boundary (the override set records that the request asked for it).
+    if (typeof body.verbosity === 'string' && body.verbosity) {
+      completionOverrides.verbosity = body.verbosity;
+    }
     if (Object.keys(completionOverrides).length) connectParams.completion = completionOverrides;
     // Native tool definitions (groundwork, #49). The connect request builder only
     // emits a real `tools` field when DEVIN_CONNECT_TOOL_DEF_TAGS is calibrated;
@@ -4379,6 +4908,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // O1: honor stream_options.include_usage on the connect path too — the
     // trailing usage frame is emitted only when the caller opted in.
     const connectMeta = { id: ccId, created: ccCreated, displayModel: connectDisplayModel, emulateTools, includeUsage: body.stream_options?.include_usage === true, stop: body.stop ?? null, clineCompat: clineCompatActive, reqId, account: ccAcct ? safeAccountRef(ccAcct) : null,
+      onDispatch: context.onConnectDispatch,
       // Route-owned request budget: the adapter consumes one upstream turn per
       // internal attempt (empty/rescue/outer retry) and clamps its backoffs to
       // the remaining deadline. See src/request-budget.js.
@@ -4387,7 +4917,8 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // exact matched stop sequence (it echoes it as the public `stop_sequence`).
       // Explicit opt-in from the route — a direct OpenAI client keeps the
       // public response shape untouched.
-      stopCarrier: context.__messagesStopCarrier === true };
+      stopCarrier: context.__messagesStopCarrier === true,
+      keepReasoningSeparate };
     // Shared failover bookkeeping for both stream + non-stream paths. triedKeys
     // accumulates every session token burned this request so getApiKey never
     // re-picks a known-dead account when we hop to the next pool member.
@@ -4473,6 +5004,20 @@ async function _handleChatCompletionsInner(body, context = {}) {
             // O9/O12: connect 流 chunk 由 adapter 预置 fp；此处幂等补
             // system_fingerprint 与 service_tier。error 帧不动。
             applyChatCompletionCompatFields(data, fp);
+            // G1 reverse leg: the model was told the WIRE names, so the tool_call
+            // deltas it produces carry them. Map back before serialization, or an
+            // OpenAI client receives a name it never declared (and the tool_result
+            // it sends next cannot be matched by its own registry).
+            if (toolNameMap && Array.isArray(data?.choices)) {
+              for (const choice of data.choices) {
+                const calls = choice?.delta?.tool_calls;
+                if (!Array.isArray(calls)) continue;
+                for (const tc of calls) {
+                  const name = tc?.function?.name;
+                  if (typeof name === 'string' && name) tc.function.name = clientToolName(name);
+                }
+              }
+            }
             if (isOpenAIClient && data && data.error && typeof data.error.type === 'string') {
               data.error.type = normalizeOpenAIErrorType(data.error.type);
             }
@@ -4574,6 +5119,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
           // would duplicate content, so we surface the error instead.
           const attemptStream = async (a) => {
             const params = a ? { ...connectParams, token: a.apiKey, deviceSeed: ensureDeviceSeed(a) } : connectParams;
+            const meta = { ...connectMeta, dispatchAccountId: a?.id };
             // D2/V-10: a schema-constrained turn cannot be judged frame by frame
             // — the verdict needs the whole payload, and the adapter writes every
             // delta the moment it arrives. Buffer this attempt's frames instead of
@@ -4584,7 +5130,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
             const schemaFrames = jsonSchema ? [] : null;
             const sink = schemaFrames ? (data) => { schemaFrames.push(data); } : send;
             try {
-              const _sr = await streamChatCompletion(params, sink, connectMeta);
+              const _sr = await streamChatCompletion(params, sink, meta);
               // Dashboard token-usage breakdown from the streaming connect path
               // (the return value carries the terminal usage). Was discarded
               // before → "Token 用量分布" empty on connect deployments.
@@ -4592,13 +5138,14 @@ async function _handleChatCompletionsInner(body, context = {}) {
               // name the response body/chunks carry and the non-stream arm files
               // under — reqModelName split one conversation across two buckets on
               // a degrade or a router hop (P2-6).
-              try { recordTokenUsage(_sr?.usage, connectDisplayModel); } catch {}
               // K8: attribute the spend to THIS account (per-account lifetime total).
               // Pass the whole reservation, not its apiKey: the credential may have
               // rotated while the stream was in flight, and the ledger belongs to
               // the immutable account id (review #3).
               try { recordAccountSpend(a, _sr?.usage, connectSpendOpts(_sr?.billing)); } catch {}
               finalizeConnectAccount(a, { model: connectDisplayModel, selector, startTime: ccStart, err: null });
+              // Join this attempt's row, not a preceding failover row.
+              try { recordTokenUsage(_sr?.usage, connectDisplayModel); } catch {}
               return { kind: 'ok', sr: _sr, frames: schemaFrames };
             } catch (err) {
               // Client or server-level abort: the caller is gone (or the process
@@ -4636,12 +5183,12 @@ async function _handleChatCompletionsInner(body, context = {}) {
                       // The first attempt may have buffered frames before it hit
                       // the 401; the replay replaces them, never appends.
                       if (schemaFrames) schemaFrames.length = 0;
-                      const _sr3 = await streamChatCompletion({ ...connectParams, token: freshKey }, sink, connectMeta);
-                      try { recordTokenUsage(_sr3?.usage, connectDisplayModel); } catch {}
+                      const _sr3 = await streamChatCompletion({ ...connectParams, token: freshKey }, sink, meta);
                       // Billing identity is the account, not the credential: the
                       // retry presented freshKey, but the row belongs to a.id.
                       try { recordAccountSpend({ accountId: a.id, apiKey: freshKey, attemptId: a.reservationTimestamp }, _sr3?.usage, connectSpendOpts(_sr3?.billing)); } catch {}
                       finalizeConnectAccount(a, { model: connectDisplayModel, selector, startTime: ccStart, err: null, credentialKey: freshKey });
+                      try { recordTokenUsage(_sr3?.usage, connectDisplayModel); } catch {}
                       return { kind: 'ok', sr: _sr3, frames: schemaFrames };
                     } catch (retryErr) {
                       // Client disconnected while re-login was in flight — stop cleanly.
@@ -4744,13 +5291,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
                       ? structuredOutputViolation(deliveredText, jsonSchema)
                       : null;
                     if (violation) {
-                      log.warn(`Chat[${reqId}]: structured output does not conform (${violation.path}: ${violation.message}) — closing the stream with a typed error`);
+                      const failure = structuredOutputFailure(violation);
+                      log.warn(`Chat[${reqId}]: structured output ${violation.unable ? 'could not be validated' : 'does not conform'} (${violation.path}: ${violation.message}) — closing the stream with a typed error`);
                       terminalOk = false;
-                      await send(chatStreamError(
-                        `The model's answer does not conform to the requested JSON Schema (${violation.path}: ${violation.message}).`,
-                        'server_error',
-                        'STRUCTURED_OUTPUT_NOT_CONFORMING',
-                      ));
+                      await send(chatStreamError(failure.message, 'server_error', failure.code));
                       break;
                     }
                     // Conforming: release the held frames in their original order,
@@ -4758,28 +5302,49 @@ async function _handleChatCompletionsInner(body, context = {}) {
                     for (const frame of r.frames) await send(frame);
                     r.frames.length = 0;
                   }
+                  publishStreamDelivery(context, () => {
+                  // B2: only a legal terminal may be cached/committed/pinned. A
+                  // turn the upstream ended in error — or one that never named a
+                  // terminal — already spent its quota in attemptStream, but its
+                  // partial answer must not be replayed or chain-bound.
+                  const streamTerminalOk = ['stop', 'length', 'tool_calls', 'content_filter', 'refusal']
+                    .includes(r.sr?.finish_reason);
+                  if (!streamTerminalOk) {
+                    log.warn(`Chat[${reqId}]: DEVIN_CONNECT stream finished ${r.sr?.finish_reason || 'with no terminal'} — keeping usage, skipping cache/affinity/session commit`);
+                    return;
+                  }
                   // Pin this conversation to the account that just served it, so the
                   // next turn reads the prompt cache back instead of re-writing it.
                   // Complementary to the pair-chain commit below: that keeps the
                   // upstream session_id stable, this keeps the ACCOUNT stable — the
                   // prompt cache lives on the account, so without both the next turn
                   // still lands elsewhere and re-writes the whole context.
-                  bindConnectSticky(callerKey, acct, selector);
+                  bindConnectSticky(callerKey, acct, selector, r.sr?.usage ?? null);
                   // Session continuity: commit the completed request→response pair
                   // from the streamed result so the next turn resolves to this same
                   // session_id via pair-chain overlap. Gate-checked + best-effort
                   // (no-op when reuse is off). r.sr is threaded from every success
                   // path (initial, transient replay, re-login retry) so the commit
                   // fires even after an upstream wobble — exactly when reuse helps.
-                  try {
-                    const tc = r.sr?.toolCalls;
-                    const commitMsgs = [...connectMessages, {
-                      role: 'assistant',
-                      content: r.sr?.content || '',
-                      ...(tc?.length ? { tool_calls: tc.map((t, idx) => ({ id: t.id || `tc_${idx}`, function: { name: t.name, arguments: t.argumentsJson || t.arguments || '' } })) } : {}),
-                    }];
-                    commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: r.sr?.reasoning || incomingConnectReasoning });
-                  } catch { /* session commit is best-effort */ }
+                  if (connectParams.sessionId) {
+                    try {
+                      // Session continuity hashes the message pair (session-continuity
+                      // canonicalize(): name + id + args). The NEXT turn's
+                      // `connectMessages` carries the WIRE name, because this handler
+                      // renames history before the wire — so the committed assistant
+                      // turn must carry the same spelling, or the pair never matches
+                      // and a fresh session_id is minted after every rewritten call.
+                      // Ids are untouched by the name map and already client-normalized
+                      // by the adapter, so `r.sr.toolCalls` is exactly the right shape.
+                      const tc = r.sr?.toolCalls;
+                      const commitMsgs = [...continuityMessages, {
+                        role: 'assistant',
+                        content: r.sr?.content || '',
+                        ...(tc?.length ? { tool_calls: tc.map((t, idx) => ({ id: t.id || `tc_${idx}`, function: { name: t.name, arguments: t.argumentsJson || t.arguments || '' } })) } : {}),
+                      }];
+                      commitConnectSession(callerKey, connectSession, commitMsgs, undefined, { reasoning: r.sr?.reasoning || incomingConnectReasoning });
+                    } catch { /* session commit is best-effort */ }
+                  }
                   // [STREAM-CACHE] store full text + usage AFTER commit, BEFORE the
                   // loop-exit break (code after break is unreachable).
                   try {
@@ -4787,10 +5352,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
                     const _sTc = r.sr?.toolCalls;
                     if (__sCkey && _sTxt && !(_sTc && _sTc.length)) {
                       const _sSt = applyStop(_sTxt, normalizeStop(body.stop));
-                      cacheSet(__sCkey, { text: _sSt.hit ? _sSt.text : _sTxt, thinking: r.sr?.reasoning || '', stop: _sSt.hit ? _sSt.stop : (r.sr?.stop || null), finishReason: r.sr?.finish_reason || null, displayModel: connectDisplayModel, usage: r.sr?.usage || null });
-                      log.info('[STREAM-CACHE-STORE] ckey=' + __sCkey);
+                      cacheSet(__sCkey, { text: _sSt.hit ? _sSt.text : _sTxt, thinking: r.sr?.reasoning || '', stop: _sSt.hit ? _sSt.stop : (r.sr?.stop || null), finishReason: r.sr?.finish_reason || null, displayModel: connectDisplayModel, usage: r.sr?.usage || null }, cacheWriteGeneration);
+                      log.info('[STREAM-CACHE-STORE] attempted ckey=' + __sCkey);
                     }
                   } catch (e) { log.info('[STREAM-CACHE-ERR] store ' + (e && e.message)); }
+                  });
                 }
                 break;
               }
@@ -4814,7 +5380,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
                 // !emitted, since replaying after bytes are on the wire would
                 // duplicate content. The offending account is already cooled.
                 if (isAccountFailoverError(r.err.code) && !emitted && hops < maxHops) {
-                  const next = await acquireConnectFailover(triedKeys, abortController.signal, callerKey, selector, context.budget || null);
+                  const next = await acquireConnectFailover(triedKeys, abortController.signal, callerKey, selector, context.budget || null, { freeOnly: freeOnlyDroughtAdmission });
                   if (next) {
                     log.info(`Chat[${reqId}]: DEVIN_CONNECT ${r.err.code} on account → stream failover hop ${hops + 1} to next pooled account`);
                     bumpConnect(r.err.code === 'SELECTOR_NOT_ELIGIBLE' ? 'selector_failover_hops' : 'quota_failover_hops');
@@ -4850,7 +5416,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
               // failover never waits on it.
               if (acct) requestReauthCheck(acct.id, { source: 'request' }).catch(() => {});
               if (hops >= maxHops || emitted) { bumpConnect('failover_exhausted'); await send(chatStreamError('all DEVIN_CONNECT accounts exhausted (dead session tokens)', 'upstream_error', 'UNAUTHORIZED')); break; }
-              const next = await acquireConnectFailover(triedKeys, abortController.signal, callerKey, selector, context.budget || null);
+              const next = await acquireConnectFailover(triedKeys, abortController.signal, callerKey, selector, context.budget || null, { freeOnly: freeOnlyDroughtAdmission });
               if (!next) { bumpConnect('failover_exhausted'); await send(chatStreamError('all DEVIN_CONNECT accounts exhausted (dead session tokens)', 'upstream_error', 'UNAUTHORIZED')); break; }
               log.info(`Chat[${reqId}]: DEVIN_CONNECT failover hop ${hops + 1} → next pooled account`);
               bumpConnect('failover_hops');
@@ -4899,8 +5465,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // cross-account failover — wrapped in attempt() per account.
     const attempt = async (a) => {
       const params = a ? { ...connectParams, token: a.apiKey, deviceSeed: ensureDeviceSeed(a) } : connectParams;
+      const meta = { ...connectMeta, dispatchAccountId: a?.id };
       try {
-        const out = await toChatCompletion(params, connectMeta);
+        const out = await toChatCompletion(params, meta);
         finalizeConnectAccount(a, { model: connectDisplayModel, selector, startTime: ccStart, err: null });
         return { kind: 'ok', out };
       } catch (err) {
@@ -4924,7 +5491,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
             if (freshKey) {
               log.info(`Chat[${reqId}]: DEVIN_CONNECT re-login recovered token, retrying once`);
               try {
-                const out = await toChatCompletion({ ...connectParams, token: freshKey }, connectMeta);
+                const out = await toChatCompletion({ ...connectParams, token: freshKey }, meta);
                 finalizeConnectAccount(a, { model: connectDisplayModel, selector, startTime: ccStart, err: null, credentialKey: freshKey });
                 return { kind: 'ok', out };
               } catch (retryErr) {
@@ -4999,40 +5566,59 @@ async function _handleChatCompletionsInner(body, context = {}) {
       if (acct) triedKeys.push(acct.apiKey);
       const r = await attempt(acct);
       if (r.kind === 'ok') {
+        // The upstream work completed even when cancellation won the delivery
+        // race. Keep its usage/spend (and attempt()'s finalization) exactly once
+        // before checking whether this caller can receive the result. Both the
+        // initial success and the re-login retry converge here.
+        try { recordTokenUsage(r.out?.body?.usage, r.out?.body?.model || connectDisplayModel); } catch {}
+        try { recordAccountSpend(acct, r.out?.body?.usage, connectSpendOpts(r.out?.body?._windsurf_billing)); } catch {}
+        if (context.signal?.aborted) {
+          log.info(`Chat[${reqId}]: DEVIN_CONNECT non-stream completed after the client disconnected — skipping session commit, cache write and affinity`);
+          return { status: 499, body: { error: { message: 'Client closed request', type: 'client_disconnect', code: 'client_disconnect' } } };
+        }
         // V-10: a schema-constrained turn that does not conform is a failure, and
         // it must be reported BEFORE the cache write / session commit / affinity
         // pin — otherwise the next chained turn inherits a payload the caller
         // never accepted.
         const connectViolation = structuredOutputViolation(r.out?.body?.choices?.[0]?.message?.content, jsonSchema);
         if (connectViolation) {
-          log.warn(`Chat[${reqId}]: structured output does not conform (${connectViolation.path}: ${connectViolation.message}) — returning a typed failure`);
+          log.warn(`Chat[${reqId}]: structured output ${connectViolation.unable ? 'could not be validated' : 'does not conform'} (${connectViolation.path}: ${connectViolation.message}) — returning a typed failure`);
           return structuredOutputError(connectViolation);
         }
+        // B2: "upstream billed us" and "the answer is reusable" are different
+        // verdicts. A turn that ended in error (or never named a terminal at
+        // all) keeps its usage/spend above but must not be cached, committed
+        // to the session chain, or pinned as affinity — a retry has to reach
+        // the upstream again instead of replaying the failed half-answer.
+        const connectTerminalOk = ['stop', 'length', 'tool_calls', 'content_filter', 'refusal']
+          .includes(r.out?.body?.choices?.[0]?.finish_reason);
+        if (!connectTerminalOk) {
+          log.warn(`Chat[${reqId}]: DEVIN_CONNECT turn finished ${r.out?.body?.choices?.[0]?.finish_reason || 'with no terminal'} — keeping usage, skipping cache/affinity/session commit`);
+          return restoreOutToolNames(r.out);
+        }
         // Same cache-affinity pin as the streaming path above.
-        bindConnectSticky(callerKey, acct, selector);
-        // Feed the dashboard token-usage breakdown from the DEVIN_CONNECT path
-        // too. Without this the non-stream connect responses never reached
-        // recordTokenUsage (only the cascade paths did), so the "Token 用量分布"
-        // card stayed empty on connect-only deployments (homecloud). Safe no-op
-        // when usage is absent (recordTokenUsage guards null).
-        // The adapter stamps the SERVED name on the body; the fallback is the same
-        // attribution name the stream arm and finalizeConnectAccount use (P2-6).
-        try { recordTokenUsage(r.out?.body?.usage, r.out?.body?.model || connectDisplayModel); } catch {}
-        // K8: per-account lifetime spend (non-stream connect path).
-        try { recordAccountSpend(acct, r.out?.body?.usage, connectSpendOpts(r.out?.body?._windsurf_billing)); } catch {}
+        bindConnectSticky(callerKey, acct, selector, r.out?.body?.usage ?? null);
         // Session continuity: commit the completed request→response pair so the
         // next turn resolves to this session_id via pair-chain overlap. The
         // response tool_calls already ride the OpenAI function shape here.
         // Gate-checked + best-effort (no-op when reuse is off).
-        try {
-          const msg = r.out?.body?.choices?.[0]?.message;
-          const commitMsgs = [...connectMessages, {
-            role: 'assistant',
-            content: msg?.content || '',
-            ...(msg?.tool_calls ? { tool_calls: msg.tool_calls } : {}),
-          }];
-          commitConnectSession(callerKey || '', commitMsgs, undefined, { reasoning: msg?.reasoning_content || incomingConnectReasoning });
-        } catch { /* session commit is best-effort */ }
+        //
+        // This runs BEFORE `restoreOutToolNames` on purpose. `canonicalize()` hashes
+        // the tool name, and the NEXT turn's `connectMessages` carries the WIRE
+        // spelling (this handler renames history before the wire). Committing the
+        // caller's spelling here made the pair never match, so a new session_id was
+        // minted after every rewritten tool call.
+        if (connectParams.sessionId) {
+          try {
+            const msg = r.out?.body?.choices?.[0]?.message;
+            const commitMsgs = [...continuityMessages, {
+              role: 'assistant',
+              content: msg?.content || '',
+              ...(msg?.tool_calls ? { tool_calls: msg.tool_calls } : {}),
+            }];
+            commitConnectSession(callerKey, connectSession, commitMsgs, undefined, { reasoning: msg?.reasoning_content || incomingConnectReasoning });
+          } catch { /* session commit is best-effort */ }
+        }
         // [STREAM-CACHE] store non-stream text + usage BEFORE the return
         // (code after return is unreachable).
         try {
@@ -5040,11 +5626,13 @@ async function _handleChatCompletionsInner(body, context = {}) {
           const _nTxt = _nMsg?.content;
           if (__sCkey && typeof _nTxt === 'string' && _nTxt && !(_nMsg?.tool_calls?.length)) {
             const _nSt = applyStop(_nTxt, normalizeStop(body.stop));
-            cacheSet(__sCkey, { text: _nSt.hit ? _nSt.text : _nTxt, thinking: _nMsg?.reasoning_content || '', stop: _nSt.hit ? _nSt.stop : (r.out?.stop || null), finishReason: r.out?.body?.choices?.[0]?.finish_reason || null, displayModel: connectDisplayModel, usage: r.out?.body?.usage || null });
-            log.info('[STREAM-CACHE-STORE] ckey=' + __sCkey);
+            cacheSet(__sCkey, { text: _nSt.hit ? _nSt.text : _nTxt, thinking: _nMsg?.reasoning_content || '', stop: _nSt.hit ? _nSt.stop : (r.out?.stop || null), finishReason: r.out?.body?.choices?.[0]?.finish_reason || null, displayModel: connectDisplayModel, usage: r.out?.body?.usage || null }, cacheWriteGeneration);
+            log.info('[STREAM-CACHE-STORE] attempted ckey=' + __sCkey);
           }
         } catch (e) { log.info('[STREAM-CACHE-ERR] store ' + (e && e.message)); }
-        return r.out;
+        // G1 client leg: everything above (pair-chain, cache, billing) has already
+        // consumed the response, so restore the caller's own tool names last.
+        return restoreOutToolNames(r.out);
       }
       if (r.kind === 'abort') {
         log.info(`Chat[${reqId}]: DEVIN_CONNECT non-stream aborted (client gone) — not failing over`);
@@ -5059,7 +5647,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
         // a 402/429 while healthy accounts sit idle. Non-stream is always replay-safe
         // (nothing reached the client yet). Exhausted pool → fall through to surface.
         if (isAccountFailoverError(r.err.code) && hops < maxHops) {
-          const next = await acquireConnectFailover(triedKeys, context.signal, callerKey, selector, context.budget || null);
+          const next = await acquireConnectFailover(triedKeys, context.signal, callerKey, selector, context.budget || null, { freeOnly: freeOnlyDroughtAdmission });
           if (next) {
             log.info(`Chat[${reqId}]: DEVIN_CONNECT ${r.err.code} on account → failover hop ${hops + 1} to next pooled account`);
             bumpConnect(r.err.code === 'SELECTOR_NOT_ELIGIBLE' ? 'selector_failover_hops' : 'quota_failover_hops');
@@ -5072,12 +5660,28 @@ async function _handleChatCompletionsInner(body, context = {}) {
         // as 401, and a rate limit as 429 — not a blanket 502.
         const { status, type } = connectErrorToHttp(r.err.code);
         log.error(`Chat[${reqId}]: DEVIN_CONNECT error (${r.err.code || 'UPSTREAM_ERROR'} -> ${status}): ${r.err.message}`);
-        return { status, body: { error: {
-          message: r.err.message,
-          type,
-          code: r.err.code || null,
-          ...(r.err.param ? { param: r.err.param } : {}),
-        } } };
+        // F3: a provider-declared reset window on a rate limit is a usable wait
+        // hint. Advertise it on the real 429 the same way the streaming path
+        // already does: header and body carry ONE clamped value (whole seconds
+        // via clientRetryAfterSeconds); the body field is that same value in ms.
+        // No hint (missing/non-positive resetMs) keeps the historical body and
+        // header set untouched.
+        const hintedMs = r.err.code === 'RATE_LIMITED'
+          && Number.isFinite(r.err.resetMs) && r.err.resetMs > 0
+          ? r.err.resetMs
+          : null;
+        const retryAfterSec = hintedMs ? clientRetryAfterSeconds(hintedMs) : null;
+        return {
+          status,
+          ...(retryAfterSec ? { headers: { 'Retry-After': String(retryAfterSec) } } : {}),
+          body: { error: {
+            message: r.err.message,
+            type,
+            code: r.err.code || null,
+            ...(r.err.param ? { param: r.err.param } : {}),
+            ...(retryAfterSec ? { retry_after_ms: retryAfterSec * 1000 } : {}),
+          } },
+        };
       }
       // r.kind === 'dead' — the session token couldn't be revived on this account.
       if (acct) reportDeadToken(currentApiKeyForId(acct.id, acct.apiKey));
@@ -5092,7 +5696,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
         bumpConnect('failover_exhausted');
         return { status, body: { error: { message: 'all DEVIN_CONNECT accounts exhausted (dead session tokens)', type, code: 'UNAUTHORIZED' } } };
       }
-      const next = await acquireConnectFailover(triedKeys, context.signal, callerKey, selector, context.budget || null);
+      const next = await acquireConnectFailover(triedKeys, context.signal, callerKey, selector, context.budget || null, { freeOnly: freeOnlyDroughtAdmission });
       if (!next) {
         const { status, type } = connectErrorToHttp('UNAUTHORIZED');
         log.error(`Chat[${reqId}]: DEVIN_CONNECT no more pooled accounts for failover`);
@@ -5141,8 +5745,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
       created: Math.floor(Date.now() / 1000),
       model: displayModel,
       modelKey: routingModelKey,
+      requestId: reqId,
       messages,
       callerKey,
+      signal: context.signal,
+      budget: context.budget,
     }, context.specialAgent || {});
   }
 
@@ -5574,8 +6181,15 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // Anything else computes fresh. This is an optimisation, never a behaviour change.
   const reuseOriginalCkey = typeof context.__originalCkey === 'string'
     && context.__originalCkey
-    && !context.__fallbackAttempt;
-  const ckey = reuseOriginalCkey ? context.__originalCkey : cacheKey(body, callerKey);
+    && !context.__fallbackAttempt
+    // B1: an access-policy retarget happens after the outer key was computed,
+    // so that key describes the BLOCKED spelling, not the served generation.
+    && !accessFallbackModel;
+  // BLUE-CACHE P2: a fresh computation carries the effective routed identity so
+  // lookup and store describe the generation this (possibly fallback-rewritten)
+  // body dispatches to. The reused outer key was computed from the SAME body by
+  // cascadeCacheIdentity, so the two agree for non-fallback requests.
+  const ckey = reuseOriginalCkey ? context.__originalCkey : cacheKey(body, callerKey, cascadeCacheIdentity(body, routingModelKey), context.keepReasoningSeparate === true);
   // SEC-W2: only share the response cache ACROSS requests when the caller has a
   // trustworthy per-user scope. A guessed `:client:` bucket (shared key behind a
   // proxy) must never serve one user's cached answer to another — treat it as
@@ -5623,6 +6237,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       waitForAccount: waitForAccountFn,
       cachePolicy,
       wantThinking,
+      keepReasoningSeparate,
       // V-10: the JSON Schema the caller constrained this turn to, if any. The
       // stream buffers JSON content anyway, so a non-conforming payload can still
       // be reported honestly instead of closed as a clean stop.
@@ -5661,6 +6276,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
 
   // ── Local response cache (exact body match) ─────────────
   // SEC-W2: skip cross-request cache reads for an untrusted (guessed) scope.
+  const cacheWriteGeneration = cacheShareable && ckey ? captureCacheGeneration() : null;
   const cached = cacheShareable ? cacheGet(ckey) : null;
   if (cached) {
     log.info(`Chat: cache HIT model=${displayModel} flow=non-stream`);
@@ -5674,7 +6290,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
     const cachedText = replayed.hit ? replayed.text : (cached.text || '');
     const message = { role: 'assistant', content: cachedText || null };
     if (cached.thinking) message.reasoning_content = cached.thinking;
-    const choice = { index: 0, message, finish_reason: 'stop' };
+    // C1: replay the recorded terminal — a stored `length` truncation is not a
+    // clean `stop`.
+    const choice = { index: 0, message, finish_reason: cached.finishReason || 'stop' };
     if (context.__messagesStopCarrier === true && cachedStop) choice._windsurf_stop_sequence = cachedStop;
     return {
       status: 200,
@@ -5805,7 +6423,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
         return {
           status: 429,
           headers: { 'Retry-After': String(clientRetryAfterSeconds(exhausted.retryAfterMs)) },
-          body: { error: { message: `${displayModel} 账号队列耗尽: ${exhausted.reason}`, type: 'rate_limit_exceeded', retry_after_ms: exhausted.retryAfterMs } },
+          body: { error: { message: `${displayModel} 账号队列耗尽: ${exhausted.reason}`, type: 'rate_limit_exceeded', retry_after_ms: clientRetryAfterSeconds(exhausted.retryAfterMs) * 1000 } },
         };
       }
       // GAP-2: thread the request signal into the queue wait so a disconnected
@@ -5835,7 +6453,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
             // A busy (not limited) pool also frees on the queue cadence, so the
             // 503 arm carries the same hint as the 429 arm.
             headers: { 'Retry-After': String(clientRetryAfterSeconds(retryAfterMs)) },
-            body: { error: { message: `${displayModel} 账号队列超时: ${reason}`, type: (tempUnavail.allUnavailable || rateLimited.allLimited) ? 'rate_limit_exceeded' : 'pool_exhausted', retry_after_ms: retryAfterMs } },
+            body: { error: { message: `${displayModel} 账号队列超时: ${reason}`, type: (tempUnavail.allUnavailable || rateLimited.allLimited) ? 'rate_limit_exceeded' : 'pool_exhausted', retry_after_ms: clientRetryAfterSeconds(retryAfterMs) * 1000 } },
           };
           // v2.0.84 (#118 0a00) — pool-wide rate limit on a high-effort
           // variant (`-max` / `-xhigh`)? Suggest the same-base lower-
@@ -5926,7 +6544,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // nonStreamResponse neither reads nor writes the shared response cache
       // (its cacheSet is gated on ckey truthiness). Guessed `:client:` buckets
       // stay cache-private → no cross-tenant answer leak behind a shared proxy.
-      useCascade, acct.apiKey, cacheShareable ? ckey : null,
+      useCascade, acct.apiKey, cacheShareable ? ckey : null, cacheWriteGeneration,
       // v2.0.87 (#129) — aliasModelKey is set by the outer wrapper
       // when this handler is the second pass of an auto-fallback
       // retry; it carries the ORIGINAL model name the client asked
@@ -5966,6 +6584,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       jsonSchema,
       // V-14: the caller's completion controls (max_tokens), for the local cap.
       cascadeCompletion,
+      keepReasoningSeparate,
     );
     // Classify the entry's health BEFORE the abort branch can return: a 504 /
     // deadline verdict (or an explicit not_found) marks the cascade half-broken,
@@ -6111,7 +6730,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   const temporaryUnavailable = isAllTemporarilyUnavailable(routingModelKey);
   if (temporaryUnavailable.allUnavailable) {
     restoreCheckedOutReuse('temporary unavailability');
-    const retryAfterSec = Math.ceil(temporaryUnavailable.retryAfterMs / 1000);
+    const retryAfterSec = clientRetryAfterSeconds(temporaryUnavailable.retryAfterMs);
     return {
       status: 429,
       headers: { 'Retry-After': String(retryAfterSec) },
@@ -6119,7 +6738,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
         error: {
           message: `${displayModel} 所有账号暂时不可用，请 ${retryAfterSec} 秒后重试`,
           type: 'rate_limit_exceeded',
-          retry_after_ms: temporaryUnavailable.retryAfterMs,
+          retry_after_ms: retryAfterSec * 1000,
         },
       },
     };
@@ -6128,8 +6747,8 @@ async function _handleChatCompletionsInner(body, context = {}) {
     const rl = isAllRateLimited(routingModelKey);
     if (rl.allLimited) {
       restoreCheckedOutReuse('rate limit');
-      const retryAfterSec = Math.ceil(rl.retryAfterMs / 1000);
-      return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${displayModel} 所有账号均已达速率限制，请 ${retryAfterSec} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs } } };
+      const retryAfterSec = clientRetryAfterSeconds(rl.retryAfterMs);
+      return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${displayModel} 所有账号均已达速率限制，请 ${retryAfterSec} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: retryAfterSec * 1000 } } };
     }
   }
   if (!restoreCheckedOutReuse('failed request') && reuseEntryDead) {
@@ -6138,7 +6757,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null, clineCompatActive = false, allowCascadeMetadataUnwrap = true, stopSequences = [], stopCarrier = false, signal = null, budget = null, accountId = '', jsonSchema = null, completion = null) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, cacheWriteGeneration, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null, clineCompatActive = false, allowCascadeMetadataUnwrap = true, stopSequences = [], stopCarrier = false, signal = null, budget = null, accountId = '', jsonSchema = null, completion = null, keepReasoningSeparate = false) {
   const startTime = Date.now();
   const nativeBridgeOn = !!nativeOpts?.enabled;
   // V-14: local enforcement of the caller's output cap. The wire field is a
@@ -6641,7 +7260,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       // answering 200 with a body the caller's own validator rejects.
       const violation = structuredOutputViolation(allText, jsonSchema);
       if (violation) {
-        log.warn(`Chat[${reqId}]: structured output does not conform (${violation.path}: ${violation.message}) — returning a typed failure`);
+        log.warn(`Chat[${reqId}]: structured output ${violation.unable ? 'could not be validated' : 'does not conform'} (${violation.path}: ${violation.message}) — returning a typed failure`);
         try { recordRequest(model, false, Date.now() - startTime, accountId); } catch {}
         return structuredOutputError(violation);
       }
@@ -6657,6 +7276,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     if (shouldFallbackThinkingToText({
       routingModelKey: modelKey,
       wantThinking,
+      keepReasoningSeparate,
       accText: allText,
       accThinking: allThinking,
       hasToolCalls: toolCalls.length > 0,
@@ -6783,13 +7403,16 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       };
     }
 
+    const finishReason = outputCapReached ? 'length' : (toolCalls.length ? 'tool_calls' : 'stop');
     if (ckey && !toolCalls.length) {
       // SEED-C3b: cache the VISIBLE (post-stop) text together with the local stop
       // cause, so a replay reproduces both the truncated answer and the
       // `stop_sequence` metadata the Messages route derives from it.
-      cacheSet(ckey, { text: allText, thinking: allThinking, stop: localStop });
+      // C1: store the real terminal with the text — a `length` truncation must
+      // replay as `length`, not as a fabricated `stop`.
+      cacheSet(ckey, { text: allText, thinking: allThinking, stop: localStop, finishReason }, cacheWriteGeneration);
       if (aliasCkey && aliasCkey !== ckey) {
-        cacheSet(aliasCkey, { text: allText, thinking: allThinking, stop: localStop });
+        cacheSet(aliasCkey, { text: allText, thinking: allThinking, stop: localStop, finishReason }, cacheWriteGeneration);
       }
     }
 
@@ -6828,7 +7451,6 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // owns the row; apiKey is only the credential the attempt presented and may
     // have rotated while this turn was in flight (review #3).
     try { recordAccountSpend({ accountId, apiKey }, usage); } catch {}
-    const finishReason = outputCapReached ? 'length' : (toolCalls.length ? 'tool_calls' : 'stop');
     const choice = { index: 0, message, finish_reason: finishReason };
     // SEED-C3a carrier on the internal Messages route only (same contract as the
     // Connect adapter): the exact sequence that truncated the visible prose. A
@@ -6940,7 +7562,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // Rate limits → 429 with Retry-After; model errors → 403; others → 502
     if (isRateLimit) {
       const rl = isAllRateLimited(modelKey);
-      const retryMs = rl.retryAfterMs || 60000;
+      const retryMs = boundedClientResetMs(rl.retryAfterMs) || 60000;
       return {
         status: 429,
         headers: { 'Retry-After': String(Math.ceil(retryMs / 1000)) },
@@ -7078,12 +7700,13 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       // It is also what makes the producer's handle switch from "admit a new
       // entry" to "release the claimed entry back to running" on a re-detach.
       let resumeClaim = null;
-      // Port of the LS lease acquired for a claimed resume. Ownership moves to
-      // the producer at the `leaseHeld` call; until then this handler's finally
-      // is the only release, so a synchronous throw between `beginLsUse` and
-      // the producer cannot leak `activeRequests` (which would pin the entry
-      // from idle reaping and maintenance).
-      let resumeLeasePort = null;
+      // The handler owns this request hold until the producer takes it.
+      let resumeLease = null;
+      const takeResumeLease = () => {
+        const lease = resumeLease;
+        resumeLease = null;
+        return lease;
+      };
       // Delivery ledger: every tool call that reached the client — native
       // bridge, emulated <tool_call> markup, NLU recovery, or a tail lift from
       // thinking — is pushed here before its delta is written. The producer
@@ -7257,6 +7880,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
 
       // ── Cache hit: replay stored response as a fake stream ──
       // SEC-W2: skip cross-request cache reads for an untrusted (guessed) scope.
+      const cacheWriteGeneration = cacheShareable && ckey ? cacheGeneration() : null;
       const cached = cacheShareable ? cacheGet(ckey) : null;
       if (cached) {
         log.info(`Chat: cache HIT model=${model} flow=stream`);
@@ -7283,7 +7907,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             await send({ id, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: { content: replayedText }, finish_reason: null }] });
           }
-          const replayChoice = { index: 0, delta: {}, finish_reason: 'stop' };
+          const replayChoice = { index: 0, delta: {}, finish_reason: cached.finishReason || 'stop' };
           if (deps.context?.__messagesStopCarrier === true && cachedStop) replayChoice._windsurf_stop_sequence = cachedStop;
           await send({ id, object: 'chat.completion.chunk', created, model,
             choices: [replayChoice] });
@@ -7781,16 +8405,17 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               } else {
                 // The request lease covers this request only. The entry itself
                 // pins no lease, so between detach and claim the LS is free to
-                // be reaped; the re-read of the generation from the object
-                // beginLsUse returned catches a restart in that window.
+                // be reaped; the handle `beginLsUse` returns binds to the
+                // entry it acquired, and its generation catches a restart in
+                // that window.
                 const leased = beginLsUseFn(found.pin.lsPort);
-                if (leased) resumeLeasePort = found.pin.lsPort;
+                if (leased) resumeLease = leased;
                 const leaseMismatch = leased && found.pin.lsGeneration != null
                   && leased.generation !== found.pin.lsGeneration;
                 if (!leased || leaseMismatch) {
                   if (leased) {
-                    endLsUseFn(found.pin.lsPort);
-                    resumeLeasePort = null;
+                    endLsUseFn(leased);
+                    resumeLease = null;
                   }
                   detachedRegistry.evict(detachKeyValue, 'resume_miss', found);
                 } else {
@@ -7800,13 +8425,13 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                       key: detachKeyValue,
                       token: claimed.token,
                       entry: claimed.entry,
-                      lsEntry: leased,
+                      lsEntry: leased.entry,
                     };
                     log.info(`Chat[${reqId}]: detached turn CLAIMED cascade=${String(found.pin.cascadeId).slice(0, 8)}… stepOffset=${claimed.entry.snapshot.stepOffset}`);
                   } else {
                     // Busy / expired between lookup and claim: stay foreground.
-                    endLsUseFn(found.pin.lsPort);
-                    resumeLeasePort = null;
+                    endLsUseFn(leased);
+                    resumeLease = null;
                   }
                 }
               }
@@ -7909,7 +8534,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               log.info(`Chat[${reqId}]: stream pool exhausted at admission (retry_after=${exhausted.retryAfterMs}ms) → fast-fail`);
               lastErr = Object.assign(new Error(`${model} 账号队列耗尽: ${exhausted.reason}`), {
                 type: 'rate_limit_exceeded',
-                retry_after_ms: exhausted.retryAfterMs,
+                retry_after_ms: clientRetryAfterSeconds(exhausted.retryAfterMs) * 1000,
                 status: 429,
               });
               break;
@@ -8005,10 +8630,8 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
 
           let ls;
           if (resumeAttempt) {
-            // The claim already holds a request lease on this LS entry; the
-            // producer runs with `leaseHeld: true` and releases it in its
-            // finally. No ensureLs: the entry exists and was generation-
-            // checked, and a fresh spawn would not own the cascade anyway.
+            // The claim already holds a request lease on this LS entry.
+            // Use the generation-checked entry that owns the cascade.
             ls = resumeClaim.lsEntry;
           } else {
             try { await ensureLsFn(acct.proxy); } catch (e) {
@@ -8055,15 +8678,10 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             resumeClaim = null;
             // The claim acquired this request's lease; no producer ran to
             // release it.
-            endLsUseFn(ls.port);
-            resumeLeasePort = null;
+            endLsUseFn(resumeLease);
+            resumeLease = null;
             continue;
           }
-          // Ownership of the request lease transfers to the producer here:
-          // cascadeChat's own finally releases exactly this hold (leaseHeld),
-          // including when it throws synchronously before its first await. The
-          // handler finally below no longer releases it.
-          if (resumeAttempt && useCascade) resumeLeasePort = null;
           try {
             if (useCascade) {
               cascadeResult = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, {
@@ -8087,7 +8705,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                         ownsClaim: () => !!resumeClaim
                           && detachedRegistry.owns(resumeClaim.key, resumeClaim.token),
                       },
-                      leaseHeld: true,
+                      takeLease: takeResumeLease,
                       maxWaitMs: resumeMaxWaitMs,
                       detach: detachHandle,
                       acquireLease: acquireLsUseFn,
@@ -8501,7 +9119,10 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               const turnComplete = appendAssistantTurn(messages, accText, collectedToolCalls);
               const fpAfter = fingerprintAfter(turnComplete, modelKey, callerKey, fpOpts);
               const ttlHint = ttlHintFromCachePolicy(cachePolicy);
-              poolCheckin(fpAfter, {
+              // This pool is only a reusable-description Map, not an account
+              // reservation or LS lease. Snapshot the successful turn now;
+              // translated routes publish it only after their terminal passes.
+              const completedPoolEntry = {
                 cascadeId: cascadeResult.cascadeId,
                 sessionId: cascadeResult.sessionId,
                 lsPort: ls.port,
@@ -8512,12 +9133,15 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 generatorOffset: Number.isFinite(cascadeResult.generatorOffset) ? cascadeResult.generatorOffset : reuseEntry?.generatorOffset,
                 historyCoverage: cascadeResult.historyCoverage || reuseEntry?.historyCoverage || null,
                 createdAt: reuseEntry?.createdAt,
-              }, callerKey, ttlHint === undefined ? 0 : ttlHint);
-
-              // Bind caller to this account for the next turn
-              if (callerKey && isStickyEnabled() && acct) {
-                setStickyBinding(callerKey, modelKey, acct.id, acct.apiKey);
-              }
+              };
+              const completedAccount = acct ? { id: acct.id, apiKey: acct.apiKey } : null;
+              publishStreamDelivery(deps.context, () => {
+                poolCheckin(fpAfter, completedPoolEntry, callerKey, ttlHint === undefined ? 0 : ttlHint);
+                // Bind caller to this account for the next turn.
+                if (callerKey && isStickyEnabled() && completedAccount) {
+                  setStickyBinding(callerKey, modelKey, completedAccount.id, completedAccount.apiKey);
+                }
+              });
             }
             // success — P2-1: same identity split as the non-stream twin
             // (nonStreamResponse). `currentApiKey` is the per-attempt snapshot;
@@ -8562,15 +9186,12 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               // finish_reason:'stop', which would tell the caller its schema held.
               const violation = structuredOutputViolation(cleaned, deps.jsonSchema);
               if (violation) {
-                log.warn(`Chat[${reqId}]: structured output does not conform (${violation.path}: ${violation.message}) — closing with a typed error`);
+                const failure = structuredOutputFailure(violation);
+                log.warn(`Chat[${reqId}]: structured output ${violation.unable ? 'could not be validated' : 'does not conform'} (${violation.path}: ${violation.message}) — closing with a typed error`);
                 try {
                   await settleWriter();
                   if (!writerGone()) {
-                    await send(chatStreamError(
-                      `The model's answer does not conform to the requested JSON Schema (${violation.path}: ${violation.message}).`,
-                      'server_error',
-                      'STRUCTURED_OUTPUT_NOT_CONFORMING',
-                    ));
+                    await send(chatStreamError(failure.message, 'server_error', failure.code));
                   }
                   // The upstream turn really ran; bill it even though the answer
                   // is unusable. No cache write and no [DONE]: this is a failure.
@@ -8593,6 +9214,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             const thinkingPromotedToText = shouldFallbackThinkingToText({
               routingModelKey: modelKey,
               wantThinking: deps.wantThinking,
+              keepReasoningSeparate: deps.keepReasoningSeparate === true,
               accText,
               accThinking,
               hasToolCalls: collectedToolCalls.length > 0,
@@ -8705,10 +9327,17 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               // A capped turn caches what was DELIVERED, exactly like a stopped
               // one: replaying bytes the client never received would change the
               // answer between the first and second identical request.
-              cacheSet(ckey, { text: (stopMatched || outputCapReached) ? visibleText : accText, thinking: accThinking, stop: stopMatched });
+              const completedCacheEntry = { text: (stopMatched || outputCapReached) ? visibleText : accText, thinking: accThinking, stop: stopMatched,
+                // C1: keep the real terminal — a capped turn replays as `length`,
+                // not as a fabricated `stop`.
+                finishReason: outputCapReached ? 'length' : (collectedToolCalls.length ? 'tool_calls' : 'stop') };
+              publishStreamDelivery(deps.context, () => cacheSet(ckey, completedCacheEntry, cacheWriteGeneration));
             }
             return;
           } catch (err) {
+            // Release a hold left by a producer that never accepted it before
+            // the handler handles the failure or begins a fresh attempt.
+            if (resumeLease) endLsUseFn(takeResumeLease());
             // A client disconnect is not a turn failure. cascadeChat raises
             // AbortError when its signal fired mid-poll; rawGetChatMessage
             // rejects with the same shape from grpcStream. Stop here — no
@@ -9028,6 +9657,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             accThinking = '';
             const thinkingAsText = shouldFallbackThinkingToText({
               routingModelKey: modelKey, wantThinking: !!deps.wantThinking,
+              keepReasoningSeparate: deps.keepReasoningSeparate === true,
               accText, accThinking: bufferedThinking, hasToolCalls: collectedToolCalls.length > 0,
             });
             if (thinkingAsText) {
@@ -9115,7 +9745,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                   message: errMsg,
                   type: errType,
                   code: errCode,
-                  ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}),
+                  ...clientResetFields(retryAfterMs),
                 } });
             });
             await failureStage('partial-log', () => {
@@ -9156,10 +9786,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         // A resume claim that never reached the producer still holds this
         // request's LS lease; release it here so a throw cannot pin the entry
         // from idle reaping/maintenance.
-        if (resumeLeasePort != null) {
-          endLsUseFn(resumeLeasePort);
-          resumeLeasePort = null;
-        }
+        if (resumeLease) endLsUseFn(takeResumeLease());
         // Safety net: every normal path above releases its claim (served or
         // running). A claim that survives to here means an early return or a
         // throw took a path that did not; re-detach with the frozen snapshot
@@ -9177,4 +9804,4 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
 // path funnels through (connect via acquireConnectAccount, both cascade paths directly),
 // so queue-on-pin is tested by driving it end to end rather than by re-implementing the
 // wait loop in a fixture — a fixture would pass while the real hook was wired wrong.
-export const __testing = { waitForAccount, waitForOwnPin };
+export const __testing = { waitForAccount, waitForOwnPin, streamResponse };

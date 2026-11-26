@@ -29,6 +29,7 @@ import { applyStop, StopSequenceGate } from './stop-sequences.js';
 import { normalizeToolCallArgs, recordArgRepair } from './handlers/cline-compat.js';
 import { ThinkTextClassifier } from './response-classifier.js';
 import { budgetExceededError } from './request-budget.js';
+import { observeApplyPatch } from './apply-patch-diagnostic.js';
 import { bumpConnect } from './devin-connect-metrics.js';
 import { toClientToolCallId, restoreUpstreamToolIds } from './tool-ids.js';
 
@@ -414,7 +415,11 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
         ),
       }
       : upstreamParams;
-    for await (const ev of streamChatImpl(callParams)) {
+    // Observe the final selector after budget admission, for each adapter dispatch.
+    const onTransportObservation = opts.onDispatch?.(callParams.model, opts.dispatchAccountId);
+    const observedParams = typeof onTransportObservation === 'function'
+      ? { ...callParams, onTransportObservation } : callParams;
+    for await (const ev of streamChatImpl(observedParams)) {
       if ((ev.type === 'content' || ev.type === 'reasoning') && leakTraceEnabled(env)) {
         log.info('LEAK_TRACE stream-event', {
           channel: ev.type,
@@ -604,6 +609,11 @@ function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }
 
+function nativeToolForChat(tc) {
+  observeApplyPatch(tc.name, tc.arguments, tc.invalidJson, 'native');
+  return { id: tc.id, name: tc.name, argumentsJson: tc.arguments };
+}
+
 /**
  * Collect a full DEVIN_CONNECT completion and shape it as a non-streaming
  * `chat.completion` object.
@@ -620,6 +630,7 @@ function nowSeconds() {
  */
 export async function toChatCompletion(params, opts = {}) {
   const { id = newId(), created = nowSeconds(), displayModel, maxRetries = 1, retryBaseMs = 400, emulateTools = false, stop = null, clineCompat = false, stopCarrier = false, budget = null } = opts;
+  const keepReasoningSeparate = opts.keepReasoningSeparate === true;
   const model = displayModel || params.model;
 
   // Non-stream path buffers the whole answer, so a transient failure (network
@@ -632,6 +643,12 @@ export async function toChatCompletion(params, opts = {}) {
   let signedSegment = false;
   let multipleSignedSegments = false;
   let finishReason = 'stop';
+  // The upstream ended the stream without ever naming a stop reason (devin-connect
+  // raises `reason:'error'` + `unterminated:true` for a delivered payload with no
+  // #5). Remembered separately because the tool-call arms below overwrite
+  // finishReason with 'tool_calls' whenever a call exists — which would report a
+  // turn whose arguments were never validated as a clean, executable finish.
+  let finishUnterminated = false;
   let usage = null;
   // Per-request billing detail (credit / ACU cost) when the operator has calibrated
   // DEVIN_CONNECT_BILLING_TAGS. devin-connect.js has always yielded this on the
@@ -644,11 +661,11 @@ export async function toChatCompletion(params, opts = {}) {
   let nativeToolCalls = [];
   for (let attempt = 0; ; attempt++) {
     try {
-      content = ''; reasoning = ''; reasoningSignature = ''; signedSegment = false; multipleSignedSegments = false; finishReason = 'stop'; usage = null; nativeToolCalls = [];
+      content = ''; reasoning = ''; reasoningSignature = ''; signedSegment = false; multipleSignedSegments = false; finishReason = 'stop'; finishUnterminated = false; usage = null; nativeToolCalls = [];
       for await (const ev of streamChatWithEmptyRetry(params, undefined, opts)) {
         // A rescue attempt REPLACES the previous one; drop what it produced or the
         // client is handed every attempt concatenated.
-        if (ev.type === 'attempt_reset') { content = ''; reasoning = ''; reasoningSignature = ''; signedSegment = false; multipleSignedSegments = false; nativeToolCalls = []; billing = null; continue; }
+        if (ev.type === 'attempt_reset') { content = ''; reasoning = ''; reasoningSignature = ''; signedSegment = false; multipleSignedSegments = false; nativeToolCalls = []; finishUnterminated = false; billing = null; continue; }
         if (ev.type === 'content') content += ev.text;
         else if (ev.type === 'reasoning') {
           if (signedSegment) multipleSignedSegments = true;
@@ -663,6 +680,7 @@ export async function toChatCompletion(params, opts = {}) {
         }
         else if (ev.type === 'finish') {
           if (ev.reason) finishReason = ev.reason;
+          if (ev.unterminated === true) finishUnterminated = true;
           if (ev.usage) usage = ev.usage;
           if (ev.billing) billing = ev.billing;
           if (ev.toolCalls && ev.toolCalls.length) nativeToolCalls = ev.toolCalls;
@@ -710,13 +728,16 @@ export async function toChatCompletion(params, opts = {}) {
   let stopHit = false;
   let matchedStop = null;
   let toolCalls = [];
+  // The upstream's OWN terminal verdict (enum 13 → 'error'), captured before the
+  // tool-call arms below, which set 'tool_calls' unconditionally whenever a call
+  // was decoded. An error turn that happened to emit a decodable call is still an
+  // error — the call's arguments are as unverified as the rest of the turn.
+  const terminalError = finishReason === 'error';
   if (nativeToolCalls.length) {
     // arguments is the raw JSON string off the wire (decodeToolCalls); map it to
     // the same shape parseToolCallsFromText produces so the message builder below
     // is source-agnostic.
-    toolCalls = nativeToolCalls.map((tc) => ({
-      id: tc.id, name: tc.name, argumentsJson: tc.arguments,
-    }));
+    toolCalls = nativeToolCalls.map(nativeToolForChat);
     finishReason = 'tool_calls';
   } else if (emulateTools) {
     const parsed = parseToolCallsFromText(content, {
@@ -754,33 +775,24 @@ export async function toChatCompletion(params, opts = {}) {
   // `<tool_call>` XML to the client as the visible answer with finish_reason='stop'.
   // The agent loop does not advance and the user sees markup, which is worse than
   // the empty turn the promotion exists to prevent.
-  let promotedReasoning = !toolCalls.length && !content && !!reasoning && !stopHit;
-  if (promotedReasoning) {
-    if (emulateTools && !stopHit) {
-      const promotedParse = parseToolCallsFromText(reasoning, {
-        modelKey: params.model, provider: null, route: 'devin_connect',
-      });
-      if (promotedParse.toolCalls.length) {
-        // M2 ToolGuard parity: only keep calls the client declared
-        const allowedCalls = filterToolCallsByAllowlist(promotedParse.toolCalls, params.tools || []);
-        // It was a tool call all along. Deliver it as one; keep any surrounding prose
-        // as content, and leave reasoning_content in place since nothing was moved
-        // out of it into the answer.
-        toolCalls = allowedCalls;
-        content = promotedParse.text;
-        finishReason = 'tool_calls';
-        promotedReasoning = false;
-      } else {
-        content = reasoning;
-      }
-    } else {
-      content = reasoning;
+  const reasoningOnly = !toolCalls.length && !content && !!reasoning && !stopHit;
+  let promotedReasoning = reasoningOnly && !keepReasoningSeparate;
+  if (reasoningOnly && emulateTools) {
+    const promotedParse = parseToolCallsFromText(reasoning, {
+      modelKey: params.model, provider: null, route: 'devin_connect',
+    });
+    if (promotedParse.toolCalls.length) {
+      // Tool recovery also applies when the caller keeps the prose marked.
+      toolCalls = filterToolCallsByAllowlist(promotedParse.toolCalls, params.tools || []);
+      if (!keepReasoningSeparate) content = promotedParse.text;
+      finishReason = 'tool_calls';
+      promotedReasoning = false;
     }
   }
 
   // Promotion creates visible prose after the first gate. Gate it at this final boundary.
   if (promotedReasoning) {
-    const stopped = applyStop(content, stop);
+    const stopped = applyStop(reasoning, stop);
     content = stopped.text;
     if (stopped.hit) { matchedStop = stopped.stop; stopHit = true; }
     if (stopHit && !toolCalls.length) finishReason = 'stop';
@@ -793,14 +805,17 @@ export async function toChatCompletion(params, opts = {}) {
   // longer a thinking block, so a signature beside it would seal nothing.
   if (reasoning && !promotedReasoning && reasoningSignature && !multipleSignedSegments) message.reasoning_signature = reasoningSignature;
   if (toolCalls.length) {
+    if (!nativeToolCalls.length) {
+      for (const tc of toolCalls) observeApplyPatch(tc.name, tc.argumentsJson ?? tc.arguments, null, 'emulated');
+    }
     message.tool_calls = toolCalls.map((tc, i) => ({
       id: toClientToolCallId(tc.id, `call_${i}_${Date.now().toString(36)}`),
       type: 'function',
       function: { name: tc.name || 'unknown', arguments: compatArgs(tc.argumentsJson || tc.arguments, clineCompat) },
     }));
-    // content is null when the turn is a tool call (the inline text is usually
-    // a hallucinated preview the caller shouldn't show).
-    message.content = null;
+    // Gemini carries separately emitted text alongside native function calls.
+    // Use the null-content compatibility shape for other tool turns.
+    if (!keepReasoningSeparate || !nativeToolCalls.length || !message.content) message.content = null;
     finishReason = 'tool_calls';
   }
 
@@ -815,6 +830,15 @@ export async function toChatCompletion(params, opts = {}) {
   // that terminal cause and the Messages route carries it as `stop_sequence`
   // (the carrier below is gated on 'stop'). Tool calls / content_filter are
   // stronger states and applyOutputCap leaves them alone.
+  //
+  // A turn the upstream ended in ERROR (enum 13) stays an error even when a
+  // decodable tool call arrived with it — the tool-call arms above would otherwise
+  // launder a failed turn into a clean, executable `tool_calls` finish. Same for a
+  // turn that never named a stop reason at all. Placed after EVERY tool-call arm so
+  // a future one cannot slip past it, and before applyOutputCap (which only
+  // upgrades 'stop').
+  if (terminalError) finishReason = 'error';
+  else if (finishUnterminated && finishReason === 'tool_calls') finishReason = 'error';
   if (!stopHit) finishReason = applyOutputCap(finishReason, usage, params.completion?.maxTokens);
 
   // #236 log-only detector — AFTER emulation and the stop gate, on the text and
@@ -880,6 +904,7 @@ export async function toChatCompletion(params, opts = {}) {
  */
 export async function streamChatCompletion(params, send, opts = {}) {
   const { id = newId(), created = nowSeconds(), displayModel, emulateTools = false, includeUsage = false, stop = null, clineCompat = false, stopCarrier = false, maxRetries = 1, retryBaseMs = 400, budget = null } = opts;
+  const keepReasoningSeparate = opts.keepReasoningSeparate === true;
   const model = displayModel || params.model;
   const base = { id, object: OBJECT_CHUNK, created, model, system_fingerprint: systemFingerprint(model) };
 
@@ -912,6 +937,10 @@ export async function streamChatCompletion(params, send, opts = {}) {
   let content = '';
   let reasoning = '';
   let finishReason = 'stop';
+  // Same guard as the non-stream twin: the tool-call arms below force
+  // finish_reason='tool_calls' whenever a call was emitted, which would label a
+  // turn the upstream never terminated as a clean, executable finish.
+  let finishUnterminated = false;
   let usage = null;
   // Exactly what the client received as visible content, after tool-markup
   // stripping and the stop gate. `content` is the RAW upstream accumulator and
@@ -963,6 +992,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
     // (structured ev.toolCalls from upstream) are trusted and pass through.
     if (filter) calls = filterToolCallsByAllowlist(calls || [], params.tools || []);
     for (const tc of calls || []) {
+      if (filter) observeApplyPatch(tc.name, tc.argumentsJson ?? tc.arguments, null, 'emulated');
       await prime(); // a tool_call is a real delta — open the message before it
       const idx = collectedToolCalls.length;
       // Normalize once, before the call is recorded: the emitted delta AND the
@@ -1031,6 +1061,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
           }
         } else if (ev.type === 'finish') {
           if (ev.reason) finishReason = ev.reason;
+          if (ev.unterminated === true) finishUnterminated = true;
           if (ev.usage) usage = ev.usage;
           if (ev.billing) streamBilling = ev.billing;
           if (ev.toolCalls && ev.toolCalls.length) nativeToolCalls = ev.toolCalls;
@@ -1055,7 +1086,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
       if (budget && !budget.canStartAttempt()) throw err;
       if (params.signal?.aborted) throw err;
       // Nothing was emitted, so a clean restart cannot duplicate output.
-      content = ''; reasoning = ''; finishReason = 'stop'; usage = null;
+      content = ''; reasoning = ''; finishReason = 'stop'; finishUnterminated = false; usage = null;
       streamBilling = null; nativeToolCalls = []; delivered = '';
       collectedToolCalls.length = 0;
       stopGate = new StopSequenceGate(stop);
@@ -1063,6 +1094,11 @@ export async function streamChatCompletion(params, send, opts = {}) {
     }
   }
 
+  // The upstream's OWN terminal verdict (enum 13 → 'error'), captured before the
+  // tool-call arms below. Those arms set 'tool_calls' unconditionally, which turned
+  // an upstream ERROR that happened to carry a decodable call into a clean,
+  // executable finish.
+  const terminalError = finishReason === 'error';
   // Drain any tool_call still buffered at end-of-stream, plus the trailing text.
   // Skip when a stop sequence already ended the stream (stopHit) — the tail after
   // the stop must not leak out.
@@ -1079,9 +1115,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // twice. Native arrives whole on the finish event, so it's emitted here rather
   // than inline — same wire shape as the emulated deltas above.
   if (nativeToolCalls.length && !collectedToolCalls.length) {
-    await emitToolCalls(nativeToolCalls.map((tc) => ({
-      id: tc.id, name: tc.name, argumentsJson: tc.arguments,
-    })), false);   // native calls are trusted (structured upstream data), no allowlist filter
+    await emitToolCalls(nativeToolCalls.map(nativeToolForChat), false);   // native calls are trusted (structured upstream data), no allowlist filter
     finishReason = 'tool_calls';
   }
 
@@ -1117,13 +1151,13 @@ export async function streamChatCompletion(params, send, opts = {}) {
       ? parseToolCallsFromText(reasoning, { modelKey: params.model, provider: null, route: 'devin_connect' })
       : { toolCalls: [], text: reasoning };
     if (promotedParse.toolCalls.length) {
-      if (promotedParse.text) await sendContent(promotedParse.text);
+      if (!keepReasoningSeparate && promotedParse.text) await sendContent(promotedParse.text);
       await emitToolCalls(promotedParse.toolCalls.map((tc) => ({
         id: tc.id, name: tc.name, argumentsJson: tc.argumentsJson ?? tc.arguments,
       })));
-      content = promotedParse.text;
+      if (!keepReasoningSeparate) content = promotedParse.text;
       finishReason = 'tool_calls';
-    } else {
+    } else if (!keepReasoningSeparate) {
       await sendContent(reasoning);
       content = reasoning;
     }
@@ -1144,6 +1178,14 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // frame still follows every delivered delta: the answer is reported as over
   // budget, never retracted or cut mid-chunk. A local stop sequence keeps
   // 'stop' (the caller asked for that cause; the carrier below depends on it).
+  // A turn the upstream ended in ERROR (enum 13) stays an error even when a
+  // decodable tool call arrived with it; a turn that never named a stop reason is
+  // not a clean tool-call finish either. The calls were already emitted as deltas
+  // (a stream cannot retract them), so the terminal frame is the only place that
+  // can say "these arguments are unverified". Without this, every tool-call arm
+  // above (`toolParser.flush`, native #6, promoted reasoning) forced 'tool_calls'.
+  if (terminalError) finishReason = 'error';
+  else if (finishUnterminated && finishReason === 'tool_calls') finishReason = 'error';
   if (!stopHit) finishReason = applyOutputCap(finishReason, usage, params.completion?.maxTokens);
 
   // #236 log-only detector — AFTER emulation and the stop gate, on what the

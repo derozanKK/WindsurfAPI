@@ -10,7 +10,8 @@
 // the error-body shape. The first integration is the OpenAI chat route.
 
 import { Buffer } from 'node:buffer';
-import { findFrameEnd, parseSseLine } from './sse-framer.js';
+import { StringDecoder } from 'node:string_decoder';
+import { findFrameEnd, parseSseLine, parseSseDataJson } from './sse-framer.js';
 import { connectErrorToHttp, normalizeOpenAIErrorType, clientRetryAfterSeconds } from './handlers/chat.js';
 
 const DEFAULT_MAX_FRAMES = 48;
@@ -65,41 +66,62 @@ function dataPayload(frame) {
   return data.join('\n');
 }
 
-function parseFrameJson(frame) {
-  try {
-    return JSON.parse(dataPayload(frame));
-  } catch {
-    return null;
-  }
+// Every JSON document a frame carries. An upstream may concatenate documents
+// on one `data:` line; `parseSseDataJson` repairs that per line. A payload that
+// starts like a JSON object but cannot be parsed into complete documents is
+// malformed — the gate must surface a typed error, never treat it as "no error
+// frame" and let the stream finish cleanly with zero content.
+function frameDocuments(frame) {
+  return parseSseDataJson(dataPayload(frame));
+}
+
+function malformedDataError() {
+  const err = new Error('Upstream sent an SSE data payload that is not valid JSON and could not be repaired');
+  // No `type`: `api_error` maps to 500 in TYPE_STATUS, but this is a transport
+  // failure (the payload could not be parsed at all), so the status must come
+  // from the unclassified-code path — 502 — and the body type is normalized
+  // from that status.
+  err.code = 'SSE_MALFORMED_JSON';
+  return err;
+}
+
+function isOpenAIBootstrapChunk(obj) {
+  // Role-only prime chunk: no content, no tool call, no finish. Holding it is
+  // safe because a client cannot observe anything from it alone.
+  if (!Array.isArray(obj?.choices) || obj.choices.length === 0) return false;
+  return obj.choices.every((c) => {
+    const d = c?.delta;
+    if (!d || c?.finish_reason) return false;
+    return Object.keys(d).every((k) => k === 'role'
+      || ((k === 'content' || k === 'reasoning' || k === 'reasoning_content') && !d[k]));
+  });
 }
 
 function isBootstrapFrame(frame, protocol, isBootstrap = null) {
   if (isCommentFrame(frame)) return true;
   if (isKeepaliveFrame(frame)) return true;
-  const obj = parseFrameJson(frame);
-  if (!obj) return false;
-  if (typeof isBootstrap === 'function') return !!isBootstrap(obj);
-  if (protocol === 'openai') {
-    // Role-only prime chunk: no content, no tool call, no finish. Holding it is
-    // safe because a client cannot observe anything from it alone.
-    if (Array.isArray(obj.choices) && obj.choices.length > 0) {
-      return obj.choices.every((c) => {
-        const d = c?.delta;
-        if (!d || c?.finish_reason) return false;
-        return Object.keys(d).every((k) => k === 'role'
-          || ((k === 'content' || k === 'reasoning' || k === 'reasoning_content') && !d[k]));
-      });
-    }
-  }
+  const { docs, malformed } = frameDocuments(frame);
+  if (malformed || !docs || docs.length === 0) return false;
+  // Every document must be bootstrap. One content document in the frame is a
+  // real payload and must commit the gate.
+  if (typeof isBootstrap === 'function') return docs.every((obj) => !!isBootstrap(obj));
+  if (protocol === 'openai') return docs.every((obj) => isOpenAIBootstrapChunk(obj));
   return false;
 }
 
 function errorFromFrame(frame, parseError = null) {
-  const obj = parseFrameJson(frame);
-  if (!obj) return null;
-  if (typeof parseError === 'function') return parseError(obj);
-  if (!obj.error || typeof obj.error !== 'object') return null;
-  return obj.error;
+  const { docs, malformed } = frameDocuments(frame);
+  if (malformed) return malformedDataError();
+  if (!docs) return null;
+  for (const obj of docs) {
+    if (typeof parseError === 'function') {
+      const parsed = parseError(obj);
+      if (parsed) return parsed;
+      continue;
+    }
+    if (obj && typeof obj === 'object' && obj.error && typeof obj.error === 'object') return obj.error;
+  }
+  return null;
 }
 
 const GRPC_STATUS = {
@@ -183,7 +205,15 @@ export function createDeferredSseResponse(realRes, {
   let pending = [];
   let pendingBytes = 0;
   let pendingFrames = 0;
-  let inspectedChars = 0;
+  // Incremental scan window (S3-F6): Buffer.concat over ALL pending buffers on
+  // every write was O(writes × pending bytes) — a keepalive stream never
+  // commits and turns the gate quadratic. `pendingText` holds only decoded
+  // text not yet consumed; StringDecoder carries a multibyte char split across
+  // writes; the window compacts once the consumed prefix exceeds 64 KiB.
+  const pendingDecoder = new StringDecoder('utf8');
+  let pendingText = '';
+  let inspectOffset = 0;
+  let bomChecked = false;
   let timer = null;
   let disposed = false;
   // O10: the first failure this stream surfaced, kept after it is delivered so
@@ -214,7 +244,8 @@ export function createDeferredSseResponse(realRes, {
     pending = [];
     pendingBytes = 0;
     pendingFrames = 0;
-    inspectedChars = 0;
+    pendingText = '';
+    inspectOffset = 0;
   };
 
   const finishError = (error) => {
@@ -237,6 +268,11 @@ export function createDeferredSseResponse(realRes, {
           message: error?.message || 'Upstream error',
           type,
           ...(error?.code ? { code: error.code } : {}),
+          // The header is already the clamped whole-second value; expose the
+          // same advertised delay in the default JSON body so a client reading
+          // only `error.retry_after_ms` cannot see a different (or missing)
+          // wait. Custom `errorBody` builders keep their own shape.
+          ...(mapped === 429 && retry ? { retry_after_ms: retry * 1000 } : {}),
         },
         ...(requestId ? { request_id: requestId } : {}),
       };
@@ -253,6 +289,11 @@ export function createDeferredSseResponse(realRes, {
       realRes.end(JSON.stringify(body));
     } catch {
       ended = true;
+      // S3-F2: a throw here (e.g. an invalid header byte) used to leave the
+      // socket half-open — `ended` flagged but nothing ever written — and the
+      // caller held the upstream slot forever. Destroy so the connection
+      // actually closes.
+      try { realRes.destroy(); } catch { /* already gone */ }
     }
   };
 
@@ -283,14 +324,18 @@ export function createDeferredSseResponse(realRes, {
   };
 
   const inspectPending = () => {
-    let text = Buffer.concat(pending).toString('utf8');
+    let text = pendingText;
     // The wire may start with a UTF-8 BOM. It stays in `pending`, so the client
     // still receives it, but it must not hide the first frame from the gate.
     // Before the gate commits, `pending` always starts at the stream start, so
-    // the BOM is always at index 0; stripping it every pass keeps
-    // `inspectedChars` in one coordinate space across writes.
-    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-    let offset = inspectedChars;
+    // the BOM is always at index 0 of the first write; checking once keeps
+    // `inspectOffset` in one coordinate space across writes.
+    if (!bomChecked && text.length > 0) {
+      bomChecked = true;
+      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+      pendingText = text;
+    }
+    let offset = inspectOffset;
     let framesSeen = 0;
     for (;;) {
       const found = findFrameEnd(text, offset);
@@ -310,9 +355,15 @@ export function createDeferredSseResponse(realRes, {
         return;
       }
       offset = found.next;
-      inspectedChars = offset;
+      inspectOffset = offset;
     }
     pendingFrames += framesSeen;
+    // Compact the consumed prefix so a long bootstrap run does not drag a
+    // growing string through every write; 64 KiB amortizes the slice.
+    if (inspectOffset > 65536) {
+      pendingText = pendingText.slice(inspectOffset);
+      inspectOffset = 0;
+    }
     // Keep holding; a later content/error frame decides. The timer is the
     // escape hatch so a silent upstream still commits a live SSE response.
     if (pendingFrames > maxFrames || pendingBytes > maxBytes) commit();
@@ -387,6 +438,7 @@ export function createDeferredSseResponse(realRes, {
       armBootstrap();
       pending.push(buf);
       pendingBytes += buf.length;
+      pendingText += pendingDecoder.write(buf);
       inspectPending();
       if (typeof cb === 'function') process.nextTick(cb);
       return true;
@@ -406,8 +458,10 @@ export function createDeferredSseResponse(realRes, {
     once(event, listener) { realRes.once(event, listener); return this; },
     removeListener(event, listener) { realRes.removeListener?.(event, listener); return this; },
     emit(event, ...args) { return realRes.emit?.(event, ...args); },
-    dispose() { disposed = true; ended = true; clearTimer(); },
-    destroy(error) { disposed = true; ended = true; clearTimer(); return realRes.destroy?.(error); },
+    // Cancellation releases the queued bytes, not just the timer: a route that
+    // aborts before commit must not keep a held burst reachable from the gate.
+    dispose() { disposed = true; ended = true; clearTimer(); pending = []; pendingBytes = 0; pendingFrames = 0; scanCarry = Buffer.alloc(0); pendingText = ''; },
+    destroy(error) { disposed = true; ended = true; clearTimer(); pending = []; pendingBytes = 0; pendingFrames = 0; scanCarry = Buffer.alloc(0); pendingText = ''; return realRes.destroy?.(error); },
     get socket() { return realRes.socket; },
   };
 }

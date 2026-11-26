@@ -1,6 +1,7 @@
 import http2 from 'http2';
 import http from 'http';
 import { readFileSync } from 'fs';
+import { redactUrlForLog } from './src/log-safety.js';
 
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '3443', 10);
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '3003', 10);
@@ -9,7 +10,8 @@ function proxy(req, res) {
   const ts = new Date().toISOString().slice(11, 19);
   const method = req.method || req.headers[':method'] || 'GET';
   const url = req.url || req.headers[':path'] || '/';
-  console.log(`[${ts}] ${method} ${url} (${req.httpVersion})`);
+  // ?key= is a documented Gemini credential carrier; never log it raw (S2-F2).
+  console.log(`[${ts}] ${method} ${redactUrlForLog(url)} (${req.httpVersion})`);
 
   // Build headers for the HTTP/1.1 backend
   const fwdHeaders = {};
@@ -28,6 +30,19 @@ function proxy(req, res) {
   if (peer) {
     const prior = req.headers['x-forwarded-for'];
     fwdHeaders['x-forwarded-for'] = prior ? `${prior}, ${peer}` : peer;
+  }
+
+  let clientGone = false;
+  function fail(error) {
+    if (clientGone || res.destroyed || res.writableEnded) return;
+    console.error(`[${ts}] Proxy error: ${error.message} (${method} ${redactUrlForLog(url)})`);
+    if (res.headersSent) {
+      // A truncated response must fail at the transport instead of ending cleanly.
+      res.destroy(error);
+      return;
+    }
+    res.writeHead(502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'Bad Gateway', type: 'proxy_error' } }));
   }
 
   const proxyReq = http.request({
@@ -56,22 +71,21 @@ function proxy(req, res) {
     // origin for every client that reaches the dashboard through this helper.
     res.writeHead(proxyRes.statusCode, respHeaders);
 
-    proxyRes.on('data', (chunk) => {
-      res.write(chunk);
-    });
-    proxyRes.on('end', () => res.end());
+    proxyRes.on('error', fail);
+    proxyRes.pipe(res);
   });
 
-  proxyReq.on('error', (e) => {
-    console.error(`[${ts}] Proxy error: ${e.message} (${req.method} ${req.url})`);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: 'Bad Gateway', type: 'proxy_error' } }));
-    }
+  proxyReq.on('error', fail);
+  const cancel = () => {
+    clientGone = true;
+    proxyReq.destroy();
+  };
+  // HTTP/1.1 closes the request's readable side when the upload is complete.
+  // A peer reset can finish the underlying HTTP/2 writable stream without res.end().
+  res.once('close', () => {
+    if (!res.writableEnded) cancel();
   });
-
-  req.on('error', () => proxyReq.destroy());
-  req.on('close', () => { if (!proxyReq.destroyed) proxyReq.destroy(); });
+  req.on('error', cancel);
   req.pipe(proxyReq);
 }
 

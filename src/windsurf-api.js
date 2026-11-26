@@ -1,3 +1,4 @@
+import { retryAfterHeaderMs, resetSecondsToMs } from './reset-hints.js';
 /**
  * REST/Connect-RPC client for Windsurf/Codeium cloud services.
  *
@@ -17,11 +18,10 @@
  *     rides in Metadata.user_jwt on chat RPCs via src/windsurf.js)
  */
 
-import http from 'http';
 import https from 'https';
 import { config, log } from './config.js';
 import { redactCredentialFragments, safeKeyRef } from './log-safety.js';
-import { resolveProxyConnectHost } from './net-safety.js';
+import { createProxyTunnel } from './proxy-connector.js';
 // R-1 (RATE-RETRY audit): bounded response-body reads, shared with the
 // devin-connect readers — one ceiling, one truncation contract.
 import { createBoundedBodyAccumulator, MAX_ERROR_BODY_BYTES } from './devin-connect.js';
@@ -65,43 +65,10 @@ const _jwtInflight = new Map(); // `${apiKey}@${host}` → Promise
 /** Test seam: advance the epoch (logout/rotation path in auth.js calls this). */
 export function __bumpUserJwtCacheEpoch() { _cacheEpoch++; }
 
-import { isSocks, createSocksTunnel } from './socks.js';
-
-// Tunnel HTTPS through an HTTP CONNECT proxy or SOCKS5 proxy.
-async function createProxyTunnel(proxy, targetHost, targetPort) {
-  if (isSocks(proxy)) return createSocksTunnel(proxy, targetHost, targetPort);
-  // #11: pin the proxy host to a vetted IP literal so the CONNECT socket does no
-  // second (rebindable) DNS lookup. Honors ALLOW_PRIVATE_PROXY_HOSTS.
-  const rawHost = proxy.host.replace(/:\d+$/, '');
-  const proxyHost = await resolveProxyConnectHost(rawHost, { allowPrivate: config.allowPrivateProxyHosts });
-  return new Promise((resolve, reject) => {
-    const proxyPort = proxy.port || 8080;
-    const req = http.request({
-      host: proxyHost,
-      port: proxyPort,
-      method: 'CONNECT',
-      path: `${targetHost}:${targetPort}`,
-      headers: {
-        Host: `${targetHost}:${targetPort}`,
-        ...(proxy.username ? {
-          'Proxy-Authorization': `Basic ${Buffer.from(`${proxy.username}:${proxy.password || ''}`).toString('base64')}`,
-        } : {}),
-      },
-    });
-    req.on('connect', (res, socket) => {
-      if (res.statusCode === 200) resolve(socket);
-      else { socket.destroy(); reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`)); }
-    });
-    req.on('error', (err) => reject(new Error(`Proxy tunnel: ${err.message}`)));
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Proxy tunnel timeout')); });
-    req.end();
-  });
-}
-
 /** Detect errors caused by the proxy itself (not the upstream API). */
 function isProxyError(err) {
   const m = err?.message || '';
-  return /Proxy CONNECT failed|Proxy tunnel|Proxy connection/i.test(m);
+  return /Proxy CONNECT failed|Proxy tunnel|Proxy connection|Proxy TLS/i.test(m);
 }
 
 let postJsonOverride = null;
@@ -630,18 +597,6 @@ export async function registerWithFirebaseToken(firebaseToken, opts = {}) {
   throw new Error(`RegisterUser failed both endpoints: ${redactCredentialFragments(errors.join(' | '))}`);
 }
 
-// R-2: Retry-After is delta-seconds or an HTTP-date (RFC 9110) → ms, or null.
-function parseRetryAfterHeaderMs(value) {
-  if (value == null) return null;
-  const s = String(value).trim();
-  if (!s) return null;
-  const seconds = Number(s);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
-  const when = Date.parse(s);
-  if (Number.isNaN(when)) return null;
-  return Math.max(0, when - Date.now());
-}
-
 /**
  * Pre-flight check: does this account still have message capacity?
  * Returns { hasCapacity, messagesRemaining, maxMessages, retryAfterMs }.
@@ -668,9 +623,7 @@ export async function checkMessageRateLimit(apiKey, proxy = null) {
           // resets_in_seconds (#5) or the Retry-After header. The limit is
           // account-scoped, so there is no point trying the other host;
           // network errors below still fail open.
-          const resetSeconds = res.data?.resetsInSeconds == null ? NaN : Number(res.data.resetsInSeconds);
-          const bodyMs = Number.isFinite(resetSeconds) ? Math.round(resetSeconds * 1000) : null;
-          const retryAfterMs = bodyMs ?? parseRetryAfterHeaderMs(res.headers?.['retry-after']) ?? null;
+          const retryAfterMs = resetSecondsToMs(res.data?.resetsInSeconds) ?? retryAfterHeaderMs(res.headers?.['retry-after']);
           log.warn(`CheckRateLimit ${host} → ${res.status}: no capacity${retryAfterMs != null ? ` (retry after ${retryAfterMs}ms)` : ''}`);
           return {
             hasCapacity: false,
@@ -685,12 +638,11 @@ export async function checkMessageRateLimit(apiKey, proxy = null) {
         }
         // The cooldown rides resets_in_seconds (#5) — int64, which may arrive as
         // a number or a proto3-JSON string; retryAfterMs is the ×1000 ms form.
-        const resetSeconds = res.data.resetsInSeconds == null ? NaN : Number(res.data.resetsInSeconds);
         return {
           hasCapacity: res.data.hasCapacity !== false,
           messagesRemaining: res.data.messagesRemaining ?? -1,
           maxMessages: res.data.maxMessages ?? -1,
-          retryAfterMs: Number.isFinite(resetSeconds) ? resetSeconds * 1000 : null,
+          retryAfterMs: resetSecondsToMs(res.data?.resetsInSeconds),
         };
       } catch (e) {
         lastErr = e;

@@ -20,8 +20,10 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { VERSION, BRAND } from './version.js';
 import { abortActiveSse } from './sse-registry.js';
+import { createShutdownController } from './shutdown.js';
 import { registerServer } from './server-registry.js';
 import { flushLangfuse, isLangfuseEnabled } from './langfuse.js';
+import { buildSubprocessEnv } from './log-safety.js';
 export { VERSION, BRAND };
 
 // v2.0.146 (audit F-1): last-resort process safety nets. This service must
@@ -122,7 +124,11 @@ async function main() {
         // extraction and hashing.
         execSync(`bash "${scriptPath}"`, {
           stdio: 'inherit',
-          env: { ...process.env, LS_INSTALL_PATH: binaryPath },
+          // Denylist env (L3b env-leak fix): the installer needs the general
+          // env — PATH for curl/node/sha256sum, HOME, TMPDIR, proxy + CA-trust
+          // vars for the downloads, WINDSURFAPI_LS_* overrides — but not the
+          // proxy's credentials. Nothing install-ls.sh reads is secret-shaped.
+          env: { ...buildSubprocessEnv(), LS_INSTALL_PATH: binaryPath },
           timeout: 1020000,
         });
         log.info('Language server binary installed.');
@@ -240,46 +246,27 @@ async function main() {
 
   if (isLangfuseEnabled()) log.info('Langfuse export enabled (request metadata + token usage only)');
 
-  let shuttingDown = false;
-  const shutdown = (signal) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    const inflight = server.getActiveRequests?.() ?? '?';
-    log.info(`${signal} received — draining ${inflight} in-flight requests (up to 30s)...`);
-    const abortedSse = abortActiveSse('server shutting down');
-    if (abortedSse) log.warn(`Aborted ${abortedSse} active SSE stream(s): server shutting down`);
-    // Detach P1: entries are in-memory and hold no LS lease, but a drain must
-    // refuse new admissions and drop what exists so a dying process does not
-    // leave claims behind while the LS pool is being stopped.
-    import('./detached-registry.js').then(m => m.beginDetachDrain()).catch(() => {});
-    if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+  // Single-flight: the HTTP close callback and the 30s deadline share one
+  // drain+exit promise, so a late deadline cannot exit while the first drain
+  // still waits for LS children (audit 70defee2 P2). Ownership lives in
+  // shutdown.js so both callback orders are covered by unit tests.
+  const shutdown = createShutdownController({
+    server,
     // v2.0.146 (audit F-2): await LS children actually exiting before
     // process.exit, mirroring the self-update path. A synchronous
     // stopLanguageServer() + immediate exit reparents still-living LS
     // children to PID 1, leaving them holding pool ports (42100, 42101…)
     // that the freshly-restarted replica then races (the H-4 orphan race).
-    const finalize = async (reason) => {
-      // K7: shutdown DRAINS, it does not write the pool back. The periodic
-      // dirty-flush keeps accounts.json current (≤30s stale) and status flips
-      // save immediately, so a shutdown rewrite buys nothing — and it used to
-      // clobber an operator's external accounts.json write, forcing the
-      // "stop → wait for the flush hook → write → start" deploy dance. Removing
-      // it lets an external write land safely once the process is stopped.
-      try { await stopLanguageServerAndWait({ perProcessTimeoutMs: 1500 }); }
-      catch { try { stopLanguageServer(); } catch {} }
+    drainLanguageServer: () => stopLanguageServerAndWait({ perProcessTimeoutMs: 1500 }),
+    stopLanguageServer,
+    abortSse: abortActiveSse,
+    beginDetachDrain: () => import('./detached-registry.js').then(m => m.beginDetachDrain()),
+    log,
+    exit: async (code) => {
       await flushLangfuse().catch(() => {});
-      log.info(`Shutdown complete (${reason})`);
-      process.exit(0);
-    };
-    server.close(() => {
-      log.info('HTTP server closed, stopping language server');
-      void finalize('drained');
-    });
-    setTimeout(() => {
-      log.warn('Drain timeout, forcing exit');
-      void finalize('drain-timeout');
-    }, 30_000);
-  };
+      process.exit(code);
+    },
+  });
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }

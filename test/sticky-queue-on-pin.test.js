@@ -33,6 +33,10 @@ import assert from 'node:assert/strict';
 const auth = await import('../src/auth.js');
 const sticky = await import('../src/account/sticky-session.js');
 const rc = await import('../src/runtime-config.js');
+auth.__setModelCatalogDeps({
+  disableConnectSync: true,
+  getCascadeModelConfigs: async () => ({ configs: [] }),
+});
 
 const CALLER = 'api:cafebabecafebabecafebabecafebabe:user:qop-1';
 const SELECTOR = 'swe-1-6-slow';
@@ -340,41 +344,50 @@ describe('end to end: the caller stays on its own account', () => {
       'the pin is unchanged, so the next turn reads the cache back');
   });
 
-  it('with the knob OFF, the same scenario rotates to the substitute (default unchanged)', async () => {
+  it('with the knob OFF, the same scenario rotates to the substitute (default unchanged)', async (t) => {
     const chat = await import('../src/handlers/chat.js');
     const A = seed('off-a');
     const B = seed('off-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
+    // Keep the short recovery window blocked until the actual checkout.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
     blockOnRpm(A);
     setBudget(null); // OFF
 
-    setTimeout(() => unblock(A), 150);
+    const polling = Symbol('pending poll');
+    const acct = await Promise.race([
+      chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR),
+      new Promise(resolve => setImmediate(resolve, polling)),
+    ]);
 
-    const acct = await chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR);
-
+    assert.notEqual(acct, polling, 'the disabled wait must settle without advancing the clock');
     assert.ok(acct, 'the caller must still be served');
     assert.equal(acct.id, B.id,
       'with the knob off the behaviour must be exactly what it was: rotate immediately');
     auth.releaseAccountById(acct.id);
   });
 
-  it('a wait longer than the budget gives up and rotates rather than stalling', async () => {
+  it('a recovery window longer than the budget rotates without waiting', async (t) => {
     const chat = await import('../src/handlers/chat.js');
     const A = seed('give-a');
     const B = seed('give-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
-    blockOnRpm(A); // never freed
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+    blockOnRpm(A, RPM_WINDOW_MS - 900);
     setBudget(300);
+    assert.ok(auth.getAccountAvailability(A.apiKey, SELECTOR).retryAfterMs > 300,
+      'the fixture must keep the recovery beyond the pin wait budget');
 
-    const t0 = Date.now();
-    const acct = await chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR);
-    const elapsed = Date.now() - t0;
+    const polling = Symbol('pending poll');
+    const acct = await Promise.race([
+      chat.__testing.waitForAccount([], null, 5000, null, CALLER, SELECTOR),
+      new Promise(resolve => setImmediate(resolve, polling)),
+    ]);
 
+    assert.notEqual(acct, polling, 'a recovery beyond the budget must skip the pin wait');
     assert.ok(acct, 'giving up must still serve the caller');
-    assert.equal(acct.id, B.id, 'it rotates to the substitute after the budget expires');
+    assert.equal(acct.id, B.id, 'the checkout rotates to the substitute');
     auth.releaseAccountById(acct.id);
-    assert.ok(elapsed < 3000,
-      `must give up near the 300ms budget, not stall — took ${elapsed}ms`);
   });
 
   it('a quota dry-well rotates IMMEDIATELY instead of burning the budget', async () => {
@@ -415,11 +428,12 @@ describe('end to end: the caller stays on its own account', () => {
     assert.ok(elapsed < 500, `must not wait for a burned key — took ${elapsed}ms`);
   });
 
-  it('an aborted request stops waiting', async () => {
+  it('an aborted request stops waiting', async (t) => {
     const chat = await import('../src/handlers/chat.js');
     const A = seed('abort-a');
     seed('abort-b');
     sticky.setStickyBinding(CALLER, null, A.id, A.apiKey, SELECTOR);
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
     // The window must still be blocked when the abort fires, or this test measures the
     // happy path instead. ~2s to recovery: inside the 5s budget so the loop DOES enter
     // and wait, but far enough out that the abort at 120ms lands mid-wait.
@@ -430,7 +444,11 @@ describe('end to end: the caller stays on its own account', () => {
     setTimeout(() => ac.abort(), 120);
 
     const t0 = Date.now();
-    const acct = await chat.__testing.waitForAccount([], ac.signal, 5000, null, CALLER, SELECTOR);
+    const waiting = chat.__testing.waitForAccount([], ac.signal, 5000, null, CALLER, SELECTOR);
+    t.mock.timers.tick(120);
+    assert.ok(ac.signal.aborted, 'the request aborted while its first poll was pending');
+    t.mock.timers.tick(880);
+    const acct = await waiting;
     const elapsed = Date.now() - t0;
 
     assert.equal(acct, null, 'an aborted wait returns null rather than serving');

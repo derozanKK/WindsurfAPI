@@ -63,7 +63,7 @@ function element(id) {
   if (elements.has(id)) return elements.get(id);
   const classes = new Set();
   const el = {
-    id, textContent: '', innerHTML: '', value: '', hidden: false, disabled: false,
+    id, textContent: '', innerHTML: '', value: '', hidden: false, disabled: false, dataset: {},
     classList: {
       add: (c) => classes.add(c),
       remove: (c) => classes.delete(c),
@@ -104,6 +104,8 @@ function appBase(overrides = {}) {
     reloginAccount: method('reloginAccount'),
     closeAddAccountModal: method('closeAddAccountModal'),
     openAddAccountModal: method('openAddAccountModal'),
+    resetEmailCodeForm: method('resetEmailCodeForm'),
+    updateEmailCodeControls: method('updateEmailCodeControls'),
     closeRowMenu() { this._closed = (this._closed || 0) + 1; },
     closeAccountDrawer() { this._closedDrawer = (this._closedDrawer || 0) + 1; },
     renderAccountDetail: () => '<detail/>',
@@ -115,6 +117,7 @@ function appBase(overrides = {}) {
 const reauthRow = {
   id: 'acct-reauth',
   email: 'dead@example.test',
+  loginEmail: 'dead@example.test',
   status: 'reauth',
   reauth: { at: 1_700_000_000_000, source: 'request', code: 'UNAUTHORIZED' },
   errorCount: 0,
@@ -177,6 +180,59 @@ describe('row menu', () => {
     assert.equal(self._closed, 1, 'the kebab must close');
     assert.equal(self._closedDrawer, 1, 'the drawer must close');
     assert.deepEqual(opened, [{ tab: 'login', opts: { email: 'dead@example.test', accountId: 'acct-reauth' } }]);
+  });
+
+  it('prefills the verified login address instead of a renamed display label', () => {
+    const opened = [];
+    const self = appBase({
+      _accountsById: new Map([['acct-reauth', {
+        ...reauthRow,
+        email: 'renamed-label@example.test',
+        loginEmail: 'real-identity@example.test',
+      }]]),
+      openAddAccountModal: (tab, opts) => opened.push({ tab, opts }),
+    });
+    self.reloginAccount('acct-reauth');
+    assert.deepEqual(opened, [{
+      tab: 'login',
+      opts: { email: 'real-identity@example.test', accountId: 'acct-reauth' },
+    }], 'a renamed label must not be submitted as the login identity');
+  });
+
+  it('clears the email input when the next bound row has no verified address', () => {
+    const input = element('wl-email');
+    const self = appBase({
+      _accountsById: new Map([['acct-reauth', { ...reauthRow, loginEmail: '' }]]),
+      switchAddTab(tab) { this._addTab = tab; },
+      selectLoginMethod() {}, loadWindsurfLogin() {}, checkLocalImportAvailability() {},
+      loadDevinBrowserLogin() { this._browserAvailabilityChecked = true; },
+    });
+    input.value = 'previous@example.test';
+
+    self.reloginAccount('acct-reauth');
+
+    assert.equal(input.value, '');
+    assert.equal(self._reauthAccountId, 'acct-reauth');
+    assert.equal(self._browserAvailabilityChecked, true);
+  });
+
+  it('opens the replacement guide for a bound Connect credential', () => {
+    const guide = element('connect-recovery-guide');
+    const tabs = element('add-account-tabs');
+    const self = appBase({
+      _accountsById: new Map([['acct-reauth', { ...reauthRow, credentialKind: 'connect_session' }]]),
+      switchAddTab(tab) { this._addTab = tab; },
+      selectLoginMethod() { assert.fail('Connect recovery should open the paste panel'); },
+      loadWindsurfLogin() {}, checkLocalImportAvailability() {},
+    });
+    self.reloginAccount('acct-reauth');
+    assert.equal(self._addTab, 'paste');
+    assert.equal(self._reauthAccountId, 'acct-reauth');
+    assert.equal(guide.classList.contains('hidden'), false);
+    assert.equal(tabs.classList.contains('hidden'), true);
+    self.closeAddAccountModal();
+    assert.equal(guide.classList.contains('hidden'), true);
+    assert.equal(tabs.classList.contains('hidden'), false);
   });
 });
 

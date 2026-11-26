@@ -25,8 +25,10 @@ JavaScript · MIT · ★3,126
 
 > 把 Windsurf / Devin 的 100+ AI 模型（Claude、GPT、Gemini、DeepSeek、Kimi、GLM、SWE…）变成 OpenAI Chat / Responses / Anthropic / Gemini 四套标准 API。零 npm 运行时依赖。
 
-> **历史账本** · 把 1387 次提交、196 个版本、82 个 PR、180 个 issue（账本自己的口径，**数字跟到 v3.9.34 / 2026-09-15**）摊开给你看：时间线主账 + 贡献者分析 + Git 树三形态（竖/横/环）+ 自伤与返工全记录 —— [**打开可视化账本**](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html)（纯原生渲染，零依赖）
+> **项目史与证据账本** · 检索 PR、Issue、提交、发布与 tag，查看开发里程碑、贡献与采集口径。旧可视账本保存在同页，可展开查看截至 2026-09-15 的快照。 [打开项目史](https://dwgx.github.io/WindsurfAPI/HISTORY-LEDGER-VIZ.html#history)
 
+
+[项目路线图](docs/ROADMAP.md) · [v3.2.11 发行说明与签名升级](docs/releases/RELEASE_NOTES_3.2.11.md)
 
 <p align="center">
   <a href="https://github.com/dwgx/WindsurfAPI/stargazers"><img src="https://img.shields.io/github/stars/dwgx/WindsurfAPI?style=for-the-badge&logo=github&color=f5c518" alt="Stars"></a>&nbsp;
@@ -197,6 +199,8 @@ cd WindsurfAPI
 bash setup.sh          # 建目录 · 配权限 · 生成 .env
 node src/index.js
 ```
+
+> 注意：本项目不发布到 npm。`npm i windsurf-api` 装到的是**无关的同名第三方包**，安装一律走上面的 git/Docker 路径。
 
 Dashboard：`http://你的IP:3003/dashboard`
 
@@ -489,7 +493,7 @@ curl -X DELETE http://localhost:3003/v1/responses/resp_xxx -H "Authorization: Be
 | `API_KEY` | 空 | 调 API 要带的密钥。空=默认 fail-closed（401，本机 bind 也一样）。本机开放需 `WINDSURFAPI_ALLOW_UNAUTHENTICATED=1` 且本机 bind |
 | `WINDSURFAPI_ALLOW_UNAUTHENTICATED` | 关 | 空 `API_KEY` 时放行本机 bind。默认关。公网 bind 即使设了也不放行 |
 | `DATA_DIR` | 项目根目录 | 持久化 JSON 状态和 `logs/` 的目录，Docker 推荐设成 `/data` |
-| `DEFAULT_MODEL` | `claude-sonnet-4.6` | 不传 model 用哪个。必须是当前后端能解析的名字。Connect 上解析不到默认 400 `model_not_found`（`WINDSURFAPI_STRICT_MODEL=0` 才降级到**当前真的可调**的免费 selector；连这样的 selector 都没有时仍然 400，不再落到目录里已不存在的 `swe-1-6-slow`） |
+| `DEFAULT_MODEL` | `claude-sonnet-4.6` | 不传 model 用哪个。必须是当前后端能解析的名字。Connect 上解析不到直接 400 `model_not_found`，不再静默降级到免费 selector |
 | `MAX_TOKENS` | `8192` | 默认最大回复 token 数 |
 | `LOG_LEVEL` | `info` | 控制台级别：debug / info / warn / error；JSONL 文件和 Dashboard 仍接收所有级别 |
 | `LOG_RETENTION_DAYS` | `0`（关闭） | 应用 JSONL 日志保留的 UTC 日历天数，包含当天；示例 `14`。启动及每小时清理，改配置需重启 |
@@ -773,6 +777,8 @@ A: 不能。长 thinking / 长输出在约 236-243 秒断流，是 Windsurf prov
 
 特别感谢下面的朋友，他们提交过 PR 或系统性地审了代码，让这个项目变得更稳：
 
+**安全致谢 / Security acknowledgments**：感谢 [fishfish](https://github.com/fishfish57) 负责任地披露两个 **CWE-1333**（event-loop 阻塞）问题——客户端身份中和器的二次正则扫描（2026-11-08 报告）与 `src/json-schema.js` 中 JSON Schema `pattern` 的无界求值（2026-11-10 报告）。分别跟踪为 [GHSA-fx5f-49jr-fw6r](https://github.com/dwgx/WindsurfAPI/security/advisories/GHSA-fx5f-49jr-fw6r) 与 [GHSA-r7v2-3h32-f5g6](https://github.com/dwgx/WindsurfAPI/security/advisories/GHSA-r7v2-3h32-f5g6)（CVSS 6.5，两条均已发布），修复版本 **3.141.592661**（`patched_versions: >= 3.141.592661`）。披露政策见 [SECURITY.md](SECURITY.md)。
+
 - [@dd373156](https://github.com/dd373156) — [PR #1](https://github.com/dwgx/WindsurfAPI/pull/1)
   修复 Pro 层级的模型合并逻辑：原本只看硬编码清单，云端动态拉回来的模型没进 tier 表，Pro 账号在 Cursor / Cherry Studio 里看不到新上线的模型。
 - [@colin1112a](https://github.com/colin1112a) — [PR #13](https://github.com/dwgx/WindsurfAPI/pull/13)
@@ -818,8 +824,13 @@ MIT License. See [LICENSE](LICENSE).
 
 ## 发布与密钥边界
 
-发布流程会自动推 Docker 镜像和 GitHub Release。当前发布 **v3.141.592658**；仓库共 228 个
-git tag / 218 份发布说明（2026-10-30）。从 v3.10.0 起，每个 Release 为四个发布资产
+发布流程会自动推 Docker 镜像和 GitHub Release。本版发布 **v3.2.11**，发布说明 223 份。
+CHANGELOG 里的 **231** 是「发布命名空间」计数——`git tag | wc -l` 减去本 checkout 里存在的
+未发布 tag（`docs/releases/UNPUBLISHED-TAGS.txt`）再减去本版自己的 tag，所以它**不是**远端
+tag 总数，实际数量以 `git ls-remote --tags origin` 为准（annotated tag 会额外列出 `^{}` 行，
+不要直接数行）。`v3.141.592660` 是公开 tag，但它的 Release/CI 因 tag 计数 230-vs-229 失败、
+未产出任何资产；`v3.141.592659` 从未发布——它的本地 tag 冻结在未修复的 `d5519da3` 上。
+从 v3.10.0 起，每个 Release 为四个发布资产
 （Windows exe/zip、macOS arm64 二进制/zip）生成 `SHA256SUMS`，并用 **cosign keyless**
 （GitHub OIDC，仓库内没有任何私钥或签名 secret）为四个资产和清单各发布一个
 `.sigstore.json`（签名、Fulcio 证书与 Rekor inclusion proof 合在一个文件里）。从

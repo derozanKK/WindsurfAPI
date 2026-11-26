@@ -1,37 +1,34 @@
-// Item 14 — the neutralize pass silently rewrote caller content, and the guard
+// Item 14 — the neutralize pass could silently rewrite caller content, and the guard
 // meant to catch that was structurally blind to the shape that did it.
 //
 // `rule()` warned only when a substitution REMOVED more than
 // OVER_DELETION_WARN_BYTES. That check was added for an unbounded-regex
 // over-deletion defect (199 bytes in, 18 out, two caller security rules gone). It
-// can only fire when the text shrinks — and a7-freeform, the one rule that rewrites
-// a bare token, GROWS: FREEFORM is 8 bytes, free-form is 9, so `removed` is -1 per
-// hit and no byte threshold can ever see it. MEASURED damage while it was silent:
+// can only fire when the text shrinks — and a7-freeform, the one rule that rewrote
+// a bare token, GREW: FREEFORM is 8 bytes, free-form is 9, so `removed` is -1 per
+// hit and no byte threshold could ever see it. MEASURED damage while it was silent:
 //     CHECK (kind IN ('FREEFORM','STRUCTURED'))  ->  ('free-form','STRUCTURED')
 //     if (mode === FREEFORM) { parse(); }        ->  mode === free-form
 // The first rewrites a string literal inside a data contract; the second is not
 // valid code.
 //
-// THE RULE IS DELIBERATELY NOT NARROWED. It exists because a live-bisected
-// (deterministic 7/7) content policy blocks the request when that token is present,
-// and the live A/B showed BOTH fragments must change or the block persists. Narrowing
-// needs a fresh A/B against a NON-DETERMINISTIC policy that cannot be run here — this
-// repo already ships rule a6-cline-obj default-OFF for exactly that reason. So the
-// deliverable is visibility, not suppression.
+// H2 HAS SINCE FIXED THE REWRITE ITSELF. a7-freeform is now scoped to a line that
+// carries the apply_patch JSON-wrap clause, so caller SQL/JS comes back byte-identical
+// (the first case below pins that). The occurrence guard stays as the safety net for
+// any future GLOBAL rule — a4-fastmode and a4-cli-line can still fire repeatedly — and
+// the multi-hit case below exercises it through a4-cli-line.
 //
 // WHY OCCURRENCE COUNT AND NOT BYTES. A byte threshold in the growth direction is the
 // wrong instrument twice: a one-byte-per-hit rewrite never reaches a useful figure,
 // while an ordinary identity rewrite (a clause replaced by a longer sentence) exceeds
 // any small figure on every well-behaved request, training operators to ignore the
-// line. What makes a7-freeform different is that it is a GLOBAL BARE-TOKEN rule, so it
-// can hit an unbounded number of times in text it was never aimed at.
+// line. What made a7-freeform different was that it was a GLOBAL BARE-TOKEN rule, so
+// it could hit an unbounded number of times in text it was never aimed at.
 //
 // RESIDUAL, stated because it is not covered: a SINGLE-hit rewrite of caller content
 // is still silent. `if (mode === FREEFORM)` has one occurrence, which is
-// indistinguishable by count from one legitimate hit of the trigger phrase.
-// Separating them needs context sniffing (is the token quoted? adjacent to an
-// operator?), which is the same kind of shape guess this file refuses to make about
-// narrowing. Reported rather than guessed.
+// indistinguishable by count from one legitimate hit of the trigger phrase. H2's
+// provenance boundary is what protects that shape now, not the count.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -57,22 +54,24 @@ function neutralize(text, env = {}) {
   };
 }
 
-describe('item 14 — a length-increasing rewrite of caller content is reported', () => {
-  it('reports the SQL-DDL case that was silent', () => {
-    // The reported shape: a column doc mentioning the token twice.
+describe('item 14 — the growth guard stays visible after H2 scoped a7-freeform', () => {
+  it('preserves the SQL-DDL caller text H2 took out of a7-freeform scope', () => {
+    // The shape the global rule used to corrupt: a column doc mentioning the token
+    // twice, with no apply_patch JSON-wrap clause anywhere on the line.
     const sql = 'DB column TYPE is FREEFORM. Validate that FREEFORM entries parse.';
     const { out, multiHit } = neutralize(sql);
-    assert.equal(multiHit.length, 1, 'a multi-hit bare-token rewrite must be reported');
-    assert.match(multiHit[0], /a7-freeform/);
-    assert.match(multiHit[0], /2 occurrences/);
-    // The rewrite still happens — this is visibility, not suppression.
-    assert.equal(out.includes('free-form'), true);
-    assert.equal(out.includes('FREEFORM'), false);
+    assert.equal(out, sql, 'caller SQL is byte-identical');
+    assert.deepEqual(multiHit, [], 'nothing was rewritten, so nothing is reported');
   });
 
-  it('names the byte figures so an operator can see the direction', () => {
-    const { multiHit } = neutralize("CHECK (kind IN ('FREEFORM','STRUCTURED')) -- FREEFORM is free text");
-    assert.equal(multiHit.length, 1);
+  it('reports a multi-hit length-increasing rewrite with its byte direction', () => {
+    // a4-cli-line is a GLOBAL rule that can still fire twice and grows each line;
+    // this keeps the occurrence guard exercised now that a7-freeform is scoped.
+    const src = 'Claude Code is available as a CLI.\nClaude Code is available as a CLI.';
+    const { multiHit } = neutralize(src);
+    assert.equal(multiHit.length, 1, 'a multi-hit rewrite must be reported');
+    assert.match(multiHit[0], /a4-cli-line/);
+    assert.match(multiHit[0], /2 occurrences/);
     // Growth, not shrinkage: the numbers must show the prompt got LONGER, which is
     // precisely why the deletion-only guard could not fire.
     const m = multiHit[0].match(/prompt (\d+) → (\d+) bytes/);
@@ -105,11 +104,14 @@ describe('item 14 — a length-increasing rewrite of caller content is reported'
     assert.deepEqual(neutralize(doubled).multiHit, []);
   });
 
-  it('keeps the over-deletion warning working on the input it was written for', () => {
+  it('keeps the over-deletion warning working on a large catalogue deletion', () => {
     // The W2 guard. Its branch is byte-for-byte unchanged, and this pins that: a
     // large single deletion must still be reported, and must NOT be reclassified as
-    // a multi-hit rewrite.
-    const bigCatalogue = 'The most recent Claude models are ' + 'x'.repeat(600) + '\n';
+    // a multi-hit rewrite. The fixture now carries the catalogue TERMINATOR: the
+    // a4-catalogue-line fallback rewrites only its anchor phrase (it no longer
+    // deletes the line), so the full a4-catalogue span is the deletion path left.
+    const bigCatalogue = 'The most recent Claude models are ' + 'x'.repeat(600)
+      + ' most capable Claude models.\n';
     const { overDeletion, multiHit } = neutralize(bigCatalogue);
     assert.equal(overDeletion.length, 1, 'the over-deletion warning must still fire');
     assert.match(overDeletion[0], /removed \d+ bytes/);
@@ -120,12 +122,46 @@ describe('item 14 — a length-increasing rewrite of caller content is reported'
     // The two branches must stay EXCLUSIVE. A rule that deletes a lot AND matches
     // several times is one event, not two, and reporting it twice would make the
     // operator-facing count meaningless. Needs both conditions true at once —
-    // >512 bytes removed and >1 occurrence — which no other fixture here produces,
-    // so without it the exclusivity is untested (a mutation merging the branches
-    // SURVIVED before this case existed).
-    const line = 'The most recent Claude models are ' + 'x'.repeat(400) + '\n';
+    // >512 bytes removed and >1 occurrence. Two SHORT a4-cli-line bullets are that
+    // shape: each is replaced whole (293 bytes removed per line, 586 total) and the
+    // rule fires twice, so without the exclusivity the multi-hit branch would report
+    // it a second time.
+    const line = 'Claude Code is available as a CLI ' + 'x'.repeat(300) + '\n';
     const { overDeletion, multiHit } = neutralize(line + line);
     assert.equal(overDeletion.length, 1, 'the deletion must be reported');
+    assert.deepEqual(multiHit, [], 'and must NOT also be reported as a rewrite');
+  });
+
+  // The two tests above drive applySpans' accounting. `rule()` carries its OWN copy
+  // of both branches, and the regex rules are the only path where a single
+  // substitution can both grow the text and match repeatedly. Without the two tests
+  // below, switching `rule()`'s growth branch off — or making its two branches
+  // non-exclusive — survives the whole suite.
+  it('reports a multi-hit length-increasing rewrite through the REGEX path too', () => {
+    // a7-json-wrap is a GLOBAL rule() that GROWS: "do not wrap the patch in JSON."
+    // → "provide the patch as plain text." (+2 bytes per hit). Two hits is the
+    // smallest shape that crosses MULTI_HIT_REWRITE_WARN_COUNT, and the byte figures
+    // must show the prompt got LONGER — the deletion-only guard could not fire.
+    const src = 'do not wrap the patch in JSON. Also do not wrap the patch in JSON.';
+    const { out, multiHit } = neutralize(src);
+    assert.equal(out.includes('do not wrap the patch in JSON'), false, 'both clauses rewritten');
+    assert.equal(multiHit.length, 1, 'the rule() growth branch must report it');
+    assert.match(multiHit[0], /a7-json-wrap/);
+    assert.match(multiHit[0], /2 occurrences/);
+    const m = multiHit[0].match(/prompt (\d+) → (\d+) bytes/);
+    assert.ok(m, `expected byte figures in: ${multiHit[0]}`);
+    assert.ok(Number(m[2]) > Number(m[1]), `expected growth, got ${m[1]} → ${m[2]}`);
+  });
+
+  it('classifies a large multi-occurrence deletion through the REGEX path as a deletion only', () => {
+    // Same exclusivity contract, for `rule()`: 30 identity lines are ONE global
+    // substitution that removes 780 bytes (> 512) and matches 30 times, so both
+    // branches' conditions are true at once. Reporting the deletion a second time as
+    // a rewrite would make the operator-facing count meaningless.
+    const line = "You are Claude Code, Anthropic's official CLI for Claude.";
+    const { out, overDeletion, multiHit } = neutralize(Array(30).fill(line).join('\n'));
+    assert.equal(out.includes('Claude Code'), false, 'every identity line rewritten');
+    assert.equal(overDeletion.length, 1, 'the deletion must be reported exactly once');
     assert.deepEqual(multiHit, [], 'and must NOT also be reported as a rewrite');
   });
 

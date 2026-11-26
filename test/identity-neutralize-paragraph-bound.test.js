@@ -23,7 +23,7 @@
 //   1. a span cannot cross a blank line (this file's namesake), AND the passages the
 //      529 / content-policy defence exists to remove are STILL removed — bounding a
 //      span is only a fix if the defence survives it. Those negative controls are the
-//      reason the 49 tests in client-identity-neutralize.test.js and
+//      reason the 53 tests in client-identity-neutralize.test.js and
 //      identity-neutralize-shapes.test.js are the specification, not this file.
 //   2. an over-large single substitution reaches the operator as a WARN carrying the
 //      real byte delta, and an ordinary prompt logs NOTHING (a line per request is
@@ -158,6 +158,172 @@ describe('identity-neutralize — spans stop at a paragraph break', () => {
   });
 });
 
+// H1: the paragraph bound was hand-written to accept only space/tab/CR as a blank
+// line, while the regex it replaced used `\n(?!\s*\n)` — `\s` covers the Unicode
+// spaces, FF and VT as well. A prompt whose paragraph separator was one of those
+// therefore had NO break, so the security/brand/catalogue span crossed it and
+// deleted the caller's RULE line sitting between the anchor and the terminator
+// (measured differential: 85 old-keeps/new-loses, 0 gains). The security half of
+// the class is pinned in identity-neutralize-integrity.test.js; this block pins
+// brand + catalogue plus the exact measured shapes.
+const UNICODE_BLANKS = [
+  ['NBSP (U+00A0)', '\u00A0'],
+  ['ideographic space (U+3000)', '\u3000'],
+  ['em space (U+2003)', '\u2003'],
+  ['form feed (U+000C)', '\u000C'],
+  ['vertical tab (U+000B)', '\u000B'],
+];
+
+describe('identity-neutralize — a Unicode-whitespace blank line is a paragraph break', () => {
+  it('security: the measured NBSP shape keeps the caller RULE', () => {
+    const src = 'IMPORTANT: Assist with authorized security testing\n\u00A0\nsecurity research.\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+    assert.equal(/Assist with authorized security testing/i.test(out), false,
+      'the opening fingerprint is still removed');
+  });
+
+  it('brand: the measured NBSP shape keeps the caller RULE', () => {
+    const src = 'Claude Code is available as a CLI\n\u00A0\navailable on Opus 4.8.\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+    assert.equal(/Claude Code/i.test(out), false, 'the opening fingerprint is still removed');
+  });
+
+  it('catalogue: the measured U+3000 shape keeps the caller RULE', () => {
+    const src = 'The most recent Claude models are\n\u3000\nmost capable Claude models.\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+    assert.equal(/most recent Claude models are/i.test(out), false,
+      'the opening fingerprint is still removed');
+  });
+
+  // The deletion shape: the terminator sits after the caller's rules, so before the
+  // fix the unbroken "paragraph" reached it and took the rules with it.
+  for (const [name, ws] of UNICODE_BLANKS) {
+    it(`brand: ${name} blank line does not carry the span across the caller RULE`, () => {
+      const src = `Claude Code is available as a CLI\n${ws}\n${USER_RULES}\navailable on Opus 4.8.`;
+      const { out } = neutralize(src);
+      assert.ok(out.includes('RULE 7: the API key must never be logged.'), 'user API-key rule kept');
+      assert.ok(out.includes('Never delete the production database.'), 'user DB rule kept');
+      assert.ok(out.includes('available on Opus 4.8.'),
+        'the paragraph after the blank line is outside the span');
+      assert.equal(/Claude Code/i.test(out), false, 'the opening fingerprint is still removed');
+    });
+
+    it(`catalogue: ${name} blank line does not carry the span across the caller RULE`, () => {
+      const src = `The most recent Claude models are\n${ws}\n${USER_RULES}\nmost capable Claude models.`;
+      const { out } = neutralize(src);
+      assert.ok(out.includes('RULE 7: the API key must never be logged.'), 'user API-key rule kept');
+      assert.ok(out.includes('Never delete the production database.'), 'user DB rule kept');
+      assert.ok(out.includes('most capable Claude models.'),
+        'the paragraph after the blank line is outside the span');
+      assert.equal(/most recent Claude models are/i.test(out), false,
+        'the opening fingerprint is still removed');
+    });
+  }
+});
+
+// P2 (FinalReviewRecheck): with the anchor and the terminator in DIFFERENT
+// paragraphs, a4-catalogue correctly declines to cross the break and
+// a4-catalogue-line is the only rule left. While that fallback rewrote just the
+// anchor phrase, the model-ID body sitting on the anchor line stayed on the wire —
+// the very fingerprint the paragraph bound must not cost us. The span now runs to
+// the end of the anchor's line when a catalogue body marker follows it, and stays
+// phrase-only on a caller line that has none.
+const SPLIT_CAT = "The most recent Claude models are the Claude 5 family, Opus 4.8, and Haiku 4.5. Model IDs — Fable 5: 'claude-fable-5', Opus 4.8: 'claude-opus-4-8'.\n\nWhen building AI applications, default to the latest and most capable Claude models.\n\nNow do the task.";
+
+describe('identity-neutralize — the split-paragraph catalogue fallback removes the model-ID body', () => {
+  it('the measured shape: model IDs gone, terminator paragraph and task kept', () => {
+    assert.equal(bytes(SPLIT_CAT), 253, 'fixture is the measured 253-byte input');
+    const { out } = neutralize(SPLIT_CAT);
+    assert.equal(bytes(out), 128,
+      `expected 128 bytes, got ${bytes(out)}. The anchor-only fallback produced 244.`);
+    assert.equal(/Model IDs|claude-fable-5|claude-opus-4-8/i.test(out), false,
+      'the model-ID body is removed with the header');
+    assert.ok(out.startsWith('The available models are\n\n'),
+      'header rewritten in place; the line break is preserved');
+    assert.ok(out.includes('When building AI applications, default to the latest and most capable Claude models.'),
+      'the terminator paragraph is outside the span');
+    assert.ok(out.includes('Now do the task.'), 'the task is kept');
+  });
+
+  it('the caller prefix before the anchor and a RULE after the break survive', () => {
+    const src = "Always answer in French. The most recent Claude models are the Claude 5 family. Model IDs — Fable 5: 'claude-fable-5'.\n\nRULE: keep me\n\nmost capable Claude models.\n\nNow do the task.";
+    const { out } = neutralize(src);
+    assert.ok(out.startsWith('Always answer in French. The available models are\n\n'),
+      'the prefix before the anchor is the caller\'s and survives');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+    assert.equal(/claude-fable-5|Model IDs/i.test(out), false, 'model IDs removed');
+    assert.ok(out.includes('most capable Claude models.'), 'the other paragraph untouched');
+  });
+
+  it('a caller line with NO catalogue marker keeps its RULE', () => {
+    const src = 'The most recent Claude models are listed below; RULE: keep me\nnext';
+    const { out } = neutralize(src);
+    assert.equal(out, 'The available models are listed below; RULE: keep me\nnext',
+      'no body marker ⇒ phrase-only span; every other byte of the line survives');
+  });
+
+  // G-06: the body test accepted bare English (`claude-`, `fable`, `opus`,
+  // `sonnet`) and the phrase `Model IDs` anywhere after the anchor, so a caller
+  // sentence that merely mentions one of them was taken for the client's catalogue
+  // and lost everything to the end of its line. The body must be ID-SHAPED:
+  // `claude-<family|version>` (`claude-fable-5`, `claude-opus-4-8`,
+  // `claude-3-5-sonnet`). `Model IDs` alone is a phrase, and `claude-` alone is a
+  // prefix that also starts domains (`claude-docs.example.com`).
+  it('a caller line mentioning Sonnet keeps its RULE (a bare model name is not a body)', () => {
+    const src = 'The most recent Claude models are documented at /docs; Sonnet is our default. RULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out,
+      'The available models are documented at /docs; Sonnet is our default. RULE: keep me',
+      'only the anchor phrase changes; a bare model NAME must not extend the span');
+  });
+
+  it('a caller line mentioning "Model IDs" keeps its RULE (a phrase is not a body)', () => {
+    const src = 'The most recent Claude models are documented under Model IDs in the docs. RULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out,
+      'The available models are documented under Model IDs in the docs. RULE: keep me',
+      'only the anchor phrase changes; the phrase "Model IDs" must not extend the span');
+  });
+
+  it('a caller line mentioning claude-docs.example.com keeps its RULE (a domain is not a model ID)', () => {
+    const src = 'The most recent Claude models are documented at claude-docs.example.com; RULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out,
+      'The available models are documented at claude-docs.example.com; RULE: keep me',
+      'only the anchor phrase changes; the `claude-` prefix alone must not extend the span');
+  });
+
+  // P3 (external audit): the head alone was not enough. A digit head accepted ANY
+  // following character, so hostnames whose first label starts with a digit were
+  // classified as model IDs and the span ate the caller's RULE.
+  it('a caller line mentioning claude-3d.example.com keeps its RULE (digit+letter is a hostname)', () => {
+    const src = 'The most recent Claude models are documented at claude-3d.example.com; RULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out,
+      'The available models are documented at claude-3d.example.com; RULE: keep me',
+      'only the anchor phrase changes; a digit followed by an identifier letter is a hostname');
+  });
+
+  it('a caller line mentioning claude-1password.example.com keeps its RULE (digit run + letter is a hostname)', () => {
+    const src = 'The most recent Claude models are documented at claude-1password.example.com; RULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out,
+      'The available models are documented at claude-1password.example.com; RULE: keep me',
+      'only the anchor phrase changes; a digit run followed by a letter is a hostname');
+  });
+
+  it('a caller line mentioning claude-opus.example.com keeps its RULE (family + domain dot is a hostname)', () => {
+    const src = 'The most recent Claude models are documented at claude-opus.example.com; RULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out,
+      'The available models are documented at claude-opus.example.com; RULE: keep me',
+      'only the anchor phrase changes; a family name followed by a domain dot is not an ID token');
+  });
+});
+
 describe('identity-neutralize — an over-large deletion is observable', () => {
   // Threshold is 512 bytes per substitution, calibrated on the fixtures the 49
   // pinning tests use (largest legitimate removal: the security paragraph at 322,
@@ -256,5 +422,115 @@ describe('identity-neutralize — an over-large deletion is observable', () => {
     assert.deepEqual(warns, [],
       'no single substitution exceeded the threshold, so nothing should be logged. '
       + `Got:\n${warns.join('\n')}`);
+  });
+});
+
+// Differential audit (OLD scanner vs NEW, .agent/diff-audit/REPORT.md): two
+// under-redaction regressions where NEW kept fingerprint bytes that OLD removed.
+// F1: `IMPORTANT:` alone on its line, then ONLY whitespace (including the blank
+// line the live preamble emits), then the security phrase — the paragraph-bound
+// gap refused to cross the break, so the whole sentence went upstream. F2: a
+// billing header behind a lone \r / U+2028 / U+2029 never anchored, because
+// forEachLine only split on \n while the old `/^…/m` rules accepted every JS
+// line terminator.
+describe('identity-neutralize — differential audit under-redaction fixes', () => {
+  const SEC_PHRASE = /Assist with authorized security testing/i;
+  const SEC_TAIL = 'defensive security, CTF challenges. Dual-use tools require authorization: security research, or defensive use cases.';
+
+  it('security: IMPORTANT: alone, blank line, then the phrase — still neutralized', () => {
+    const src = 'IMPORTANT:\n\nAssist with authorized security testing, ' + SEC_TAIL + '\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(SEC_PHRASE.test(out), false,
+      'the all-whitespace gap must let IMPORTANT: pair with the phrase (F1)');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+  });
+
+  it('security: same shape with a whitespace-only line between', () => {
+    const src = 'IMPORTANT:\n   \nAssist with authorized security testing, ' + SEC_TAIL + '\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(SEC_PHRASE.test(out), false,
+      'a whitespace-only blank line is still whitespace for the gap');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+  });
+
+  it('security: same shape with an NBSP-only line between', () => {
+    const src = 'IMPORTANT:\n \nAssist with authorized security testing, ' + SEC_TAIL + '\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(SEC_PHRASE.test(out), false,
+      'an NBSP-only blank line is still whitespace for the gap');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+  });
+
+  it('security: anchor mid-line keeps the pairing too', () => {
+    const src = 'preamble text IMPORTANT:\n\nAssist with authorized security testing, ' + SEC_TAIL + '\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(SEC_PHRASE.test(out), false, 'fingerprint leaked');
+    assert.ok(out.includes('preamble text'), 'text before the anchor kept');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+  });
+
+  // NEGATIVE CONTROL — the WA-002 bound still holds: when the anchor's own
+  // paragraph continues with real text, a phrase one paragraph later is NOT
+  // paired and must survive exactly as OLD left it.
+  it('security: anchor followed by real text still does NOT pair across the break', () => {
+    const src = 'IMPORTANT: keep this instruction.\n\nAssist with authorized security testing, ' + SEC_TAIL + '\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.ok(out.includes('keep this instruction.'), 'the anchor paragraph survives');
+    assert.ok(SEC_PHRASE.test(out),
+      'a phrase in the NEXT paragraph is not the anchor\'s sentence — OLD left it too');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+  });
+
+  it('billing: a header behind a lone CR is still stripped', () => {
+    const src = 'preamble\rx-anthropic-billing-header: cc_version=2.1.0;\rtail keep me';
+    const { out } = neutralize(src);
+    assert.equal(out.includes('x-anthropic-billing-header'), false,
+      'a lone CR is a line terminator — the header must not leak (F2)');
+    assert.ok(out.includes('preamble'), 'text before kept');
+    assert.ok(out.includes('tail keep me'), 'text after kept');
+  });
+
+  it('billing: a header behind U+2028 / U+2029 is still stripped', () => {
+    for (const [name, sep] of [['U+2028', ' '], ['U+2029', ' ']]) {
+      const src = 'preamble' + sep + 'x-anthropic-billing-header: cc_version=2.1.0;' + sep + 'tail keep me';
+      const { out } = neutralize(src);
+      assert.equal(out.includes('x-anthropic-billing-header'), false,
+        `${name} is a JS line terminator — the header must not leak (F2)`);
+      assert.ok(out.includes('tail keep me'), `${name}: text after kept`);
+    }
+  });
+});
+
+// F5 (diff-audit): the FREEFORM provenance boundary was line-scoped, so a
+// preamble whose clause and token wrapped across lines leaked the token.
+// Paragraph scope covers the wrap while a bare token in caller text — the
+// WA-003 corruption the line bound exists to stop — still survives.
+describe('identity-neutralize — FREEFORM provenance is paragraph-scoped', () => {
+  it('token on the line AFTER the clause is still rewritten', () => {
+    const src = 'return the patch and do not wrap the patch in json,\nrespond in FREEFORM.\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out.includes('FREEFORM'), false, 'wrapped clause+token must not leak (F5)');
+    assert.ok(out.includes('free-form'), 'token rewritten to the benign form');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+  });
+
+  it('token on the line BEFORE the clause is still rewritten', () => {
+    const src = 'respond in FREEFORM,\ndo not wrap the patch in json.\n\nRULE: keep me';
+    const { out } = neutralize(src);
+    assert.equal(out.includes('FREEFORM'), false, 'token-before-clause in one paragraph');
+    assert.ok(out.includes('RULE: keep me'), 'caller RULE kept');
+  });
+
+  it('clause in paragraph 1, token in paragraph 2 — the token survives', () => {
+    const src = 'do not wrap the patch in json.\n\nCHECK (kind IN (\'FREEFORM\',\'STRUCTURED\'))';
+    const { out } = neutralize(src);
+    assert.ok(out.includes("'FREEFORM'"),
+      'a token outside the clause paragraph is caller content — keep it');
+  });
+
+  it('a bare FREEFORM token with no clause anywhere still survives (WA-003)', () => {
+    const src = "if (mode === FREEFORM) { run(); }\nSELECT * FROM t WHERE kind = 'FREEFORM'";
+    const { out } = neutralize(src);
+    assert.equal(out, src, 'caller code tokens are not the fingerprint');
   });
 });

@@ -23,6 +23,9 @@ Set-Location $Root
 $LogDir = Join-Path $Root 'logs'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $PidFile = Join-Path $LogDir 'windsurfapi.pid'
+# Required before spawning: missing ownership support must not silently publish
+# a numeric-only ticket that cannot be safely stopped.
+Import-Module (Join-Path $PSScriptRoot 'ownership.psm1') -Force -ErrorAction Stop
 $Date = Get-Date -Format 'yyyy-MM-dd'
 $SupLog = Join-Path $LogDir "supervisor-$Date.log"
 
@@ -71,11 +74,17 @@ while ($true) {
   $proc.BeginOutputReadLine()
   $proc.BeginErrorReadLine()
 
-  Set-Content -Path $PidFile -Value $proc.Id -Encoding ASCII
+  $pidTicket = $null
+  try {
+    $creationRow = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction Stop
+    if (-not (Test-StartedProcessCimIdentity $proc $creationRow)) { throw 'Child CIM identity unavailable' }
+    $pidTicket = Set-WindsurfApiPidMeta -LogDir $LogDir -ProcessId $proc.Id -CreationTimeUtc $creationRow.CreationDate -Root $Root -Mode 'source'
+  } catch { Write-Sup "PID ticket unavailable; child remains supervised: $($_.Exception.Message)" }
   Write-Sup "node started pid=$($proc.Id)"
 
   $proc.WaitForExit()
   $code = $proc.ExitCode
+  try { [void](Remove-WindsurfApiPidArtifacts -LogDir $LogDir -ExpectedTicket $pidTicket) } catch { }
   # 注销事件订阅,防止跨循环泄漏。
   Unregister-Event -SourceIdentifier $so.Name -ErrorAction SilentlyContinue
   Unregister-Event -SourceIdentifier $se.Name -ErrorAction SilentlyContinue
@@ -117,6 +126,5 @@ while ($true) {
   }
 }
 
-# 干净退出:删 pidfile。
-if (Test-Path $PidFile) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
+# Each exited child cleaned only its own receipt above; never delete a new run.
 Write-Sup 'supervisor stopped'

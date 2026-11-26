@@ -23,39 +23,69 @@
  * not verified against a live Gemini endpoint are marked TODO(unverified).
  */
 
-import { handleChatCompletions, connectErrorToHttp } from './chat.js';
+import { handleChatCompletions, clientResetFields, connectErrorToHttp } from './chat.js';
 import { log } from '../config.js';
 import { createBoundedWriter, resolveMaxDrainWaitMs } from '../stream-writer.js';
 import { SseFramer } from '../sse-framer.js';
 import { buildToolNameMap, restoreToolName, sanitizeToolName } from '../tool-names.js';
 import { createToolIdAllocator, normalizeToolIdsInMessages, sanitizeToolId, toolHygieneEnabled } from '../tool-ids.js';
 import { normalizeHistoryTail } from '../history-normalize.js';
+import { firstUnsupportedGeminiServerTool, geminiServerSideToolUnsupported, droppedGeminiServerToolNames } from '../server-side-tools.js';
 
 // ─── finish_reason mapping (OpenAI → Gemini) ────────────────────
 // Gemini has no dedicated finishReason for function calls — a turn that
 // ends in functionCall parts still reports STOP. content_filter → SAFETY.
 //
-// The `|| 'STOP'` default below is safe only because of a premise that lives in
-// another file, so it is stated here and pinned by a test rather than assumed:
-// every finish_reason this proxy can emit is a key above. Measured — the
-// internal producers are special-agent.js's own mapFinishReason (range: stop /
-// length / tool_calls / content_filter) and devin-connect's resolveFinishReason
-// ('length'). The one exception, `finish_reason:'error'` from a special-agent
-// stream that failed after headers were sent, never reaches this map: that path
-// emits its error frame FIRST, and `error()` sets `this.finished`, so the finish
-// chunk is dropped before translation. Were that ordering to change, a failed
-// run would arrive here and default to STOP — i.e. report as a clean completion,
-// exactly what special-agent.js's "H2" comment set out to prevent. Gemini's enum
-// carries OTHER for that case if it ever becomes reachable.
+// G3/Q2: the Connect decoder reports a turn that DELIVERED a payload but never
+// named a stop reason as `finish_reason:'error'` (with `unterminated:true` when
+// the marker rides the frame). That is a FAILED/truncated turn, not a finished
+// one. It must never reach a client as STOP: Gemini's enum has OTHER for
+// "ended for a reason this enum cannot express", and both egress paths below
+// fail the turn with an error frame/body before a terminal candidate is
+// emitted. The OTHER rows exist so a direct caller of this map (or a future
+// path that forgets the guard) still cannot certify a half answer as clean.
 const FINISH_MAP = {
   stop: 'STOP',
   length: 'MAX_TOKENS',
   tool_calls: 'STOP',
   content_filter: 'SAFETY',
+  error: 'OTHER',
+  unterminated: 'OTHER',
 };
 function mapFinishReason(openaiReason) {
   if (!openaiReason) return 'STOP';
   return FINISH_MAP[openaiReason] || 'STOP';
+}
+
+// The one message both Gemini exits report when the upstream closed a turn
+// without saying how it ended. Mirrors messages.js / responses.js (G3).
+const UPSTREAM_UNTERMINATED_MESSAGE =
+  'The upstream ended the turn without a completion reason (truncated response).';
+
+// A06: the buffered twin for a Cascade max_wait/stall_warm exit that DELIVERED
+// partial text — the turn was interrupted, not finished (see isCascadeInterrupted).
+const UPSTREAM_INTERRUPTED_MESSAGE =
+  'The upstream interrupted the turn before completion (partial response).';
+
+// G3: the Connect decoder's truncation terminal, on either the choice or the
+// frame (responses.js accepts both shapes, so this route must too).
+function isUnterminatedFinish(chunk) {
+  return chunk?.unterminated === true
+    || chunk?.choices?.[0]?.unterminated === true
+    || chunk?.choices?.[0]?.finish_reason === 'error';
+}
+
+// A06 (P1): the Cascade poll loop's max_wait/stall_warm exit DELIVERED partial
+// text but never finished the turn. The producer types that as a fabricated
+// finish_reason:'length' plus a private carrier (chat.js nonStreamResponse, from
+// client.js classifyCascadeEnd) — so isUnterminatedFinish never fires and this
+// body used to render as a 200 MAX_TOKENS candidate, letting a client act on
+// text the upstream did not finish. A caller-imposed output cap also reports
+// 'length'; only the carrier distinguishes an interruption from a real cap.
+function isCascadeInterrupted(body) {
+  return body?.__windsurf_incomplete === true
+    || body?.choices?.[0]?._windsurf_truncated === true
+    || body?.choices?.[0]?._windsurf_end_reason === 'upstream_truncated';
 }
 
 // Parse a tool call's `arguments` string into Gemini's functionCall.args struct.
@@ -126,13 +156,42 @@ function normalizeSchemaTypes(node, depth = 0) {
   return out;
 }
 
+// In a Gemini response Schema only properties, items and anyOf contain other
+// Schema messages. Examples and defaults are arbitrary JSON, including objects
+// with a literal "type" member. Walk schema nodes without recursing on the JS stack.
+function normalizeResponseSchema(schema) {
+  const pending = [];
+  function copyNode(node) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+    const copy = { ...node };
+    const lower = typeof node.type === 'string' && node.type.toLowerCase();
+    if (GEMINI_SCHEMA_TYPES.has(lower)) copy.type = lower;
+    pending.push(copy);
+    return copy;
+  }
+  const root = copyNode(schema);
+  while (pending.length) {
+    const node = pending.pop();
+    if (node.properties && typeof node.properties === 'object' && !Array.isArray(node.properties)) {
+      node.properties = Object.fromEntries(Object.entries(node.properties).map(([name, sub]) => [name, copyNode(sub)]));
+    }
+    if (node.items) node.items = copyNode(node.items);
+    if (Array.isArray(node.anyOf)) node.anyOf = node.anyOf.map(copyNode);
+  }
+  return root;
+}
+
 function mapGeminiToolChoice(toolConfig) {
   const mode = toolConfig?.functionCallingConfig?.mode;
   if (!mode) return undefined;
   switch (String(mode).toUpperCase()) {
     case 'AUTO': return 'auto';
     case 'ANY': {
-      // ANY with a single allowed name pins that function; otherwise "required".
+      // ANY pins a single allowed function; several (or zero) allowed names are
+      // a generic "must call one of the offered tools" ('required'). The offered
+      // set itself is narrowed in geminiToOpenAI to exactly the allowlisted
+      // declarations (and unknown names are rejected there), so 'required' can
+      // only propose functions the caller actually allowed this turn.
       const allowed = toolConfig.functionCallingConfig.allowedFunctionNames;
       if (Array.isArray(allowed) && allowed.length === 1) {
         return { type: 'function', function: { name: allowed[0] } };
@@ -182,6 +241,30 @@ export function geminiToOpenAI(body, modelFromPath) {
   const allowedNames = Array.isArray(body?.toolConfig?.functionCallingConfig?.allowedFunctionNames)
     ? body.toolConfig.functionCallingConfig.allowedFunctionNames.filter((n) => typeof n === 'string' && n)
     : [];
+  // P2 (adapters audit): Gemini's ANY mode with a nonempty allowedFunctionNames
+  // list constrains WHICH declared functions the model may call this turn. The
+  // old mapping forwarded every declaration with a generic tool_choice, so a
+  // callable the caller meant to exclude for this turn stayed offered and could
+  // be proposed. Narrow the offered declarations to exactly the requested
+  // client names (mapGeminiToolChoice keeps the pin/required shape), and reject
+  // an allowlist that names a function nobody declared — Google's own API
+  // refuses that instead of letting the upstream resolve an unknown name.
+  // Checked before any model turn, like the server-side-tool refusal.
+  const fnCallMode = String(body?.toolConfig?.functionCallingConfig?.mode || '').toUpperCase();
+  const rawAllowedNames = body?.toolConfig?.functionCallingConfig?.allowedFunctionNames;
+  let anyAllowlist = null;
+  if (fnCallMode === 'ANY' && Array.isArray(rawAllowedNames) && rawAllowedNames.length) {
+    const unknown = rawAllowedNames.filter((n) => !declaredNames.includes(n));
+    if (unknown.length) {
+      const err = new Error(
+        `toolConfig.functionCallingConfig.allowedFunctionNames must name functions declared in tools.functionDeclarations (unknown: ${unknown.map((n) => JSON.stringify(n)).join(', ')})`,
+      );
+      err.status = 400;
+      err.code = 'unknown_allowed_function_name';
+      throw err;
+    }
+    anyAllowlist = new Set(rawAllowedNames);
+  }
   const toolNameMap = toolHygieneEnabled()
     ? buildToolNameMap([...declaredNames, ...historyNames, ...allowedNames])
     : null;
@@ -288,14 +371,31 @@ export function geminiToOpenAI(body, modelFromPath) {
   }
 
   // tools.functionDeclarations → OpenAI tools. Gemini also allows server-side
-  // tools (googleSearch, codeExecution) as bare keys on a tool object; the
-  // proxy can't honor those, so they're dropped (parity with the Anthropic
-  // server-side tool drop in messages.js).
+  // tools (googleSearch, codeExecution, urlContext) as bare keys on a tool
+  // object. The proxy cannot execute those, and the old behaviour — count and
+  // drop them with a log line — returned a 200 for a turn whose search/exec
+  // never ran (Q4 G06). Refuse the request instead, through the same
+  // `unsupported_server_side_tool` code the OpenAI/Anthropic surfaces use, so
+  // no caller has to guess why the tool disappeared. Checked before any
+  // functionDeclarations are translated: one bad tool rejects the request.
+  const unsupportedGeminiTool = firstUnsupportedGeminiServerTool(body?.tools);
+  if (unsupportedGeminiTool) throw geminiServerSideToolUnsupported(unsupportedGeminiTool);
+  // The refused set above is the documented four; the remaining server-executed
+  // tools (googleMaps / fileSearch / computerUse / mcpServers) are deliberately
+  // not refused — no client in the repo sends them — but they are still dropped
+  // here, so warn once per request instead of letting them vanish silently.
+  const droppedGeminiTools = droppedGeminiServerToolNames(body?.tools);
+  if (droppedGeminiTools.length) {
+    log.warn(`gemini: dropped ${droppedGeminiTools.length} unlisted server-side tool declaration(s) [${droppedGeminiTools.join(', ')}] - the proxy has no executor for them; declare a normal functionDeclaration if the client runs them itself`);
+  }
   const tools = [];
-  let droppedServerTools = 0;
   for (const t of (body?.tools || [])) {
     if (Array.isArray(t?.functionDeclarations)) {
       for (const fd of t.functionDeclarations) {
+        // ANY + nonempty allowlist: only the requested client names are offered
+        // this turn (validated as a declared subset above). Other modes keep
+        // every declaration.
+        if (anyAllowlist && !anyAllowlist.has(fd.name)) continue;
         tools.push({
           type: 'function',
           function: {
@@ -310,12 +410,6 @@ export function geminiToOpenAI(body, modelFromPath) {
         });
       }
     }
-    if (t?.googleSearch || t?.googleSearchRetrieval || t?.codeExecution || t?.urlContext) {
-      droppedServerTools++;
-    }
-  }
-  if (droppedServerTools) {
-    log.info(`gemini: dropped ${droppedServerTools} server-side tool(s) (googleSearch/codeExecution/urlContext) - proxy does not implement them`);
   }
 
   const gc = body?.generationConfig || {};
@@ -323,7 +417,7 @@ export function geminiToOpenAI(body, modelFromPath) {
   // responseSchema / responseJsonSchema) → OpenAI response_format.
   let responseFormat = null;
   if (gc.responseMimeType === 'application/json') {
-    const schema = gc.responseSchema || gc.responseJsonSchema;
+    const schema = gc.responseSchema ? normalizeResponseSchema(gc.responseSchema) : gc.responseJsonSchema;
     if (schema) {
       responseFormat = {
         type: 'json_schema',
@@ -334,9 +428,8 @@ export function geminiToOpenAI(body, modelFromPath) {
     }
   }
 
-  // thinkingConfig → reasoning hint. Gemini 2.5 exposes thinkingBudget
-  // (token budget) and includeThoughts. The internal handler speaks the
-  // `thinking` dialect (passed through to chat.js, same as messages.js).
+  // thinkingConfig.thinkingBudget → generation hint. includeThoughts is
+  // handled by the response translator. Chat uses the `thinking` dialect.
   // TODO(unverified): exact thinkingBudget→effort mapping against this
   // backend is not calibrated; we forward a coarse enabled/disabled hint.
   let thinking = null;
@@ -389,33 +482,47 @@ function extractText(node) {
 }
 
 // ─── usageMetadata builder (OpenAI usage → Gemini) ──────────────
+// The shared Cascade producer folds thinking into completion_tokens and exposes
+// the reasoning count as a subset (completion_tokens_details.reasoning_tokens).
+// Gemini's UsageMetadata reports candidates and thoughts as SEPARATE buckets
+// (a consumer that adds them reads generated+candidates), so the combined
+// completion count must NOT be copied into candidatesTokenCount verbatim: the
+// candidate bucket is completion minus the bounded thinking subset. The supplied
+// total is preserved verbatim — including the shared producer's cache-write
+// accounting, which deliberately breaks OpenAI's total identity (#118).
 function buildUsageMetadata(usage) {
   if (!usage || typeof usage !== 'object') return undefined;
-  const prompt = usage.prompt_tokens ?? usage.input_tokens ?? 0;
-  const candidates = usage.completion_tokens ?? usage.output_tokens ?? 0;
+  const prompt = Number(usage.prompt_tokens ?? usage.input_tokens) || 0;
+  const generated = Number(usage.completion_tokens ?? usage.output_tokens) || 0;
   const cached = usage.cache_read_input_tokens
     ?? usage.prompt_tokens_details?.cached_tokens
     ?? 0;
-  const thoughts = usage.completion_tokens_details?.reasoning_tokens ?? 0;
-  const total = usage.total_tokens ?? (prompt + candidates);
+  // Bound the reasoning subset to [0, generated]. An unexpected negative count
+  // must not increase the candidate bucket, just as excess reasoning must not
+  // make it negative.
+  const thoughts = Math.min(
+    Math.max(0, Number(usage.completion_tokens_details?.reasoning_tokens) || 0),
+    Math.max(0, generated),
+  );
+  const candidates = Math.max(0, generated - thoughts);
+  const total = usage.total_tokens ?? (prompt + candidates + thoughts);
   const meta = {
     promptTokenCount: prompt,
     candidatesTokenCount: candidates,
     totalTokenCount: total,
   };
-  if (cached) meta.cachedContentTokenCount = cached;
+  if (cached) meta.cachedContentTokenCount = Number(cached) || 0;
   if (thoughts) meta.thoughtsTokenCount = thoughts;
   return meta;
 }
 
 // ─── OpenAI → Gemini non-stream response translation ────────────
-export function openAIToGemini(result, model, toolNameMap = null) {
+export function openAIToGemini(result, model, toolNameMap = null, { includeThoughts = true } = {}) {
   const choice = result?.choices?.[0];
   const msg = choice?.message || {};
   const parts = [];
 
-  // Reasoning trace → thought part (Gemini marks thinking parts with thought:true).
-  if (msg.reasoning_content) {
+  if (includeThoughts && msg.reasoning_content) {
     parts.push({ text: msg.reasoning_content, thought: true });
   }
   if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
@@ -436,7 +543,11 @@ export function openAIToGemini(result, model, toolNameMap = null) {
 
   const candidate = {
     content: { role: 'model', parts },
-    finishReason: mapFinishReason(choice?.finish_reason),
+    // G3: the unterminated marker can ride next to a fabricated 'stop'
+    // finish_reason. It wins: the turn did not complete, so never render it as
+    // a clean STOP (OTHER is the non-clean fallback for direct callers; the
+    // route itself fails the turn before reaching this map).
+    finishReason: isUnterminatedFinish(result) ? 'OTHER' : mapFinishReason(choice?.finish_reason),
     index: 0,
   };
 
@@ -457,11 +568,12 @@ export function openAIToGemini(result, model, toolNameMap = null) {
 // Mode 'array' → frames streamed inside a JSON array: `[`, frame, `,frame`, `]`
 //                (the default :streamGenerateContent wire format).
 class GeminiStreamTranslator {
-  constructor(res, model, { mode = 'sse', toolNameMap = null } = {}) {
+  constructor(res, model, { mode = 'sse', toolNameMap = null, includeThoughts = true } = {}) {
     this.res = res;
     this.model = model;
     this.mode = mode;
     this.toolNameMap = toolNameMap;
+    this.includeThoughts = includeThoughts;
     this.toolCallBufs = new Map(); // index → { id, rawId, name, argsBuffered }
     // Egress id allocator: upstream may reuse one call id for two distinct
     // calls, but the client must never see the same functionCall id twice
@@ -481,6 +593,12 @@ class GeminiStreamTranslator {
     // chat.js emits `[DONE]` on that path too — so both signals must be discounted
     // together or BUG1's guard stays defeated.
     this.sawSyntheticFinish = false;
+    // G3: set when the upstream's terminal frame says the turn was NOT completed
+    // (`finish_reason:'error'` / `unterminated:true`). finish() fails the turn
+    // with an error frame instead of emitting a terminal candidate — otherwise
+    // mapFinishReason would have to invent a reason and the client would read a
+    // truncated answer as final.
+    this.upstreamError = false;
     // V-08/D8: one abort-aware bounded writer for this egress. `res` is the REAL
     // response; the Chat producer writes into `createCaptureRes`, which reports
     // THIS writer's pressure back to it. Without the wait the translator consumed
@@ -601,6 +719,10 @@ class GeminiStreamTranslator {
       this.error(chunk.error);
       return;
     }
+    // G3: the Connect decoder's truncation terminal. Checked before the normal
+    // finish-reason branch so the turn is failed in finish() even though the
+    // frame itself is a terminal signal.
+    if (isUnterminatedFinish(chunk)) this.upstreamError = true;
     // Adopt the upstream's model name before the first frame is emitted.
     //
     // Constructed with the REQUESTED name (it must exist before the upstream call), so a
@@ -617,7 +739,9 @@ class GeminiStreamTranslator {
     const choice = chunk.choices?.[0];
     if (choice) {
       const delta = choice.delta || {};
-      if (delta.reasoning_content) this.emitTextDelta(delta.reasoning_content, { thought: true });
+      if (this.includeThoughts && delta.reasoning_content) {
+        this.emitTextDelta(delta.reasoning_content, { thought: true });
+      }
       if (delta.content) this.emitTextDelta(delta.content);
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) this.bufferToolCall(tc);
@@ -666,6 +790,20 @@ class GeminiStreamTranslator {
     // #238 is about a strict client erroring on an empty answer), and it keeps a
     // clean STOP terminal because sawTerminalSignal is set. Only the ABSENCE of the
     // signal is the fault.
+    // G3: the upstream named a truncation terminal (`finish_reason:'error'` /
+    // `unterminated:true`). It IS a terminal signal, so the guard below would
+    // let it through; fail the turn explicitly with the same retryable shape as
+    // an abnormally cut-off stream instead of emitting a terminal candidate.
+    // Gemini's enum has no "truncated", and mapFinishReason's OTHER fallback is
+    // a last resort for direct callers — a real client must see the error.
+    if (this.upstreamError) {
+      this.error({
+        status: 502,
+        type: 'upstream_error',
+        message: UPSTREAM_UNTERMINATED_MESSAGE,
+      });
+      return;
+    }
     if (!this.sawTerminalSignal) {
       this.error({
         status: 502,
@@ -704,7 +842,7 @@ class GeminiStreamTranslator {
         ? { ...mapped.body, error: {
           ...mapped.body.error,
           __upstream_code: err.code,
-          ...(Number.isFinite(Number(err.retry_after_ms)) ? { retry_after_ms: Number(err.retry_after_ms) } : {}),
+          ...clientResetFields(err.retry_after_ms),
         } }
         : mapped.body;
       const json = JSON.stringify(body);
@@ -794,6 +932,10 @@ function createCaptureRes(translator, realRes) {
       // further byte — a terminal frame must not be written into a socket that is
       // already gone. (The chat writer's own wait settles through fire('close').)
       translator.writer.dispose();
+      // Release whatever the SSE framer still retains: after teardown no push
+      // may reach it, and its "flood bytes unreachable" contract is only
+      // enforced if dispose actually runs here.
+      translator.sseFramer?.dispose();
       fire('close');
     },
     on(event, cb) {
@@ -909,7 +1051,30 @@ export async function handleGemini(model, body, context = {}, { stream = false, 
       'This proxy only supports candidateCount=1. The upstream backend returns a single candidate per request; set generationConfig.candidateCount to 1 (or omit it).',
     );
   }
-  const openaiBody = geminiToOpenAI(body, requestedModel);
+  let openaiBody;
+  try {
+    openaiBody = geminiToOpenAI(body, requestedModel);
+  } catch (err) {
+    if (err?.code === 'unsupported_server_side_tool') {
+      // The translator refuses a server-executed tool (G06). Gemini's envelope
+      // carries a numeric `code` + status enum, so the shared string code rides
+      // as `type` (the field OpenAI-family clients branch on) instead of
+      // clobbering the numeric code.
+      const mapped = geminiError(err.status || 400, null, err.message);
+      mapped.body.error.type = err.code;
+      if (err.param) mapped.body.error.param = err.param;
+      return mapped;
+    }
+    if (err?.code === 'unknown_allowed_function_name') {
+      // P2: an ANY allowlist naming an undeclared function. Same envelope as
+      // the server-side-tool refusal — the string code rides as `type`.
+      const mapped = geminiError(err.status || 400, null, err.message);
+      mapped.body.error.type = err.code;
+      if (err.param) mapped.body.error.param = err.param;
+      return mapped;
+    }
+    throw err;
+  }
   const toolNameMap = openaiBody.__toolNameMap || null;
   delete openaiBody.__toolNameMap;
   if (toolHygieneEnabled()) {
@@ -919,13 +1084,34 @@ export async function handleGemini(model, body, context = {}, { stream = false, 
     );
   }
   const chatHandler = context.handleChatCompletions || handleChatCompletions;
+  const includeThoughts = body?.generationConfig?.thinkingConfig?.includeThoughts === true;
+  // Keep marked parts separate even when shown, so cached or resumed turns
+  // can apply the current client's visibility preference at egress.
+  const chatContext = { ...context, keepReasoningSeparate: true };
 
   if (!stream) {
-    const result = await chatHandler({ ...openaiBody, stream: false, __route: 'gemini' }, context);
+    const result = await chatHandler({ ...openaiBody, stream: false, __route: 'gemini' }, chatContext);
     if (result.status !== 200) {
       return withUpstreamHeaders(geminiError(result.status, result.body?.error?.type, result.body?.error?.message), result.headers);
     }
-    return { status: 200, body: openAIToGemini(result.body, requestedModel, toolNameMap) };
+    // G3: a 200 body whose terminal choice says the turn was NOT completed
+    // (`finish_reason:'error'` / `unterminated:true`) is a truncated answer, not
+    // a clean one. Surface it through the route's error path — Gemini has no
+    // candidate status for "incomplete", and a STOP/OTHER candidate would tell
+    // the client the partial answer is final.
+    if (isUnterminatedFinish(result.body)) {
+      return withUpstreamHeaders(geminiError(502, 'upstream_error', UPSTREAM_UNTERMINATED_MESSAGE), result.headers);
+    }
+    // A06: the Cascade max_wait/stall_warm exit rides a fabricated 'length'
+    // terminal instead of a missing stop reason, so the guard above passes it.
+    // Gemini has no candidate status for "interrupted"; surface it through the
+    // same retryable error path (502 upstream_error → 503 UNAVAILABLE) rather
+    // than typing the partial answer as MAX_TOKENS, which a client reads as a
+    // legitimate caller-imposed cap.
+    if (isCascadeInterrupted(result.body)) {
+      return withUpstreamHeaders(geminiError(502, 'upstream_error', UPSTREAM_INTERRUPTED_MESSAGE), result.headers);
+    }
+    return { status: 200, body: openAIToGemini(result.body, requestedModel, toolNameMap, { includeThoughts }) };
   }
 
   // Streaming path — ask handleChatCompletions for its streaming handler and
@@ -940,7 +1126,7 @@ export async function handleGemini(model, body, context = {}, { stream = false, 
   // Gemini streaming response shipped with usageMetadata entirely absent.
   const streamResult = await chatHandler(
     { ...openaiBody, stream: true, __route: 'gemini', stream_options: { ...(openaiBody.stream_options || {}), include_usage: true } },
-    context,
+    chatContext,
   );
 
   if (!streamResult.stream) {
@@ -966,7 +1152,7 @@ export async function handleGemini(model, body, context = {}, { stream = false, 
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new GeminiStreamTranslator(realRes, requestedModel, { mode, toolNameMap });
+      const translator = new GeminiStreamTranslator(realRes, requestedModel, { mode, toolNameMap, includeThoughts });
       const captureRes = createCaptureRes(translator, realRes);
 
       // Forward client disconnect so the upstream is cancelled. Don't call

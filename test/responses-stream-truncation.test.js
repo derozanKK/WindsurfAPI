@@ -142,6 +142,63 @@ describe('Responses stream: turns that DID terminate are unchanged', () => {
   });
 });
 
+describe('Responses stream: a finish_reason of "error" is terminal', () => {
+  // The decoder can emit finish_reason:'error' and then keep streaming chunks
+  // (a later synthetic close, a trailing choice). The recorded reason must
+  // latch: otherwise 'error' followed by 'stop' closes the failed turn as
+  // response.completed.
+  const errorThenStop = async () => ({
+    status: 200, stream: true,
+    handler: async (res) => {
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'partial' } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'error' }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    },
+  });
+
+  it('stays response.failed instead of being downgraded to response.completed', async () => {
+    const { out } = await runStream(errorThenStop);
+    assert.equal(lastEvent(out), 'response.failed',
+      'an error finish must latch; a later "stop" cannot relabel a failed turn');
+    assert.equal(out.includes('response.completed'), false);
+    assert.equal(eventData(out, 'response.failed').response.status, 'failed');
+  });
+
+  it('seals the turn\'s items as incomplete — matching the non-streaming path', async () => {
+    // finish() sealed every open item 'completed' BEFORE checking whether the
+    // turn had failed, so a response.failed envelope embedded items claiming
+    // they finished. chatToResponse marks the same turn 'incomplete'.
+    const { out } = await runStream(errorThenStop);
+    const done = eventData(out, 'response.output_item.done');
+    assert.equal(done?.item?.status, 'incomplete',
+      'an item closed on a failed turn must not claim status completed');
+    const failed = eventData(out, 'response.failed');
+    assert.equal(failed.response.status, 'failed');
+    assert.ok(failed.response.output.length > 0, 'the failed envelope should embed the partial items');
+    assert.ok(
+      failed.response.output.every((item) => item.status === 'incomplete'),
+      `embedded output must be uniformly incomplete, got ${JSON.stringify(failed.response.output.map((i) => i.status))}`,
+    );
+  });
+
+  it('a stop BEFORE the error still ends failed', async () => {
+    const stopThenError = async () => ({
+      status: 200, stream: true,
+      handler: async (res) => {
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'x' } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'error' }] })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      },
+    });
+    const { out } = await runStream(stopThenError);
+    assert.equal(lastEvent(out), 'response.failed');
+  });
+});
+
 describe('a SYNTHETIC terminal chunk must not satisfy the truncation guard', () => {
   // The blocker this file originally missed. When a Cascade stream dies AFTER
   // delivering content, chat.js closes it with a FABRICATED finish_reason:'stop'
@@ -245,5 +302,42 @@ describe('connect layer: a stream with no end-of-stream frame is an error', () =
     );
     assert.equal(err, null, 'a well-formed stream must not be affected');
     assert.equal(events.find(e => e.type === 'finish').reason, 'stop');
+  });
+});
+
+describe('Responses stream: items sealed AFTER an error terminal', () => {
+  // L5 probe finding: `failedTurn` used to latch only inside finish(), so a
+  // mid-stream seal triggered by chunks arriving AFTER finish_reason:'error'
+  // closed the item 'completed' inside what became response.failed. Post-error
+  // bytes are not verifiable content — the seal must read the already-recorded
+  // failure signal and close 'incomplete'.
+  const errorThenMore = async () => ({
+    status: 200, stream: true,
+    handler: async (res) => {
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'error' }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'still streaming' } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ id: 'call_1', index: 0, type: 'function', function: { name: 'undeclared_tool', arguments: '{}' } }] } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: ' after tool' } }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    },
+  });
+
+  it('no output item claims completed inside response.failed', async () => {
+    const { out } = await runStream(errorThenMore);
+    const failed = eventData(out, 'response.failed');
+    assert.ok(failed, 'terminal must be response.failed');
+    const statuses = failed.response.output.map(i => `${i.type}:${i.status}`);
+    assert.ok(statuses.every(s => s.endsWith(':incomplete')),
+      `post-error items must seal 'incomplete', got ${JSON.stringify(statuses)}`);
+  });
+
+  it('output_item.done frames carry the same incomplete verdict', async () => {
+    const { out } = await runStream(errorThenMore);
+    const dones = [...out.matchAll(/^event: response\.output_item\.done\ndata: (.*)$/gm)]
+      .map(m => JSON.parse(m[1]));
+    assert.ok(dones.length >= 2, 'expected the message and tool-call seals');
+    assert.ok(dones.every(d => d.item.status === 'incomplete'),
+      `wire seals must be 'incomplete', got ${dones.map(d => d.item.status).join(',')}`);
   });
 });

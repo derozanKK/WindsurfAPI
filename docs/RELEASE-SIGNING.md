@@ -1,11 +1,13 @@
 # Release signing
 
-> **Status: releases are signed from v3.10.0 onward.** The release workflow signs
-> the four published binaries/zips, `SHA256SUMS`, the pushed Docker image
-> **digest**, and the source-OTA **attestation** with cosign keyless signing: the signer identity is the workflow's
-> GitHub OIDC token, exchanged for a short-lived Fulcio certificate. There is no
-> long-lived private key, no signing secret, and no key material in this
-> repository. Releases before v3.10.0 are unsigned and have no signature assets.
+**Use Cosign v3 or newer** to verify the published Sigstore bundles.
+The v3.2.11 bundles were verified with Cosign v3. Cosign v2.4.1 with the
+commands below cannot verify this bundle format.
+
+Binary and checksum signing began with v3.10.0 on October 24, 2026.
+The subsequently published v3.2.10 and v3.2.11 are also signed. The current
+release workflow uses GitHub OIDC and signs the source attestation and Docker
+digest in addition to the four platform assets and checksum manifest.
 
 ## What a release publishes
 
@@ -30,7 +32,7 @@ For every row, the release also carries one file:
 The bundle is the durable proof. A Fulcio certificate lives for minutes, and
 `cosign verify-blob --certificate` checks it against the current time unless a
 signed timestamp is supplied. Verify the bundle; there is no detached `.sig` or
-`.pem` pair attached to v3.10.0+ releases.
+`.pem` pair attached to these signed releases.
 
 The `docker` job additionally publishes the image's content address:
 
@@ -92,7 +94,7 @@ done
 sha256sum -c SHA256SUMS
 ```
 
-Only the `.sigstore.json` bundle is published from v3.10.0 onward; there is no
+The release workflow publishes the `.sigstore.json` bundle for each signed blob; there is no
 detached `.sig`/`.pem` pair to verify. The bundle is the durable proof.
 
 On macOS use `shasum -a 256 -c SHA256SUMS`. On Windows, `Get-FileHash` replaces
@@ -253,6 +255,61 @@ release environment are separate controls.
 Adding `git verify-tag` is a different root of trust (a signing key that every
 deployment must already have) and remains intentionally not wired.
 
+### Select an exact signed source release
+
+Source builds that include the release-line selector can follow a stable
+release line with `bash update.sh --line <major>.x` (e.g. `3.x`, `4.x`).
+The equivalent `WINDSURFAPI_UPDATE_RELEASE_LINE=<major>.x` setting also
+applies to dashboard Git checks and updates. Confirm support with
+`git show HEAD:update.sh` before using either option. The staged migration
+in the target release's notes remains the entry point for older
+installations.
+
+The selector ranks published stable tags of the requested major numerically
+**within the descendants of the v3.2.10 commit on the release branch**. It
+includes future minor releases and excludes the earlier v3.141 series. It
+requires an annotated tag and signed source attestation. Source updates
+follow a fast-forward. Leave the setting unset for the default numeric
+selector.
+
+For an existing source installation moving to v3.2.11, follow the
+[v3.2.11 staged migration](releases/RELEASE_NOTES_3.2.11.md#signed-upgrade).
+Both v3.141.592661 and v3.2.11 ship the numeric stable-tag selector. The
+one-shot selector described below is available in subsequent source builds
+that include this change.
+
+To check support on your trusted installation, inspect the updater source in
+the current Git revision.
+
+```bash
+git show HEAD:update.sh | grep -F 'Usage: bash update.sh [--tag vX.Y.Z]'
+```
+
+If the command prints the usage line, choose a published, signed release
+that is a descendant of your current checkout. Save a recoverable copy of
+the installation and its operator state before applying that release.
+If the line is absent, follow the staged migration in the chosen release's
+own notes.
+
+```bash
+read -r -p 'Exact signed release tag to install: ' target_tag
+bash update.sh --tag "${target_tag:?a release tag is required}"
+```
+
+The tag applies to this invocation. The updater requires the remote annotated
+tag and its peeled commit to agree with the Git advertisement, and the commit
+must be reachable from the fetched `origin/master`. Your checkout must be
+clean and able to fast-forward to that commit. The updater verifies the
+canonical repository, exact tag workflow identity, commit and tree in the
+signed release attestation before changing the checkout. To use a downloaded
+attestation and bundle, set `WINDSURFAPI_ATTESTATION_DIR` to their directory.
+Cosign and the bundle are required, and both force overrides are incompatible
+with `--tag`.
+
+After the update, check the running commit in `/health`. The script uses the
+existing PM2 health check and rollback and returns a failure if it rolls back
+the elected update.
+
 ### Docker OTA
 
 The dashboard one-click update (when `/var/run/docker.sock` is mounted) never
@@ -291,9 +348,30 @@ This installer downloads language-server binaries from a different repository
 (`windsurf-ls-release`) and verifies their own manifest/pin hashes. It is not
 covered by the release-asset signatures described here.
 
+## Manual Git-source migration from v3.141 to v3.2.x
+
+**Select the target tag manually.** The Git-source updater sorts reachable
+stable release tags by numeric major, minor and patch. It compares the lengths
+of decimal components before comparing their digits. Consequently
+`v3.141.592661` ranks above `v3.2.11`. Changing GitHub Latest does not select
+the 3.2.x line for an installation running the legacy updater.
+
+1. Choose the exact published 3.2.x tag and follow that tag's instructions.
+   For v3.2.11, use the [signed upgrade procedure](releases/RELEASE_NOTES_3.2.11.md#signed-upgrade).
+2. Back up operator state and keep the running installation available. In a
+   separate clean clone, check the annotated tag, its peeled commit, ancestry,
+   and signed source attestation with the exact tag's workflow identity.
+3. Stage the verified checkout separately. Confirm its version and build
+   commit in `/health` before switching traffic. Keep the previous checkout
+   and its data backup for rollback.
+
+The `--tag` example for `verify-release-assets.mjs` pins signature verification.
+The published v3.2.11 `update.sh` uses its automatic numeric selector.
+
 ## Historical releases
 
-- v3.10.0 and later: release assets signed as described above.
+- v3.10.0 introduced signing for the four platform assets and their checksum manifest.
+  v3.2.10 and v3.2.11 also publish the signed source attestation and image digest.
 - Docker images: signed by digest from the first release that publishes
   `image-digest.txt`; earlier images are unsigned.
 - v3.9.53–v3.9.60: `SHA256SUMS` only, unsigned. v3.9.53 recorded build-tree

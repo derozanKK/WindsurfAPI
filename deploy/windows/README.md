@@ -39,7 +39,8 @@
 | `run-background.bat` / `run.vbs` | 一次性隐藏后台(不注册任务,不跨重启) |
 | `install-task.bat` / `install-task.ps1` | 注册开机自启计划任务(主后台方案) |
 | `uninstall-task.bat` | 移除计划任务 |
-| `stop.bat` / `stop.ps1` | 停机(优雅优先,超时 `/F` 兜底) |
+| `stop.bat` / `stop.ps1` | 停机(优雅优先,超时 `/F` 兜底)。所有权绑定:只动「命令行启动的脚本 ∈ 本目录」的监督者与代际吻合的 node,PID 复用/它装同名脚本一律不动手 |
+| `ownership.psm1` | 所有权判定辅助模块(纯函数):监督者选择、代际校验、pidfile 元数据读写,供 stop/run/tray 共用 |
 | `status.bat` / `status.ps1` | 状态(RUNNING/STOPPED + PID + 端口 + 日志尾) |
 | `restart.bat` | 重启 |
 | `update.bat` | `git pull --ff-only` 拉新码(解释执行不锁文件,无需先停) |
@@ -57,6 +58,16 @@
 不可照抄 KS 的「0=重启」循环——WS 里 **75** 才是「请重启我」信号,漏接会让面板 Update 按钮卡死。
 
 ## Windows 特有注意
+
+### 停止操作的身份范围
+
+`stop.ps1` 只识别本仓库启动器实际使用的形式：PowerShell `-File` 后的本安装绝对 `run.ps1` / `start.ps1` / `tray.ps1`，以及 WScript/CScript 的本安装绝对 `run.vbs` / `tray.vbs`。任意 `-Command`、编码命令、相对路径和文件内容里的路径提及都不作为归属证明。计划任务必须只有一个 Exec action，且由 WScript/CScript 实际执行本安装 `run.vbs`；同名任务或参数子串均不足以停止它。
+
+子进程票据保留原单行数字 `windsurfapi.pid`，并以 `windsurfapi.pid.meta` 记录 PID、CIM 创建时刻、安装根目录、source/exe 模式及唯一 receipt。发布与复验都使用 `Win32_Process.CreationDate` 的精确值，没有三秒身份容差。缺失、损坏、根目录或模式不匹配的 metadata 不退回父 PID 推断；旧版数字票据需要人工核对，正常重新启动后会生成新格式。
+
+三个脚本通过同一 `windsurfapi.pid.lock` 串行化票据发布、读取与条件清理；清理只删除自己捕获的完整 receipt，保留并发启动的新票据。发出 `/F` 后必须再确认目标消失，查询失败或仍在运行时不宣称成功，也不删除票据。托盘同样在确认原 Process 对象退出前拒绝启动第二个实例。
+
+限制：Windows 的 CIM 查询与随后按数字 PID 发出的 `Stop-Process` / `taskkill` 之间仍存在很短的非原子窗口；计划任务查询与 `/end` 也不是原子事务。这里缩小并校验每个动作前后的窗口，不声称具备操作系统级原子身份绑定。锁协议只协调这些启动脚本，不保护绕过协议直接改文件的外部写者。Windows 分发包必须同时携带 `ownership.psm1`；缺失时启动器在 spawn 前报错。
 
 - **`.env` 用 UTF-8 无 BOM 写**(`start.ps1` 用 `UTF8Encoding($false)`)。`config.js` 的 `.trim()` 恰好能剥掉首键 BOM,但仍以无 BOM 为准。`.bat` 全 ASCII,中文只在 `.ps1`。
 - **必须 `HOST=127.0.0.1`**:默认 `0.0.0.0` + 空 `API_KEY` = fail-closed 锁死(看似起来了实则 401)。

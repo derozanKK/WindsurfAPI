@@ -9,22 +9,27 @@ function topFunction(name) {
   assert.ok(start >= 0 && end > start, `actual ${name} definition must exist`);
   return source.slice(start, end);
 }
-async function run(pattern, env = {}, emittedInitially = false) {
+async function run(pattern, env = {}, emittedInitially = false, freeOnlyDroughtAdmission = false) {
   const start = source.indexOf('          const attemptStream = async (a) => {');
   const end = source.indexOf('            if (leakTraceEnabled()) {', start);
   assert.ok(start >= 0 && end > start, 'the complete production attempt/loop block is required');
   const ladder = source.slice(start, end) + '\n          } finally {}';
   const accounts = Array.from({ length: 12 }, (_, i) => ({ id: `a${i}`, apiKey: `key-${i}` }));
-  let now = 0, scheduled = 0; const attempts = [], events = [], finalized = [];
+  let now = 0, scheduled = 0; const attempts = [], events = [], finalized = [], acquisitions = [];
   const deps = {
     accounts, env, emittedInitially,
-    getApiKey: tried => accounts.find(a => !tried.includes(a.apiKey)) || null,
+    // Named like the handler's local so the extracted block closes over it.
+    freeOnlyDroughtAdmission,
+    getApiKey: (tried, _modelKey, _callerKey, _selector, opts) => {
+      acquisitions.push(opts);
+      return accounts.find(a => !tried.includes(a.apiKey)) || null;
+    },
     setTimeout(fn, ms) { scheduled++; now += ms; queueMicrotask(fn); return scheduled; }, clearTimeout() {},
     streamChatCompletion: async params => {
       const n = attempts.length; attempts.push({ token: params.token, at: now });
       const code = typeof pattern === 'function' ? pattern(n) : pattern[n];
       if (code) throw Object.assign(new Error(code), { code });
-      return { content: 'ok', toolCalls: [] };
+      return { content: 'ok', toolCalls: [], finish_reason: 'stop' };
     },
     ensureDeviceSeed: () => undefined, recordTokenUsage() {}, recordAccountSpend() {}, connectSpendOpts: () => ({}),
     finalizeConnectAccount: (a, result) => finalized.push({ id: a?.id, err: result.err?.code }),
@@ -42,7 +47,11 @@ async function run(pattern, env = {}, emittedInitially = false) {
     jsonSchema: null,
     log: { info() {}, error() {} }, AbortController,
   };
-  const body = `${topFunction('acquireConnectFailover')}\n${topFunction('connectFailoverMax')}\nreturn (async () => {
+  // The extracted success arm uses the real delivery helper and its private
+  // Symbol, including the no-hook direct Chat behaviour pinned by this fixture.
+  const deliverySymbol = source.match(/^export (const DEFER_STREAM_DELIVERY = Symbol\([^\r\n]*\);)$/m)?.[1];
+  assert.ok(deliverySymbol, 'actual DEFER_STREAM_DELIVERY declaration must exist');
+  const body = `${deliverySymbol}\n${topFunction('publishStreamDelivery')}\n${topFunction('acquireConnectFailover')}\n${topFunction('connectFailoverMax')}\nreturn (async () => {
     const connectParams = {}, connectMeta = {}, reqId = 'r', reqModelName = 'model', selector = 'model', connectDisplayModel = 'model';
     const ccStart = 0, ccAcct = accounts[0], callerKey = 'owner', connectMessages = [], incomingConnectReasoning = '';
     const abortController = new AbortController(), triedKeys = [], maxHops = connectFailoverMax(env);
@@ -51,7 +60,7 @@ async function run(pattern, env = {}, emittedInitially = false) {
     ${ladder}
   })();`;
   await new Function(...Object.keys(deps), body)(...Object.values(deps));
-  return { attempts, events, finalized, scheduled };
+  return { attempts, events, finalized, scheduled, acquisitions };
 }
 
 test('R5 default outer ceiling is three adapter calls, with two account gaps', async () => {
@@ -64,6 +73,19 @@ test('R5 default outer ceiling is three adapter calls, with two account gaps', a
   assert.deepEqual(r.attempts.map(a => a.at), [0, 500, 1000]);
   assert.equal(r.events.filter(x => x === 'quota_failover_hops').length, 2);
   assert.equal(r.finalized.length, 3);
+  // Ordinary admission: the two failover acquisitions must not claim free-only.
+  assert.equal(r.acquisitions.length, 2);
+  assert.ok(r.acquisitions.every(opts => !opts?.freeOnly), 'ordinary hops must not fabricate a free-only admission');
+
+  // Free-only drought admission rides every failover hop without changing the
+  // ladder shape: still one adapter call per account, same two 500ms gaps.
+  const free = await run(() => 'QUOTA_EXHAUSTED', {}, false, true);
+  assert.equal(free.attempts.length, 3);
+  assert.deepEqual(free.attempts.map(a => a.at), [0, 500, 1000]);
+  assert.equal(free.events.filter(x => x === 'quota_failover_hops').length, 2);
+  assert.equal(free.finalized.length, 3);
+  assert.equal(free.acquisitions.length, 2);
+  assert.ok(free.acquisitions.every(opts => opts?.freeOnly === true), 'each free-only hop must pass { freeOnly: true }');
 });
 
 test('R5 healthy first-attempt success has zero scheduled delay', async () => {

@@ -1,3 +1,4 @@
+import { boundResetMs, MAX_QUOTA_RESET_MS } from './reset-hints.js';
 /**
  * Multi-account authentication pool for Codeium/Windsurf.
  *
@@ -12,6 +13,7 @@
 
 import { createHash, randomUUID, randomBytes, timingSafeEqual } from 'crypto';
 import { isStickyEnabled, getStickyBinding, peekStickyBinding, setStickyBinding, clearStickyBinding, noteStickyFallback } from './account/sticky-session.js';
+import { accountLoginIdentity, loginResultIdentity, normalizeLoginIdentity } from './account/login-identity.js';
 import { isExperimentalEnabled, getDroughtThresholdPercent, getIpLockThreshold, getIpLockMs, getBackendSwitch, getBreakerTunable, getQuotaTunable } from './runtime-config.js';
 import { readFileSync, existsSync, unlinkSync, readdirSync } from 'fs';
 import { config, log } from './config.js';
@@ -32,6 +34,9 @@ import {
   forgetCloudModelCatalog,
   setActiveCloudCatalogAccounts,
   getCloudCostTierFreeSelectors,
+  getCloudCostTierInfoForAccount,
+  getCloudCreditRateForAccount,
+  isCostTierFreeNow,
   getCloudBillingSyncState,
   getCloudSelectorPricing,
   getCloudZeroRateSelectors,
@@ -47,7 +52,7 @@ import {
 } from './devin-connect-models.js';
 import { getLsAdmissionStatus, getLsMaintenanceRequests } from './langserver.js';
 import { bumpConnect } from './devin-connect-metrics.js';
-import { deleteCredential } from './devin-connect-credentials.js';
+import * as credentials from './devin-connect-credentials.js';
 import { classifyToken, unwrapPastedSecret } from './dashboard/account-text-parser.js';
 
 import { join } from 'path';
@@ -312,12 +317,39 @@ export function isModelBlockedByDrought(modelKey) {
  */
 export function isConnectSelectorBlockedByDrought(selector) {
   if (!selector) return false;
+  if (!connectDroughtApplies(selector)) return false;
+  return !isConnectSelectorCurrentlyFree(selector);
+}
+
+/**
+ * Does the drought restriction apply to this selector at all?
+ *
+ * Shared by the gate and the free-only admission reason so the two can never
+ * disagree about WHICH selectors are in scope. Weekly-quota-exempt paid selectors
+ * (#258) are excluded here: their routing is deliberately not tied to pricing.
+ */
+function connectDroughtApplies(selector) {
+  if (!selector) return false;
   if (!isDroughtRestrictEnabled()) return false;
   if (!isDroughtMode()) return false;
-  // Weekly-quota-exempt paid selectors (#258). Separate from
-  // FREE_REACHABLE_SELECTORS so unpaid accounts stay off swe-1-7 / glm-5-2.
-  if (DROUGHT_SAFE_SELECTORS.has(selector)) return false;
-  return !isConnectSelectorCurrentlyFree(selector);
+  // Separate from FREE_REACHABLE_SELECTORS so unpaid accounts stay off
+  // swe-1-7 / glm-5-2.
+  return !DROUGHT_SAFE_SELECTORS.has(selector);
+}
+
+/**
+ * Was this selector admitted by the drought gate SOLELY because it is currently
+ * free? That is the one admission reason that is per-account in reality but
+ * pool-wide in decision: `isConnectSelectorCurrentlyFree` says "SOME account can
+ * run it without debiting quota", so the scheduler must not hand the request to a
+ * different account that bills for it. This is the gate's complementary arm —
+ * `blocked === !free` within `connectDroughtApplies` — exposed so the handler can
+ * carry the reason into account selection instead of re-deriving the predicate (a
+ * second copy is how "admitted as free" and "selected as free" drift apart).
+ */
+export function isConnectFreeOnlyDroughtAdmission(selector) {
+  if (!connectDroughtApplies(selector)) return false;
+  return isConnectSelectorCurrentlyFree(selector);
 }
 
 /**
@@ -555,6 +587,49 @@ export function isConnectSelectorCurrentlyFree(selector) {
 }
 
 /**
+ * Is `selector` free on THIS account right now?
+ *
+ * The pool-wide answer (above) is "somebody can run it without spending quota",
+ * which is exactly wrong for a free-only admission: spending account A's promotion
+ * on account B's bill is the defect. This asks the same evidence sources the pool
+ * answer reads, scoped to one account:
+ *
+ *   1. that account's paired rate table, keeping only `rate === 0`;
+ *   2. that account's cost-tier row, promo-aware (`isCostTierFreeNow`); and
+ *   3. that account's own catalog `creditMultiplier`, keeping only a strict numeric 0.
+ *
+ * (3) is the same fact the gate already reads through `getCloudCreditRate`, but
+ * account-scoped: a deployment whose accounts never receive a GetUserStatus rate
+ * table still gets the catalog's zero, and account A's zero never admits account B.
+ * Absence stays not-free; a nonzero rate (including a discounted-but-paid row)
+ * bills. A stale last-known zero is still trusted: nothing here expires pricing,
+ * so an old zero keeps admitting until the next accepted sync replaces or clears
+ * it — the same behaviour as the rate-table and cost-tier arms above, and the same
+ * at the pool gate. Freshness is reported elsewhere, not enforced by this
+ * predicate; read that way, it can still only ever NARROW the gate's admission,
+ * never widen it.
+ *
+ * One deliberate exception, and it is not a new fallback: when the pool gate itself
+ * fell back to the static FREE_REACHABLE floor (`freeReason === 'fallback_whitelist'`
+ * — no live source anywhere named the selector), the gate's "free" is a
+ * deployment-level entitlement statement that applies to every account. Refusing it
+ * here would turn a cold-start deployment's admitted selector into a 429.
+ */
+export function isConnectSelectorFreeForAccount(account, selector) {
+  if (!account || !selector) return false;
+  const table = account.credits?.rateTable;
+  if (table && !Array.isArray(table)) {
+    const rate = table[selector];
+    if (typeof rate === 'number' && rate === 0) return true;
+  }
+  const info = getCloudCostTierInfoForAccount(selector, account.id);
+  if (info && isCostTierFreeNow(info)) return true;
+  const catalogRate = getCloudCreditRateForAccount(selector, account.id);
+  if (catalogRate && catalogRate.credit === 0) return true;
+  return getConnectSelectorPricing(selector).freeReason === 'fallback_whitelist';
+}
+
+/**
  * The connect selectors this deployment can run without debiting quota.
  *
  * Cost-tier FREE rows first (the live catalog's own answer, promo-aware), then
@@ -637,10 +712,45 @@ export function getDroughtSummary({ env = process.env } = {}) {
   };
 }
 
+function rpmReservationTime(entry) {
+  return typeof entry === 'number' ? entry : entry?.timestamp;
+}
+
+function recordRpmReservation(account, now, trackReservation) {
+  const reservationTimestamp = nextReservationToken(now);
+  if (!trackReservation) {
+    account._rpmHistory.push(reservationTimestamp);
+    return { reservationTimestamp };
+  }
+
+  // A tracked checkout owns its exact RPM entry and one slot on this account
+  // record. The key can rotate during a turn, and stale cleanup can retire
+  // an entire set of slots before a late completion arrives.
+  const entry = { timestamp: reservationTimestamp };
+  const active = account._trackedReservations ??= new Set();
+  const apiKey = account.apiKey;
+  const keyGeneration = account._keyGeneration;
+  active.add(entry);
+  account._rpmHistory.push(entry);
+  return {
+    reservationTimestamp,
+    canReportHealth() {
+      return active.has(entry) && account._keyGeneration === keyGeneration
+        && isCurrentAccount(account) && accounts.find(a => a.apiKey === apiKey) === account;
+    },
+    settleReservation(refund) {
+      // The captured record can retire while its last turn is still finishing.
+      if (!active.delete(entry)) return;
+      if (refund) refundAccountReservation(account, entry);
+      _releaseAccountObj(account);
+    },
+  };
+}
+
 function pruneRpmHistory(account, now) {
   if (!account._rpmHistory) account._rpmHistory = [];
   const cutoff = now - RPM_WINDOW_MS;
-  while (account._rpmHistory.length && account._rpmHistory[0] < cutoff) {
+  while (account._rpmHistory.length && rpmReservationTime(account._rpmHistory[0]) < cutoff) {
     account._rpmHistory.shift();
   }
   return account._rpmHistory.length;
@@ -654,7 +764,7 @@ function rpmHistoryCount(account, now) {
   if (!Array.isArray(hist) || hist.length === 0) return 0;
   const cutoff = now - RPM_WINDOW_MS;
   let first = 0;
-  while (first < hist.length && hist[first] < cutoff) first++;
+  while (first < hist.length && rpmReservationTime(hist[first]) < cutoff) first++;
   return hist.length - first;
 }
 
@@ -837,6 +947,11 @@ export const RATE_LIMIT_PERSIST_MAX_MS = 24 * 60 * 60 * 1000;
 
 // Normalize one persisted deadline: 0 unless it is a finite timestamp in the
 // future, clamped so the remaining window can never exceed the persistence cap.
+function sanitizeQuotaDeadline(value, now) {
+  if (!Number.isFinite(value) || value <= now) return 0;
+  return Math.min(value, now + MAX_QUOTA_RESET_MS);
+}
+
 function sanitizeRateLimitDeadline(value, now) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= now) return 0;
   return Math.min(value, now + RATE_LIMIT_PERSIST_MAX_MS);
@@ -906,6 +1021,10 @@ function _serializeAccounts() {
     // `status === 'reauth'` is the bit; this only explains it. Written solely by
     // markNeedsReauth and dropped the moment the account re-enters rotation.
     ...(a.status === 'reauth' && a.reauth ? { reauth: a.reauth } : {}),
+    // The address a successful login proved for this row. The display email is
+    // renameable (updateAccountLabel); this field is not, and re-login / bound
+    // identity checks use it instead of the label.
+    ...(a.identityEmail ? { identityEmail: a.identityEmail } : {}),
     // Which email the stored re-login credential is keyed by. The display email
     // is renameable (updateAccountLabel), so re-login and account removal must
     // not look the credential up by it.
@@ -931,7 +1050,7 @@ function _serializeAccounts() {
     // RB2/B2: quota-exhaustion cooldown deadline (own self-healing dimension,
     // separate from transient rateLimitedUntil). Persisted so a restart mid-
     // cooldown doesn't immediately re-select a dry account and eat a 402.
-    quotaResetAt: a.quotaResetAt || 0,
+    quotaResetAt: sanitizeQuotaDeadline(a.quotaResetAt, now),
     // V-18: provenance travels WITH a live deadline, so a restart cannot turn a
     // live-402 window into one a weekly snapshot is allowed to clear.
     ...(a.quotaResetAt > now && QUOTA_RESET_SOURCES.has(a.quotaResetSource)
@@ -1119,6 +1238,9 @@ function _deserializeAccount(a, now = Date.now()) {
     // well-formed record survives; the STATUS is the bit, so a corrupt record
     // loses the explanation but never puts the account back in rotation.
     ...(reauth ? { reauth } : {}),
+    // No migration from `email` or `credentialEmail`: a historical row without
+    // a persisted verified identity stays unverified and must re-verify.
+    identityEmail: typeof a.identityEmail === 'string' ? a.identityEmail.trim().toLowerCase() : '',
     credentialEmail: typeof a.credentialEmail === 'string' ? a.credentialEmail : '',
     lastUsed: 0, errorCount: 0,
     refreshToken: a.refreshToken || '', expiresAt: 0, refreshTimer: null,
@@ -1144,7 +1266,7 @@ function _deserializeAccount(a, now = Date.now()) {
     userStatus: a.userStatus || null,
     userStatusLastFetched: a.userStatusLastFetched || 0,
     // RB2/B2 + B1: restore self-healing quota cooldown + backoff memory.
-    quotaResetAt: a.quotaResetAt || 0,
+    quotaResetAt: sanitizeQuotaDeadline(a.quotaResetAt, now),
     // V-18: an unrecorded provenance (older accounts.json) stays null — unknown
     // is never treated as "a snapshot wrote this", so the deadline is only
     // cleared by expiry. A source without a live deadline is meaningless.
@@ -1814,22 +1936,61 @@ async function registerWithCodeium(idToken) {
 
 // ─── Account management ───────────────────────────────────
 
+// The label is stored into `email` and rendered into dashboard rows, batch
+// results, the search corpus and log lines. The write took the string
+// verbatim, so a caller-supplied label could carry C0/C1 controls (ANSI into
+// the operator's terminal when a log line prints it), characters that break
+// the markup contexts escapers don't reach, or a length that wedges the
+// table. Printable Unicode is legitimate (non-ASCII names exist); control
+// chars and a >128-char blob are not. Caller labels reject via a coded error
+// so the API layer can return a 400 with a stable code instead of a silent
+// no-op; upstream-derived names are sanitized instead — a hostile registry
+// name must not turn a successful login into a 400 (S5).
+const MAX_ACCOUNT_LABEL = 128;
+// Boundary for text that lands in `account.email`/labels: C0/C1 controls
+// (ANSI, forged log lines) AND the invisible/bidi format characters that let
+// one label impersonate another on the dashboard (RLO U+202E can visually
+// reverse "treppa-metsyS"-style text; ZWSP/BOM/SHY/invisible operators hide
+// in plain sight). ZWJ/ZWNJ/LRM/RLM stay allowed — real RTL names and emoji
+// sequences use them.
+const LABEL_UNSAFE = /[\x00-\x1f\x7f-\x9f\xad\u034f\u180e\u200b\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
+const LABEL_UNSAFE_GLOBAL = /[\x00-\x1f\x7f-\x9f\xad\u034f\u180e\u200b\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+
+function assertAccountLabel(label) {
+  if (!label || label.length > MAX_ACCOUNT_LABEL || LABEL_UNSAFE.test(label)) {
+    throw Object.assign(new Error('ERR_ACCOUNT_LABEL_INVALID'), {
+      code: 'ERR_ACCOUNT_LABEL_INVALID', statusCode: 400,
+    });
+  }
+}
+
+export function sanitizeLabelText(value) {
+  return String(value || '').replace(LABEL_UNSAFE_GLOBAL, '').trim().slice(0, MAX_ACCOUNT_LABEL);
+}
+
 /**
  * Add account via API key.
  */
 export function addAccountByKey(apiKey, label = '', apiServerUrl = '') {
+  return addAccountByKeyWithDisposition(apiKey, label, apiServerUrl).account;
+}
+
+export function addAccountByKeyWithDisposition(apiKey, label = '', apiServerUrl = '') {
   const existing = accounts.find(a => a.apiKey === apiKey);
   if (existing) {
     if (apiServerUrl && !existing.apiServerUrl) {
       existing.apiServerUrl = apiServerUrl;
       saveAccounts();
     }
-    return existing;
+    return { account: existing, poolDisposition: 'existing' };
   }
 
+  if (label != null && typeof label !== 'string') assertAccountLabel('');
+  const callerLabel = typeof label === 'string' ? label.trim() : '';
+  if (callerLabel) assertAccountLabel(callerLabel);
   const account = {
     id: randomUUID().slice(0, 8),
-    email: label || `key-${apiKey.slice(0, 8)}`,
+    email: callerLabel || `key-${apiKey.slice(0, 8)}`,
     apiKey,
     apiServerUrl: apiServerUrl || '',
     method: 'api_key',
@@ -1851,7 +2012,7 @@ export function addAccountByKey(apiKey, label = '', apiServerUrl = '') {
   saveAccounts();
   log.info(`Account added: ${safeAccountRef(account)} [api_key]`);
   trySyncModelCatalog();
-  return account;
+  return { account, poolDisposition: 'added' };
 }
 
 /**
@@ -1861,6 +2022,10 @@ export function addAccountByKey(apiKey, label = '', apiServerUrl = '') {
  * there (#257). The OAuth callback already classified; POST /accounts did not.
  */
 export async function addAccountByPastedSecret(secret, label = '', apiServerUrl = '', opts = {}) {
+  return (await addAccountByPastedSecretWithDisposition(secret, label, apiServerUrl, opts)).account;
+}
+
+export async function addAccountByPastedSecretWithDisposition(secret, label = '', apiServerUrl = '', opts = {}) {
   const value = unwrapPastedSecret(secret);
   if (!value) {
     const err = new Error('ERR_NO_TOKEN_IN_INPUT');
@@ -1879,29 +2044,36 @@ export async function addAccountByPastedSecret(secret, label = '', apiServerUrl 
     throw err;
   }
   if (kind === 'session' || value.startsWith('sk-')) {
-    return addAccountByKey(value, label, apiServerUrl);
+    return addAccountByKeyWithDisposition(value, label, apiServerUrl);
   }
   // The dashboard Type=API Key field (and batch-import kind=api_key) still
   // means "this is a pool key" for unclassified strings. Without this, a
   // short real apiKey would hit RegisterUser. auth1_ / JWT / session are
   // classified above and must not take this branch.
   if (opts && opts.unknownAsKey === true && kind === 'unknown') {
-    return addAccountByKey(value, label, apiServerUrl);
+    return addAccountByKeyWithDisposition(value, label, apiServerUrl);
   }
-  return addAccountByToken(value, label);
+  return addAccountByTokenWithDisposition(value, label);
 }
 
 /**
  * Add account via auth token.
  */
 export async function addAccountByToken(token, label = '') {
+  return (await addAccountByTokenWithDisposition(token, label)).account;
+}
+
+async function addAccountByTokenWithDisposition(token, label) {
   const reg = await registerWithCodeium(token);
   const existing = accounts.find(a => a.apiKey === reg.apiKey);
-  if (existing) return existing;
+  if (existing) return { account: existing, poolDisposition: 'existing' };
 
+  if (label != null && typeof label !== 'string') assertAccountLabel('');
+  const callerLabel = typeof label === 'string' ? label.trim() : '';
+  if (callerLabel) assertAccountLabel(callerLabel);
   const account = {
     id: randomUUID().slice(0, 8),
-    email: label || reg.name || `token-${reg.apiKey.slice(0, 8)}`,
+    email: callerLabel || sanitizeLabelText(reg.name) || `token-${reg.apiKey.slice(0, 8)}`,
     apiKey: reg.apiKey,
     apiServerUrl: reg.apiServerUrl || '',
     method: 'token',
@@ -1923,8 +2095,16 @@ export async function addAccountByToken(token, label = '') {
   saveAccounts();
   log.info(`Account added: ${safeAccountRef(account)} [token] server=${account.apiServerUrl}`);
   trySyncModelCatalog();
-  return account;
+  return { account, poolDisposition: 'added' };
 }
+
+// Test seam for the email/password import path. Production resolves the real
+// login module; tests inject a fake login (and, when they want to observe the
+// store contract, fake store functions) so no provider call or real key is
+// needed. The locality/consent decision is NOT made here — callers pass the
+// already-gated boolean, so this path cannot invent consent of its own.
+let _emailImportDeps = null;
+export function __setEmailImportDeps(deps) { _emailImportDeps = deps || null; }
 
 /**
  * Add account via email/password.
@@ -1934,21 +2114,40 @@ export async function addAccountByToken(token, label = '') {
  * CheckUserLoginMethod (with /_devin-auth/connections fallback), then
  * register a Codeium api_key. Refresh token (Firebase path) is persisted
  * so the background renewal loop in checkAndRefreshTokens picks it up.
+ *
+ * `opts.storeCredential === true` is the operation's explicit consent to retain
+ * the password. Without it the login still succeeds and the verified identity
+ * is recorded, but nothing is written to the encrypted store and no lookup
+ * binding is claimed. The caller is responsible for the locality gate.
  */
-export async function addAccountByEmail(email, password) {
+export async function addAccountByEmail(email, password, opts = {}) {
   if (!email || !password) {
     throw new Error('email and password required');
   }
-  const emailKey = String(email).trim().toLowerCase();
-  const { windsurfLogin } = await import('./dashboard/windsurf-login.js');
+  const wantStore = opts?.storeCredential === true;
+  const loginMod = await import('./dashboard/windsurf-login.js');
+  const windsurfLogin = _emailImportDeps?.windsurfLogin || loginMod.windsurfLogin;
   const result = await windsurfLogin(email, password, null);
   if (!result?.apiKey) {
     throw new Error('Login succeeded but no apiKey returned');
   }
-  const label = result.name || email;
-  const existingByEmail = accounts.find(a => String(a.email || '').trim().toLowerCase() === emailKey);
+  const label = sanitizeLabelText(result.name) || sanitizeLabelText(email) || email;
+  // The address this login proved. Prefer the login result's own identity over
+  // the request input, but never use the display name: that is what an operator
+  // may rename at will.
+  const identity = loginResultIdentity(result);
+  const existingByKey = accounts.find(a => a.apiKey === result.apiKey);
+  const keyIdentity = accountLoginIdentity(existingByKey);
+  if (identity && keyIdentity) loginMod.assertLoginIdentity(result, keyIdentity);
+  // Reuse an exact key or a verified address, including a legacy store
+  // binding. An editable label cannot establish ownership of an older row.
+  const existingByEmail = !existingByKey && identity
+    ? accounts.find(a => accountLoginIdentity(a) === identity)
+    : null;
   const account = existingByEmail || addAccountByKey(result.apiKey, label);
-  if (existingByEmail) {
+  if (account.status === 'reauth' && identity && accountLoginIdentity(account) === identity) {
+    markAccountReauthenticated(account.id, { apiKey: result.apiKey, via: 'password', allowSameKey: true });
+  } else if (existingByEmail) {
     const apiKeyChanged = account.apiKey !== result.apiKey;
     const previousKey = account.apiKey;
     account.apiKey = result.apiKey;
@@ -1959,6 +2158,16 @@ export async function addAccountByEmail(email, password) {
     }
     if (account.status === 'error') account.status = 'active';
     account.errorCount = 0;
+  }
+  if (identity) {
+    // Persist the proof even when no password was retained: a later bound login
+    // or auto re-login needs the stable identity, not the store record.
+    account.identityEmail = identity;
+    // A lookup key that names a different address no longer describes this
+    // row's identity. Drop the binding (the old secret is left on disk; consent
+    // changes must not delete historical records).
+    const bound = normalizeLoginIdentity(account.credentialEmail);
+    if (bound && bound !== identity) account.credentialEmail = '';
   }
   if (account.email !== label) {
     account.email = label;
@@ -1973,15 +2182,33 @@ export async function addAccountByEmail(email, password) {
       idToken: result.idToken || '',
     });
   }
-  // Persist the password (encrypted) so a dead session_id can be auto-recovered
-  // via re-login. No-op unless DEVIN_CONNECT_CRED_KEY is set. Best-effort: a
-  // store failure must not break the login that already succeeded.
-  try {
-    const { storeCredential, isCredStoreEnabled } = await import('./devin-connect-credentials.js');
-    if (isCredStoreEnabled()) storeCredential(email, password);
-  } catch (e) {
-    log.warn(`could not persist credential for re-login: ${e.message}`);
+  // Persist the password (encrypted) only when THIS operation explicitly asked
+  // for retention. Login success never implies consent: without wantStore the
+  // store is untouched, and no lookup binding is claimed. Best-effort:
+  // a disabled/failed store must not break the login that already succeeded.
+  if (wantStore) {
+    if (!identity) {
+      log.warn(`Credential NOT stored for ${safeAccountRef(account)} — the login reported no identity to bind it to`);
+    } else {
+      try {
+        const credMod = _emailImportDeps?.storeCredential ? _emailImportDeps : credentials;
+        if (credMod.isCredStoreEnabled()) {
+          if (credMod.storeCredential(identity, password) === true) {
+            // The record is keyed by the verified identity; remember it so a
+            // later rename cannot orphan the secret.
+            account.credentialEmail = identity;
+          } else {
+            log.warn(`Credential NOT stored for ${safeAccountRef(account)} — auto-relogin stays disarmed`);
+          }
+        } else {
+          log.debug(`Credential NOT stored for ${safeAccountRef(account)} — credential storage is disabled`);
+        }
+      } catch (e) {
+        log.warn(`could not persist credential for re-login: ${e.code || e.message}`);
+      }
+    }
   }
+  bumpAccountCredentialRevision(account);
   saveAccounts();
   log.info(`Account added via email: ${safeAccountRef(account)}`);
   trySyncModelCatalog();
@@ -2200,6 +2427,7 @@ function isAdmittedForRequest(account, {
   now = Date.now(),
   inflightCap = maxInflightPerAccount(),
   excludeKeys = null,
+  requireFreeSelector = null,
 } = {}) {
   if (!account || account.status !== 'active') return false;
   if (excludeKeys && excludeKeys.includes(account.apiKey)) return false;
@@ -2211,6 +2439,13 @@ function isAdmittedForRequest(account, {
   if (isInflightCapped(account, inflightCap)) return false;
   if (modelKey && !isModelAllowedForAccount(account, modelKey)) return false;
   if (connectSelector && !isConnectSelectorAllowedForAccount(account, connectSelector)) return false;
+  // Free-only admission (`requireFreeSelector`): the drought gate let this request
+  // through because the SELECTOR is free on SOME account. Handing it to a peer that
+  // bills for the same selector is the quota burn the gate exists to prevent, so the
+  // per-account fact is part of admission itself — the same predicate the sticky
+  // arm, the candidate loop, the degraded fallback and the preflights already use,
+  // which is what keeps "usable here" and "selected there" from drifting.
+  if (requireFreeSelector && !isConnectSelectorFreeForAccount(account, requireFreeSelector)) return false;
   return true;
 }
 
@@ -2260,6 +2495,24 @@ export function markSelectorIneligible(apiKey, selector, { credentialCurrent = t
 // True if at least one active account is entitled to this connect selector.
 export function hasConnectEntitledAccount(selector) {
   return accounts.some(a => a.status === 'active' && isConnectSelectorAllowedForAccount(a, selector));
+}
+
+// Owner decision (release candidate): a selector the upstream catalog has
+// dropped for EVERY entitled account is a permanent miss, not pool pressure —
+// answering it as a retryable 429 tells the client to keep retrying a model
+// that cannot run on this pool. True when at least one active account is
+// entitled and every entitled active account is selector-latched
+// (isSelectorIneligible: upstream said "no longer available for this account").
+export function isConnectSelectorUnavailableForAll(selector) {
+  let entitled = 0;
+  let ineligible = 0;
+  for (const a of accounts) {
+    if (a.status !== 'active') continue;
+    if (!isConnectSelectorAllowedForAccount(a, selector)) continue;
+    entitled++;
+    if (isSelectorIneligible(a, selector)) ineligible++;
+  }
+  return entitled > 0 && ineligible === entitled;
 }
 
 /** List of model keys this account is currently allowed to call. */
@@ -2321,6 +2574,23 @@ function isOperatorTerminalStatus(status) {
 // stale RPC result onto the new row is exactly the cross-epoch bug this guards.
 function isCurrentAccount(account) {
   return Boolean(account) && accounts.find(a => a.id === account.id) === account;
+}
+
+// In-process revision for asynchronous credential writers. It also distinguishes
+// rotations that reuse a previous token or happen in the same clock tick.
+function bumpAccountCredentialRevision(account) {
+  account._credentialRevision = (account._credentialRevision || 0) + 1;
+}
+
+export function captureAccountCredential(account) {
+  return { account, apiKey: account.apiKey, revision: account._credentialRevision, identity: accountLoginIdentity(account) };
+}
+
+export function isCurrentAccountCredential({ account, apiKey, revision, identity }) {
+  return isCurrentAccount(account)
+    && account.apiKey === apiKey
+    && account._credentialRevision === revision
+    && accountLoginIdentity(account) === identity;
 }
 
 // ─── Session re-auth (`status: 'reauth'`) ───────────────────────────────────
@@ -2427,6 +2697,7 @@ export function markAccountReauthenticated(id, { apiKey = null, via = 'manual', 
   account.erroredAt = 0;
   account._errorAt = 0;
   account._reloginAt = Date.now();
+  bumpAccountCredentialRevision(account);
   delete account.reauth;
   // A real login proves the credential is fine, so a stale ban-signal streak
   // must not re-ban it on the next single hit. The ban FIELDS are only cleared
@@ -2527,6 +2798,7 @@ export function setAccountStatus(id, status, { force = false } = {}) {
   const account = accounts.find(a => a.id === id);
   if (!account) return false;
   if (account.status === 'reauth' && status === 'active' && !force) throw reauthRefusal();
+  if (account.status !== status && isOperatorTerminalStatus(status)) bumpAccountCredentialRevision(account);
   account.status = status;
   if (status === 'active') {
     account.errorCount = 0;
@@ -2561,14 +2833,25 @@ export function resetAccountErrors(id) {
  * Update account label.
  *
  * The label IS the display email (the dashboard renames a row by editing it), so
- * it moves `email` — but NOT `credentialEmail`: the encrypted password record is
- * keyed by the address it was stored under, and re-login / removal must keep
- * finding it after a rename.
+ * it moves `email` — but NOT `identityEmail` or `credentialEmail`: the verified
+ * login identity and the encrypted password record are keyed by the address a
+ * successful login proved, and re-login / removal must keep using it after a
+ * rename.
  */
+// The label is stored into `email` and rendered into dashboard rows, batch
+// results, the search corpus and log lines. The write took the string
+// verbatim, so a PATCHed label could carry C0/C1 controls (ANSI into the
+// operator's terminal when a log line prints it), characters that break the
+// markup contexts escapers don't reach, or a length that wedges the table.
+// Printable Unicode is legitimate (non-ASCII names exist); control chars and
+// a >128-char blob are not. Rejects via a coded error so the API layer can
+// return a 400 with a stable code instead of a silent no-op.
 export function updateAccountLabel(id, label) {
   const account = accounts.find(a => a.id === id);
   if (!account) return false;
-  account.email = label;
+  const next = typeof label === 'string' ? label.trim() : '';
+  assertAccountLabel(next);
+  account.email = next;
   saveAccounts();
   return true;
 }
@@ -2581,7 +2864,30 @@ export function updateAccountLabel(id, label) {
 export function setAccountCredentialEmail(id, email) {
   const account = accounts.find(a => a.id === id);
   if (!account) return false;
-  account.credentialEmail = String(email || '');
+  const next = String(email || '');
+  if (normalizeLoginIdentity(account.credentialEmail) !== normalizeLoginIdentity(next)) {
+    bumpAccountCredentialRevision(account);
+  }
+  account.credentialEmail = next;
+  saveAccounts();
+  return true;
+}
+
+/**
+ * Persist the address a successful login proved for this row.
+ *
+ * This is the stable identity used by bound login checks and auto re-login; it
+ * is deliberately separate from the renameable display email (`email`) and
+ * from the credential-store lookup key (`credentialEmail`), so a login that did
+ * not retain a password still leaves a usable identity behind.
+ */
+export function setAccountIdentityEmail(id, email) {
+  const account = accounts.find(a => a.id === id);
+  if (!account) return false;
+  const next = normalizeLoginIdentity(email);
+  if (!next) return false;
+  if (account.identityEmail !== next) bumpAccountCredentialRevision(account);
+  account.identityEmail = next;
   saveAccounts();
   return true;
 }
@@ -2609,6 +2915,39 @@ export function setAccountTier(id, tier) {
   return true;
 }
 
+// ─── Account-gone cleanup (G14) ─────────────────────────────
+// removeAccount / reportBanSignal / key rotation fire these cleanups as
+// un-awaited dynamic imports: the callers are synchronous, and a static
+// import would cycle (conversation-pool / windsurf-api reach back through
+// config). A rejection must still be OBSERVABLE — a failed invalidateFor
+// leaves pool entries resuming onto a dead account, a failed evictForAccount
+// leaves a resumable detached pin, and a failed user-JWT epoch bump keeps a
+// mint cached for a rotated key — all previously swallowed by
+// `.catch(()=>{})`. Every failure is counted (account_cleanup_failed) and
+// logged; the caller still never waits on the cleanup.
+//
+// Test seam (__setReloginDeps shape): a deps map keyed by cleanup name can
+// substitute the cleanup promise so a rejection is exercised without a
+// module loader. Production leaves it null.
+let _accountCleanupDeps = null;
+export function __setAccountCleanupDeps(deps) { _accountCleanupDeps = deps || null; }
+
+function reportAccountCleanupFailure(op) {
+  return (e) => {
+    bumpConnect('account_cleanup_failed');
+    log.warn(`account cleanup "${op}" failed — stale pool/detached/JWT state may persist: ${e?.message || e}`);
+  };
+}
+
+function accountCleanup(op, start) {
+  try {
+    const dep = _accountCleanupDeps && _accountCleanupDeps[op];
+    Promise.resolve(dep ? dep() : start()).catch(reportAccountCleanupFailure(op));
+  } catch (e) {
+    reportAccountCleanupFailure(op)(e);
+  }
+}
+
 // Invalidate any cached short-lived user JWT minted for the pool. The mint
 // cache lives in windsurf-api.js; the epoch is bumped on every key rotation /
 // account removal so a mint racing a logout cannot repopulate a stale JWT.
@@ -2617,7 +2956,7 @@ export function setAccountTier(id, tier) {
 // would cycle), and this already follows the module's existing lazy-import
 // pattern for windsurf-api.js in the model-catalog sync path.
 function bumpUserJwtEpoch() {
-  import('./windsurf-api.js').then(m => m.__bumpUserJwtCacheEpoch()).catch(() => {});
+  accountCleanup('bumpUserJwtCacheEpoch', () => import('./windsurf-api.js').then(m => m.__bumpUserJwtCacheEpoch()));
 }
 
 export function setAccountTokens(id, { apiKey, refreshToken, idToken } = {}) {
@@ -2625,6 +2964,9 @@ export function setAccountTokens(id, { apiKey, refreshToken, idToken } = {}) {
   if (!account) return false;
   const previousKey = account.apiKey;
   const apiKeyChanged = apiKey != null && account.apiKey !== apiKey;
+  const refreshChanged = refreshToken != null && account.refreshToken !== refreshToken;
+  const idTokenChanged = idToken != null && account.idToken !== idToken;
+  if (apiKeyChanged || refreshChanged || idTokenChanged) bumpAccountCredentialRevision(account);
   if (apiKey != null) account.apiKey = apiKey;
   if (refreshToken != null) account.refreshToken = refreshToken;
   if (idToken != null) account.idToken = idToken;
@@ -2646,8 +2988,9 @@ export function setAccountTokens(id, { apiKey, refreshToken, idToken } = {}) {
  */
 function markKeyRotation(account, previousKey) {
   if (!account || typeof account !== 'object') return;
-  if (!previousKey || previousKey === account.apiKey) return;
-  account.keyRotatedAt = Date.now();
+  if (previousKey === account.apiKey) return;
+  account._keyGeneration = Symbol();
+  if (previousKey) account.keyRotatedAt = Date.now();
 }
 
 // Per-account re-login throttle: a dead session_id will reject EVERY in-flight
@@ -2795,10 +3138,21 @@ export async function reLoginAccount(id, { force = false, signal } = {}) {
     log.debug(`re-login ${safeAccountRef(account)} skipped: operator ${account.status}`);
     return false;
   }
-  const tokenAtStart = account.apiKey;
+  const credential = captureAccountCredential(account);
+  // Auto re-login must be driven by a proven identity, never by the renameable
+  // display label. `credentialEmail` is a legacy-but-trustworthy store binding
+  // (it was written only after a successful login); a row with neither field is
+  // ambiguous and must be re-verified explicitly.
+  const identityAtStart = credential.identity;
+  if (!identityAtStart) {
+    log.debug(`re-login ${safeAccountRef(account)} skipped: no verified identity — re-verification required`);
+    return false;
+  }
 
-  const { isCredStoreEnabled, getCredential } = _reloginDeps
-    || await import('./devin-connect-credentials.js');
+  const credDeps = (_reloginDeps?.isCredStoreEnabled && _reloginDeps?.getCredential)
+    ? _reloginDeps
+    : await import('./devin-connect-credentials.js');
+  const { isCredStoreEnabled, getCredential } = credDeps;
   if (!isCredStoreEnabled()) return false;
 
   const state = _reloginState.get(id) || { lastAttempt: 0, inflight: null };
@@ -2810,9 +3164,14 @@ export async function reLoginAccount(id, { force = false, signal } = {}) {
   }
 
   const attempt = (async () => {
+    if (!isCurrentAccountCredential(credential) || isOperatorTerminalStatus(account.status)) return false;
+    const credentialKey = accountCredentialStoreKey(account);
+    if (!credentialKey) return false;
     let password;
     try {
-      password = getCredential(account.credentialEmail || account.email);
+      // The store key is the address the record was written under. When the
+      // legacy binding is absent, the verified identity is the key.
+      password = getCredential(credentialKey);
     } catch (e) {
       // Wrong key / tampered record — credential unusable, not absent.
       log.warn(`re-login ${safeAccountRef(account)}: credential unusable (${e.message})`);
@@ -2837,23 +3196,24 @@ export async function reLoginAccount(id, { force = false, signal } = {}) {
     try {
       // Revalidate after the queued wait: the operator may have disabled,
       // banned, removed or re-keyed the row while this attempt held no slot.
-      if (!isCurrentAccount(account) || isOperatorTerminalStatus(account.status) || account.apiKey !== tokenAtStart) {
+      if (!isCurrentAccountCredential(credential) || isOperatorTerminalStatus(account.status)) {
         log.debug(`re-login ${safeAccountRef(account)} skipped: account changed while queued`);
         return false;
       }
       const proxy = getEffectiveProxy(account.id) || null;
-      const { windsurfLogin } = _reloginDeps || await import('./dashboard/windsurf-login.js');
-      const result = await windsurfLogin(account.email, password, proxy);
+      const loginMod = await import('./dashboard/windsurf-login.js');
+      const windsurfLogin = _reloginDeps?.windsurfLogin || loginMod.windsurfLogin;
+      const result = await windsurfLogin(identityAtStart, password, proxy);
       if (!result?.apiKey) throw new Error('login returned no apiKey');
+      // The result must belong to the identity this row was verified as. A
+      // missing proof is a refusal too: assertLoginIdentity does not treat an
+      // empty expectation as a wildcard.
+      loginMod.assertLoginIdentity(result, identityAtStart);
       // The login RPC is the longest await in this path. Revalidate identity,
       // operator intent and the credential epoch BEFORE committing anything: a
       // disable/ban issued while the login was in flight wins, and a removed or
       // re-added row must never receive the old attempt's token.
-      if (!isCurrentAccount(account) || isOperatorTerminalStatus(account.status)) {
-        log.warn(`re-login ${safeAccountRef(account)} result discarded: account is ${account.status} or no longer in the pool`);
-        return false;
-      }
-      if (account.apiKey !== tokenAtStart) {
+      if (!isCurrentAccountCredential(credential) || isOperatorTerminalStatus(account.status)) {
         log.warn(`re-login ${safeAccountRef(account)} result discarded: credential changed during login`);
         return false;
       }
@@ -2866,12 +3226,18 @@ export async function reLoginAccount(id, { force = false, signal } = {}) {
         bumpUserJwtEpoch();
       }
       if (result.refreshToken) account.refreshToken = result.refreshToken;
+      // A successful login re-proves the identity. Persist it (migrating a
+      // legacy credentialEmail-only row) and record the store key that actually
+      // produced the password when no explicit binding existed.
+      account.identityEmail = identityAtStart;
+      if (!account.credentialEmail) account.credentialEmail = identityAtStart;
       const wasReauth = account.status === 'reauth';
       account.status = 'active';
       account.errorCount = 0;
       account.erroredAt = 0;
       account._errorAt = 0;
       account._reloginAt = Date.now();
+      bumpAccountCredentialRevision(account);
       // A successful login proves the NEW token works, so the evidence behind a
       // previous reauth verdict is dead — dropping it is what makes the state
       // change structural rather than a second flag to remember.
@@ -2976,9 +3342,15 @@ export async function probeAndRecoverConnectAccount(id, { signal } = {}) {
   return { alive: false, code: result.code };
 }
 
-/**
- * Remove an account by ID.
- */
+// A conflicting old lookup key is insufficient to read or delete the record.
+// Identity-only rows retain their existing fallback to the verified address.
+function accountCredentialStoreKey(account) {
+  const identity = accountLoginIdentity(account);
+  const bound = normalizeLoginIdentity(account.credentialEmail);
+  return !bound || bound === identity ? identity : '';
+}
+
+/** Remove an account by ID. */
 export function removeAccount(id) {
   const idx = accounts.findIndex(a => a.id === id);
   if (idx === -1) return false;
@@ -2993,23 +3365,24 @@ export function removeAccount(id) {
   forgetCloudModelCatalog(id);
   trySyncModelCatalog();
   saveAccounts();
-  // The stored password is a live re-login credential for an account that no
-  // longer exists. Leaving it behind meant a deleted account kept a decryptable
-  // secret on disk forever (deleteCredential had zero production callers).
-  // Best-effort: a store that is disabled, locked or corrupt must not stop the
-  // removal — the account is already out of the pool.
+  // Delete a verified store record after its last account is removed.
+  // Filtered rows can still use the password from another instance.
+  const credentialKey = accountCredentialStoreKey(account);
+  const usesCredential = row => accountCredentialStoreKey(row) === credentialKey;
   try {
-    if (deleteCredential(account.credentialEmail || account.email)) log.info(`Stored credential removed for ${safeAccountRef(account)}`);
+    if (credentialKey && !accounts.some(usesCredential) && !filteredAccountRecords.some(usesCredential)) {
+      if (credentials.deleteCredential(credentialKey)) log.info(`Stored credential removed for ${safeAccountRef(account)}`);
+    }
   } catch (e) {
     log.warn(`Could not remove stored credential for ${safeAccountRef(account)}: ${e.code || e.message}`);
   }
   // Drop any Cascade conversations owned by this key so future requests
   // don't try to resume on an account that no longer exists.
-  import('./conversation-pool.js').then(m => m.invalidateFor({ apiKey: account.apiKey })).catch(() => {});
+  accountCleanup('invalidateFor', () => import('./conversation-pool.js').then(m => m.invalidateFor({ apiKey: account.apiKey })));
   // Detach P1: a frozen turn pinned to this account must not be resumable
   // either. The entry holds no LS lease, so eviction is just the map delete;
   // the next retry goes upstream.
-  import('./detached-registry.js').then(m => m.evictForAccount(account.id)).catch(() => {});
+  accountCleanup('evictForAccount', () => import('./detached-registry.js').then(m => m.evictForAccount(account.id)));
   log.info(`Account removed: ${safeAccountRef(account)}`);
   return true;
 }
@@ -3047,7 +3420,7 @@ export function removeAccount(id) {
 // ea1332e (`degradedServe` def:true) — it shipped default-off for a byte-identical rollout,
 // then was flipped deliberately to break the 429 lockout loop. Opt out with
 // WINDSURFAPI_DEGRADED_SERVE=0 to get a hard 429 back.
-function pickDegradedFallback(now, excludeKeys, modelKey, connectSelector) {
+function pickDegradedFallback(now, excludeKeys, modelKey, connectSelector, requireFreeSelector = null) {
   let best = null;
   let bestUntil = Infinity;
   for (const a of accounts) {
@@ -3059,6 +3432,9 @@ function pickDegradedFallback(now, excludeKeys, modelKey, connectSelector) {
     if (pruneRpmHistory(a, now) >= rpmLimitFor(a)) continue;   // RPM full — don't compound
     if (modelKey && !isModelAllowedForAccount(a, modelKey)) continue;
     if (connectSelector && !isConnectSelectorAllowedForAccount(a, connectSelector)) continue;
+    // Free-only admission survives degraded serve: a transient throttle must not
+    // turn "the free account is briefly busy" into "bill the paid peer".
+    if (requireFreeSelector && !isConnectSelectorFreeForAccount(a, requireFreeSelector)) continue;
     // A selector-scoped upstream rejection is not a throttle: degraded-serve must
     // not re-send a request the upstream already refused for this account.
     if (connectSelector && isSelectorIneligible(a, connectSelector, now)) continue;
@@ -3079,7 +3455,7 @@ function pickDegradedFallback(now, excludeKeys, modelKey, connectSelector) {
  * @param {string|null} [modelKey]
  * @param {string|null} [callerKey]
  * @param {string|null} [connectSelector]
- * @param {{ pinOnly?: boolean }} [opts] `pinOnly` makes the sticky arm NON-DESTRUCTIVE:
+ * @param {{ pinOnly?: boolean, trackReservation?: boolean, freeOnly?: boolean }} [opts] `pinOnly` makes the sticky arm NON-DESTRUCTIVE:
  *   return the pinned account if it is usable right now, otherwise return null WITHOUT
  *   clearing the binding and WITHOUT rotating to a substitute. It exists so an async
  *   caller can poll for its own pin (chat.js queue-on-pin) using the very same
@@ -3087,11 +3463,21 @@ function pickDegradedFallback(now, excludeKeys, modelKey, connectSelector) {
  *   the wait loop is how "the fix covered only some paths" keeps recurring here.
  *   It is absolute: with `pinOnly` this NEVER returns a non-pinned account, not even
  *   when no binding exists, so a poll can never be answered with a substitute.
+ *   `trackReservation` attaches a one-shot settler for early failures and normal
+ *   completion. The caller uses it instead of the key-based release and refund.
+ *   `freeOnly` is the drought free-only admission flag: when true, an account is
+ *   only selectable if `connectSelector` is free ON THAT ACCOUNT right now
+ *   (isConnectSelectorFreeForAccount). It rides the one admission predicate, so the
+ *   sticky pin, the candidate loop, the degraded fallback and the preflights all
+ *   agree; it never widens admission, only narrows it.
  */
 export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, connectSelector = null, opts = {}) {
   const now = Date.now();
   const pinOnly = !!opts.pinOnly;
   const inflightCap = maxInflightPerAccount();
+  // A free-only admission is about a SELECTOR. Without one there is nothing to be
+  // free about, so the flag is inert rather than silently permissive.
+  const requireFreeSelector = (opts.freeOnly && connectSelector) ? connectSelector : null;
 
   // ── Sticky session: prefer the account from the last turn ────────
   // When enabled, this keeps multi-turn conversations on the same upstream
@@ -3137,15 +3523,14 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, c
         // status, maintenance (incl. language-server), cooldown, selector latch,
         // RPM window, in-flight cap, tier/entitlement. Keeping it in ONE place is
         // what stops "usable here" from drifting away from "usable in getApiKey".
-        if (isAdmittedForRequest(acct, { modelKey, connectSelector, now, inflightCap, excludeKeys })) {
+        if (isAdmittedForRequest(acct, { modelKey, connectSelector, now, inflightCap, excludeKeys, requireFreeSelector })) {
           pruneRpmHistory(acct, now); // housekeeping only; the predicate is read-only
           // A pinOnly poll that SUCCEEDS is a real acquisition, so record it as one now
           // (the silent peek above deliberately did not). Without this a queued turn
           // would report zero hits and under-state affinity by exactly the turns
           // queue-on-pin rescued — the opposite bias to counting every poll.
           if (pinOnly) getStickyBinding(callerKey, modelKey, connectSelector);
-          const reservationTimestamp = nextReservationToken(now);
-          acct._rpmHistory.push(reservationTimestamp);
+          const reservation = recordRpmReservation(acct, now, opts.trackReservation);
           acct.lastUsed = now;
           acct._inflight = (acct._inflight || 0) + 1;
           acct._inflightAt = Date.now();
@@ -3153,7 +3538,7 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, c
             id: acct.id, email: acct.email, apiKey: acct.apiKey,
             apiServerUrl: acct.apiServerUrl || '',
             proxy: getEffectiveProxy(acct.id) || null,
-            reservationTimestamp,
+            ...reservation,
             _sticky: true,
           };
         }
@@ -3218,7 +3603,7 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, c
     // latch, RPM window, in-flight cap, tier/entitlement. The latch asks this
     // exact question before writing "a peer can take over", so it can no longer
     // latch an account while the only peer is one this loop would skip.
-    if (!isAdmittedForRequest(a, { modelKey, connectSelector, now, inflightCap, excludeKeys })) continue;
+    if (!isAdmittedForRequest(a, { modelKey, connectSelector, now, inflightCap, excludeKeys, requireFreeSelector })) continue;
     const used = pruneRpmHistory(a, now); // housekeeping only; the predicate is read-only
     candidates.push({ account: a, used, limit: rpmLimitFor(a) });
   }
@@ -3229,10 +3614,9 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, c
     // covers the single-account pool AND any pool where every entitled account is
     // momentarily throttled, without a special-case "last account" rule.
     if (degradedServeEnabled()) {
-      const fallback = pickDegradedFallback(now, excludeKeys, modelKey, connectSelector);
+      const fallback = pickDegradedFallback(now, excludeKeys, modelKey, connectSelector, requireFreeSelector);
       if (fallback) {
-        const reservationTimestamp = nextReservationToken(now);
-        fallback._rpmHistory.push(reservationTimestamp);
+        const reservation = recordRpmReservation(fallback, now, opts.trackReservation);
         fallback.lastUsed = now;
         fallback._inflight = (fallback._inflight || 0) + 1;
         fallback._inflightAt = now;
@@ -3243,7 +3627,7 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, c
           id: fallback.id, email: fallback.email, apiKey: fallback.apiKey,
           apiServerUrl: fallback.apiServerUrl || '',
           proxy: getEffectiveProxy(fallback.id) || null,
-          reservationTimestamp,
+          ...reservation,
           _degraded: true,
         };
       }
@@ -3411,8 +3795,7 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, c
   }
 
   const { account } = candidates[0];
-  const reservationTimestamp = nextReservationToken(now);
-  account._rpmHistory.push(reservationTimestamp);
+  const reservation = recordRpmReservation(account, now, opts.trackReservation);
   account.lastUsed = now;
   account._inflight = (account._inflight || 0) + 1;
   account._inflightAt = now;
@@ -3428,7 +3811,7 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null, c
     id: account.id, email: account.email, apiKey: account.apiKey,
     apiServerUrl: account.apiServerUrl || '',
     proxy: getEffectiveProxy(account.id) || null,
-    reservationTimestamp,
+    ...reservation,
   };
 }
 
@@ -3482,6 +3865,9 @@ export function releaseAccountById(id) {
 }
 
 function _releaseAccountObj(a) {
+  // A tracked slot stays counted until its owner removes the matching ticket.
+  const tracked = a._trackedReservations?.size || 0;
+  if (tracked > 0 && accountInflight(a) <= tracked) return;
   a._inflight = Math.max(0, (a._inflight || 0) - 1);
   // R2: keep _inflightAt tracking the NEWEST activity. When a request completes
   // while others are still in flight, refresh the timestamp so those survivors
@@ -3534,6 +3920,7 @@ function runInflightCleanup(now = Date.now()) {
       log.warn(`Account ${safeAccountRef(a)} inflight=${a._inflight} stale >${Math.round((now - a._inflightAt) / 1000)}s (>${Math.round(staleMs / 1000)}s cap), auto-resetting`);
       a._inflight = 0;
       a._inflightAt = 0;
+      a._trackedReservations?.clear();
       reset++;
     }
   }
@@ -3621,7 +4008,7 @@ export function getAccountAvailability(apiKey, modelKey = null) {
   if (limit <= 0) return { available: false, reason: 'tier_expired', retryAfterMs: 60_000 };
   const used = pruneRpmHistory(a, now);
   if (used >= limit) {
-    const oldest = a._rpmHistory?.[0] || now;
+    const oldest = rpmReservationTime(a._rpmHistory?.[0]) || now;
     return { available: false, reason: 'rpm_full', retryAfterMs: Math.max(1000, oldest + RPM_WINDOW_MS - now) };
   }
   if (modelKey && !isModelAllowedForAccount(a, modelKey)) {
@@ -3799,7 +4186,7 @@ export function markRateLimited(apiKey, durationMs = 5 * 60 * 1000, modelKey = n
   const account = accounts.find(a => a.apiKey === apiKey);
   if (!account) return;
   recordHealthEvent(account, healthKind);
-  const safeMs = Math.max(1000, Number(durationMs) || 0);
+  const safeMs = Math.max(1000, boundResetMs(Number(durationMs)) ?? 0);
   const until = Date.now() + safeMs;
   recordRateLimitEvent(account, { upstreamMs: durationMs, effectiveMs: safeMs, until, modelKey, healthKind });
   if (modelKey) {
@@ -3813,12 +4200,15 @@ export function markRateLimited(apiKey, durationMs = 5 * 60 * 1000, modelKey = n
 }
 
 export function refundReservation(apiKey, timestamp) {
-  const account = accounts.find(a => a.apiKey === apiKey);
-  if (!account) return false;
   if (!Number.isFinite(timestamp)) return false;
-  if ((account._inflight || 0) <= 0) return false;
+  const account = accounts.find(a => a.apiKey === apiKey);
+  return refundAccountReservation(account, timestamp);
+}
+
+function refundAccountReservation(account, entry) {
+  if (!account || accountInflight(account) === 0) return false;
   pruneRpmHistory(account, Date.now());
-  const idx = account._rpmHistory?.lastIndexOf(timestamp) ?? -1;
+  const idx = account._rpmHistory.lastIndexOf(entry);
   if (idx === -1) return false;
   account._rpmHistory.splice(idx, 1);
   return true;
@@ -4158,9 +4548,9 @@ export function markQuotaExhausted(apiKey, durationMs = null, now = Date.now()) 
   // — R6 changes only the cooldown DIMENSION, not the health weighting.
   recordHealthEvent(account, 't');
   const ms = Number.isFinite(durationMs) && durationMs >= 1000 ? durationMs : quotaCooldownMs();
-  const previous = account.quotaResetAt || 0;
+  const previous = sanitizeQuotaDeadline(account.quotaResetAt, now);
   const alreadyCooled = previous > now;
-  account.quotaResetAt = Math.max(previous, now + ms);
+  account.quotaResetAt = Math.max(previous, now + Math.min(ms, MAX_QUOTA_RESET_MS));
   // Provenance of the CURRENT deadline: this live 402 is its author only when it
   // actually extended it. A longer snapshot-armed deadline keeps its own source,
   // so a later recovery snapshot can still clear what it wrote.
@@ -4719,13 +5109,14 @@ export function reportBanSignal(apiKey, message, { windowMs = 30 * 60 * 1000 } =
   log.warn(`Account ${safeAccountRef(account)} emitted ban-shaped error #${account._banSignalCount}: "${account._banSignalLastMessage}"`);
   if (account._banSignalCount >= 2) {
     account.status = 'banned';
+    bumpAccountCredentialRevision(account);
     account.bannedAt = now;
     account.bannedReason = account._banSignalLastMessage;
     saveAccounts();
     trySyncModelCatalog();
     log.error(`Account ${safeAccountRef(account)} marked BANNED after ${account._banSignalCount} ban-shaped errors`);
     // Drop any cascade-pool entries owned by this key.
-    import('./conversation-pool.js').then(m => m.invalidateFor({ apiKey })).catch(() => {});
+    accountCleanup('invalidateFor', () => import('./conversation-pool.js').then(m => m.invalidateFor({ apiKey })));
     return true;
   }
   return false;
@@ -4753,12 +5144,24 @@ export function isAllRateLimited(modelKey, connectSelector = null) {
   const now = Date.now();
   let soonestExpiry = Infinity;
   let anyEligible = false;
+  // Connect selection asks with modelKey=null + a resolved selector, so a
+  // cooldown written under the SELECTOR dimension must gate this preflight just
+  // like one written under modelKey. Without it, a model-scoped 429 (the
+  // upstream's "rate limit for this model ... Resets in: 3h") that the handler
+  // scopes to the selector is invisible here: the pool fast-path reports
+  // "available", spends the whole queue wait, and only then discovers every
+  // account is cooled for that selector. The scheduler's own admission
+  // predicate (isCooledForRequest) already ORs the two dimensions; this is the
+  // preflight's copy of that conjunction.
+  const selectorKey = connectSelector && connectSelector !== modelKey ? connectSelector : null;
   for (const a of accounts) {
     if (a.status !== 'active') continue;
     if (modelKey && !isModelAllowedForAccount(a, modelKey)) continue;
     if (connectSelector && !isConnectSelectorAllowedForAccount(a, connectSelector)) continue;
     anyEligible = true;
-    if (!isRateLimitedForModel(a, modelKey, now)) return { allLimited: false };
+    const cooled = isRateLimitedForModel(a, modelKey, now)
+      || (selectorKey ? isRateLimitedForModel(a, selectorKey, now) : false);
+    if (!cooled) return { allLimited: false };
     // Track the soonest expiry across both global and per-model limits
     if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
       soonestExpiry = Math.min(soonestExpiry, a.rateLimitedUntil);
@@ -4772,6 +5175,9 @@ export function isAllRateLimited(modelKey, connectSelector = null) {
     if (modelKey && a._modelRateLimits?.[modelKey] > now) {
       soonestExpiry = Math.min(soonestExpiry, a._modelRateLimits[modelKey]);
     }
+    if (selectorKey && a._modelRateLimits?.[selectorKey] > now) {
+      soonestExpiry = Math.min(soonestExpiry, a._modelRateLimits[selectorKey]);
+    }
   }
   if (!anyEligible) return { allLimited: false };
   const retryAfterMs = soonestExpiry === Infinity ? 60000 : Math.max(1000, soonestExpiry - now);
@@ -4782,6 +5188,14 @@ export function isAllTemporarilyUnavailable(modelKey, connectSelector = null) {
   const now = Date.now();
   let anyEligible = false;
   let soonestExpiry = Infinity;
+  // Same dimension split as isAllRateLimited: connect selection asks with
+  // modelKey=null + a resolved selector, and isCooledForRequestReadOnly excludes
+  // an account cooled for that selector. If this view ignored the selector, the
+  // chat preflight would read a selector-cooled pool as "rate-limited but still
+  // degradable" (rl true, tu false) and skip its fast 429, spending the queue
+  // wait before failing. Reporting it unavailable restores the fast 429 with the
+  // upstream reset as Retry-After.
+  const selectorKey = connectSelector && connectSelector !== modelKey ? connectSelector : null;
 
   for (const a of accounts) {
     if (a.status !== 'active') continue;
@@ -4813,9 +5227,18 @@ export function isAllTemporarilyUnavailable(modelKey, connectSelector = null) {
       if (until && until <= now) delete a._modelRateLimits[modelKey];
     }
 
+    if (selectorKey && a._modelRateLimits) {
+      const until = a._modelRateLimits[selectorKey];
+      if (until && until > now) {
+        soonestExpiry = Math.min(soonestExpiry, until);
+        continue;
+      }
+      if (until && until <= now) delete a._modelRateLimits[selectorKey];
+    }
+
     const used = pruneRpmHistory(a, now);
     if (used >= limit) {
-      const oldest = a._rpmHistory?.[0];
+      const oldest = rpmReservationTime(a._rpmHistory?.[0]);
       // RPM window has a precise expiry — use it directly. The 30s floor
       // only applies when no precise expiry exists (strict-reuse busy
       // without per-account rate-limit data).
@@ -4868,24 +5291,43 @@ export function isAllTemporarilyUnavailable(modelKey, connectSelector = null) {
  * runs inside getApiKey, so a 429 would never let it happen. The trial is evaluated
  * on a COPY: this function still mutates nothing.
  */
-export function isAllConnectAccountsUnavailable(selector) {
+export function isAllConnectAccountsUnavailable(selector, { freeOnly = false } = {}) {
   const now = Date.now();
+  const requireFreeSelector = freeOnly ? selector : null;
   let anyEligible = false;
+  let entitledButNotFree = false;
   for (const a of accounts) {
     if (a.status !== 'active') {
       if (errorRecoveryDue(a, now)
-          && isAdmittedForRequest({ ...a, status: 'active' }, { connectSelector: selector, now })) {
+          && isAdmittedForRequest({ ...a, status: 'active' }, { connectSelector: selector, now, requireFreeSelector })) {
         return { allUnavailable: false, retryAfterMs: null };
       }
       continue;
     }
     if (!isConnectSelectorAllowedForAccount(a, selector)) continue;
+    // A free-only admission cannot be served by a peer that bills for the same
+    // selector. Counting that peer as eligible would send the handler into the
+    // queue wait only to acquire null and fall back to the un-accounted env token
+    // (the P0-2 conflation this preflight exists to prevent), so it is tracked
+    // separately: the pool exists, it just cannot serve THIS admission.
+    if (requireFreeSelector && !isConnectSelectorFreeForAccount(a, requireFreeSelector)) {
+      entitledButNotFree = true;
+      continue;
+    }
     anyEligible = true;
-    if (isAdmittedForRequest(a, { connectSelector: selector, now })) {
+    if (isAdmittedForRequest(a, { connectSelector: selector, now, requireFreeSelector })) {
       return { allUnavailable: false, retryAfterMs: null };
     }
   }
-  if (!anyEligible) return { allUnavailable: false, retryAfterMs: null };
+  if (!anyEligible) {
+    // Free-only: an entitled-but-paid peer still means "the pool cannot serve this
+    // admission right now" (429), not "there is no pool to judge" (env-token
+    // fallback). Without free-only the historical answer is unchanged.
+    if (freeOnly && entitledButNotFree) {
+      return { allUnavailable: true, retryAfterMs: 30_000 };
+    }
+    return { allUnavailable: false, retryAfterMs: null };
+  }
   return { allUnavailable: true, retryAfterMs: 30_000 };
 }
 
@@ -4896,7 +5338,10 @@ export function isAuthenticated() {
 export function maskApiKey(key = '') {
   const s = String(key || '');
   if (!s) return '';
-  if (s.length <= 12) return `${s.slice(0, 4)}...`;
+  // Never show more than ~25% of the secret: the 8-char minimum key used to
+  // leak its first half (4 chars) through the "masked" field (S6-F1).
+  if (s.length <= 8) return `${s.slice(0, 2)}...`;
+  if (s.length <= 12) return `${s.slice(0, 3)}...`;
   return `${s.slice(0, 8)}...${s.slice(-4)}`;
 }
 
@@ -4957,6 +5402,19 @@ export function publicBanReason(reason) {
     .slice(0, 240);
 }
 
+function connectCatalogObservation(account) {
+  if (account.status !== 'active' || !getBackendSwitch('devinConnect')) return null;
+  if (_connectCatalogSyncedKeys.get(account.id) !== account.apiKey) {
+    return { state: 'unknown', observedAt: null, entryCount: null };
+  }
+  const observedAt = _connectCatalogSyncedAt.get(account.id);
+  const rows = _connectCatalogRowsByAccount.get(account.id);
+  if (!observedAt || !rows?.length) return { state: 'unknown', observedAt: null, entryCount: null };
+  const age = connectCatalogNow() - observedAt;
+  const state = age >= 0 && age < connectCatalogTtlMs() ? 'observed' : 'stale';
+  return { state, observedAt, entryCount: rows.length };
+}
+
 function publicAccount(a, now, { view = 'full' } = {}) {
   const rpmLimit = rpmLimitFor(a);
   const rpmUsed = pruneRpmHistory(a, now);
@@ -4966,8 +5424,10 @@ function publicAccount(a, now, { view = 'full' } = {}) {
     id: a.id,
     email: a.email,
     displayName: a.displayName || null,
+    loginEmail: accountLoginIdentity(a),
     label: a.label || '',
     method: a.method,
+    credentialKind: a.apiKey.startsWith('devin-session-token$') ? 'connect_session' : 'other',
     status: a.status,
     state: resolveAccountState(a, now, { rpmUsed, rpmLimit }),
     // Ban metadata is operator-facing only: when it happened, and the
@@ -4988,10 +5448,14 @@ function publicAccount(a, now, { view = 'full' } = {}) {
     // Last time the upstream session key changed (re-login / Firebase refresh).
     // 0 = never rotated since the account was added.
     keyRotatedAt: a.keyRotatedAt || 0,
-    keyPrefix: a.apiKey.slice(0, 8) + '...',
+    // Same rule as maskApiKey: the "prefix" must never be a recoverable
+    // fraction of the key. Cap at 8 chars but never show more than a third:
+    // a 9–12-char key otherwise leaks 8/9 of its entropy (L1-F4).
+    keyPrefix: a.apiKey.slice(0, Math.min(8, Math.max(2, Math.floor(a.apiKey.length / 3)))) + '...',
     apiKey_masked: maskApiKey(a.apiKey),
     tier: a.tier || 'unknown',
     lastProbed: a.lastProbed || 0,
+    connectCatalog: connectCatalogObservation(a),
     rateLimitedUntil: a.rateLimitedUntil || 0,
     rateLimited: !!(a.rateLimitedUntil && a.rateLimitedUntil > now),
     quotaResetAt: a.quotaResetAt || 0,
@@ -5719,7 +6183,7 @@ function inferTier(caps, { floorTier = null } = {}) {
  * Fetch authoritative user status from the LS → account fields.
  * Returns the parsed UserStatus object on success, null on failure.
  */
-export async function fetchUserStatus(id, { allowLsStart = true } = {}) {
+export async function fetchUserStatus(id, { allowLsStart = true, residentLease = null } = {}) {
   const account = accounts.find(a => a.id === id);
   if (!account) return null;
   // V-26: a snapshot describes ONE credential at ONE point in time. Capture the
@@ -5729,7 +6193,7 @@ export async function fetchUserStatus(id, { allowLsStart = true } = {}) {
   const { WindsurfClient } = await import('./client.js');
   const { ensureLs, getLsFor } = await import('./langserver.js');
   const proxy = getEffectiveProxy(account.id) || null;
-  if (!allowLsStart) {
+  if (!allowLsStart && !residentLease) {
     const admission = getLsAdmissionForAccount(account.id);
     const skipped = residentProbeSkip(account, admission);
     if (skipped) {
@@ -5737,9 +6201,12 @@ export async function fetchUserStatus(id, { allowLsStart = true } = {}) {
       return null;
     }
   }
-  if (allowLsStart) await ensureLs(proxy);
+  if (allowLsStart && !residentLease) await ensureLs(proxy);
   const ls = getLsFor(proxy);
-  if (!ls) { log.warn(`No LS for GetUserStatus on ${account.id}`); return null; }
+  if (!ls || (residentLease && (ls !== residentLease.entry || !ls.ready))) {
+    log.warn(`No matching LS for GetUserStatus on ${account.id}`);
+    return null;
+  }
 
   // The RPC is sent with the credential captured at entry, so the response and
   // the epoch we validate against describe the same credential.
@@ -5774,8 +6241,8 @@ export async function fetchUserStatus(id, { allowLsStart = true } = {}) {
     teamsTier: status.teamsTier,
     pro: status.pro,
     planName: status.planName,
-    email: status.email,
-    displayName: status.displayName,
+    email: status.email == null ? status.email : sanitizeLabelText(status.email),
+    displayName: status.displayName == null ? status.displayName : sanitizeLabelText(status.displayName),
     teamId: status.teamId,
     isTeams: status.isTeams,
     isEnterprise: status.isEnterprise,
@@ -5789,7 +6256,8 @@ export async function fetchUserStatus(id, { allowLsStart = true } = {}) {
     allowedModels: status.allowedModels,
   };
   account.userStatusLastFetched = Date.now();
-  if (status.email && !account.email.includes('@')) account.email = status.email;
+  const statusEmail = status.email ? sanitizeLabelText(status.email) : '';
+  if (statusEmail && !account.email.includes('@')) account.email = statusEmail;
 
   // Mark every cascade-allowed enum as capable; every catalog enum NOT in the
   // allowlist as not-entitled. Pure-UID models (no enum) are left to the
@@ -5925,20 +6393,25 @@ async function _probeAccountImpl(account, { allowLsStart = true, canary } = {}) 
     }
 
     // ── Step 1: authoritative tier via GetUserStatus ──
-    const status = await fetchUserStatus(account.id, { allowLsStart });
+    // Admission already acquired an exclusive hold. Checking for zero
+    // maintenance users again would reject this probe's own hold.
+    const status = await fetchUserStatus(account.id, { allowLsStart, residentLease: lsMaintenanceToken });
+    if (!status && !runCanary) return { ok: false, error: 'ERR_ACCOUNT_CHECK_STATUS_UNAVAILABLE' };
 
   const { WindsurfClient } = await import('./client.js');
   const { getModelInfo } = await import('./models.js');
   const { ensureLs, getLsFor } = await import('./langserver.js');
 
   const proxy = getEffectiveProxy(account.id) || null;
-  if (!allowLsStart) {
+  if (!allowLsStart && !lsMaintenanceToken) {
     const skipped = residentProbeSkip(account, getLsAdmissionForAccount(account.id));
     if (skipped) return skipped;
   }
-  if (allowLsStart) await ensureLs(proxy);
+  if (allowLsStart && !lsMaintenanceToken) await ensureLs(proxy);
   const ls = getLsFor(proxy);
-  if (!ls) { log.error(`No LS available for account ${account.id}`); return null; }
+  if (!ls || (lsMaintenanceToken && (ls !== lsMaintenanceToken.entry || !ls.ready))) {
+    return { ok: false, error: 'ERR_ACCOUNT_CHECK_STATUS_UNAVAILABLE' };
+  }
   const port = ls.port;
   const csrf = ls.csrfToken;
 
@@ -6355,20 +6828,24 @@ async function refreshAllFirebaseTokens({ skipBusy = false } = {}) {
         continue;
       }
     }
-    const tokenAtStart = a.apiKey;
+    let credential = captureAccountCredential(a);
     try {
       const proxy = getEffectiveProxy(a.id) || null;
       const { idToken, refreshToken: newRefresh } = await refreshFirebaseToken(a.refreshToken, proxy);
       // The refresh RPC is an await: revalidate identity, operator intent and
       // the credential epoch before committing either half of the token pair.
-      if (!isCurrentAccount(a) || a.status !== 'active' || a.apiKey !== tokenAtStart) {
+      if (!isCurrentAccountCredential(credential) || a.status !== 'active') {
         log.debug(`Firebase refresh ${a.id} result discarded: account changed during refresh`);
         continue;
       }
-      a.refreshToken = newRefresh;
+      if (a.refreshToken !== newRefresh) {
+        a.refreshToken = newRefresh;
+        bumpAccountCredentialRevision(a);
+        credential = captureAccountCredential(a);
+      }
       // Re-register to get a fresh API key (may be the same key)
       const { apiKey } = await reRegisterWithCodeium(idToken, proxy);
-      if (!isCurrentAccount(a) || a.status !== 'active' || a.apiKey !== tokenAtStart) {
+      if (!isCurrentAccountCredential(credential) || a.status !== 'active') {
         log.debug(`Firebase refresh ${a.id} key discarded: account changed during re-register`);
         continue;
       }
@@ -6376,6 +6853,7 @@ async function refreshAllFirebaseTokens({ skipBusy = false } = {}) {
         log.info(`Firebase refresh: ${safeAccountRef(a)} got new API key`);
         const previousKey = a.apiKey;
         a.apiKey = apiKey;
+        bumpAccountCredentialRevision(a);
         markKeyRotation(a, previousKey);
         invalidateModelCatalogForAccount(a.id);
         trySyncModelCatalog();
@@ -6385,7 +6863,7 @@ async function refreshAllFirebaseTokens({ skipBusy = false } = {}) {
     } catch (e) {
       // A failure that happened after the operator parked the row must not
       // accumulate a fail streak or downgrade anything — the row is terminal.
-      if (!isCurrentAccount(a) || a.status !== 'active') {
+      if (!isCurrentAccountCredential(credential) || a.status !== 'active') {
         log.debug(`Firebase refresh ${a.id} failure ignored: account changed during refresh`);
         continue;
       }

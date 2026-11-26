@@ -48,13 +48,14 @@ describe('every chat-shaped POST route threads bindClientAbort into context.sign
     { name: 'completions', marker: "if (path === '/v1/completions' && method === 'POST')" },
     { name: 'responses', marker: "if (path === '/v1/responses' && method === 'POST')" },
     { name: 'messages', marker: "if (path === '/v1/messages' && method === 'POST')" },
-    { name: 'gemini', marker: 'if (method === \'POST\' && /\\/models\\/[^:/]+:(generateContent|streamGenerateContent)$/.test(path))' },
+    { name: 'gemini', marker: "if (method === 'POST' && GEMINI_GENERATE_PATH_RE.test(path))" },
   ];
 
   for (const { name, marker } of routes) {
     it(`${name} binds bindClientAbort and passes signal`, () => {
       const block = routeBlock(marker);
-      assert.match(block, /bindClientAbort\(res\)/, `${name} must call bindClientAbort`);
+      const binding = name === 'chat/completions' ? /bindClientAbort\(res, lifecycle\)/ : /bindClientAbort\(res\)/;
+      assert.match(block, binding, `${name} must call bindClientAbort`);
       assert.match(block, /signal:\s*abortController\.signal/, `${name} must pass abortController.signal`);
     });
   }

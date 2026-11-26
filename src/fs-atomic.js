@@ -100,17 +100,37 @@ export function renameSyncWithRetry(sourcePath, targetPath, {
  * the rename only ever publishes fully-durable contents. This is the
  * "temp → fsync → rename" durability guarantee (K7).
  */
-export function writeFileSyncDurable(path, data, { mode = 0o600 } = {}) {
+export function writeFileSyncDurable(path, data, { mode = 0o600, write = writeSync } = {}) {
   const fd = openSync(path, 'w', mode);
   try {
-    writeSync(fd, data);
+    // writeSync may short-write: keep writing the remainder until the whole
+    // buffer is flushed, and treat zero progress as an error so rename never
+    // publishes a truncated snapshot.
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    for (let offset = 0; offset < buf.length;) {
+      const written = write(fd, buf, offset, buf.length - offset);
+      if (written === 0) throw new Error(`fs-atomic: writeSync made no progress writing ${path}`);
+      offset += written;
+    }
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
 }
 
-export function writeJsonAtomic(targetPath, value, { spaces = 2, mode = 0o600 } = {}) {
+export function writeJsonAtomic(targetPath, value, {
+  spaces = 2,
+  mode = 0o600,
+  // Forwarded to renameSyncWithRetry. Defaults keep production behaviour
+  // identical; a caller that needs to exercise the published-rename boundary
+  // (rename succeeded, parent-directory sync failed) can inject a failing
+  // fsyncParent without replacing the real rename.
+  rename = renameSync,
+  fsyncParent = fsyncParentDirectorySync,
+  // Forwarded to writeFileSyncDurable so fault-injection tests can exercise
+  // short writes without touching the real syscall.
+  write = writeSync,
+} = {}) {
   // mode defaults to 0600 (owner-only): these config files can carry the runtime
   // API key / dashboard password hash / upstream tokens, and must not be
   // world-readable by other users on a shared host. rename preserves the temp
@@ -118,8 +138,8 @@ export function writeJsonAtomic(targetPath, value, { spaces = 2, mode = 0o600 } 
   // non-sensitive files, but 0600 is the safe default.
   const tmp = `${targetPath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
   try {
-    writeFileSyncDurable(tmp, JSON.stringify(value, null, spaces), { mode });
-    renameSyncWithRetry(tmp, targetPath);
+    writeFileSyncDurable(tmp, JSON.stringify(value, null, spaces), { mode, write });
+    renameSyncWithRetry(tmp, targetPath, { rename, fsyncParent });
   } catch (err) {
     try { unlinkSync(tmp); } catch {}
     throw err;

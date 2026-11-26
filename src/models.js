@@ -1040,6 +1040,25 @@ export function getCloudCostTierInfo(selector) {
 }
 
 /**
+ * Cost-tier info for one selector as reported by ONE account.
+ *
+ * The pool-wide getter above answers "can this deployment run it without debiting
+ * SOMEONE's quota", which is the right question for a badge and the wrong one for
+ * routing: a FREE row on account A says nothing about whether account B can serve
+ * the same selector for free. Callers that must keep a request on a free account
+ * (the drought free-only admission) ask per account, so one account's promotion
+ * cannot be spent on another account's bill.
+ *
+ * No pooling and no "free wins" reconciliation: this is that account's own row, or
+ * null when it never reported one. Null stays null — absence is not free.
+ */
+export function getCloudCostTierInfoForAccount(selector, accountId) {
+  const key = typeof selector === 'string' ? selector.trim().toLowerCase() : '';
+  if (!key || accountId === undefined || accountId === null || accountId === '') return null;
+  return _cloudCostTiersByAccount.get(cloudCatalogAccountKey(accountId))?.get(key) || null;
+}
+
+/**
  * Selectors at least one account reports as free right now (promo-aware), or null
  * when no account has contributed cost-tier data. Null and an empty Set answer
  * different questions — "no data" must not read as "nothing is free".
@@ -1111,6 +1130,28 @@ export function getCloudCreditRate(selector) {
     else if (credit === found.credit && fetchedAt > found.fetchedAt) found = { credit, fetchedAt };
   }
   return found;
+}
+
+/**
+ * The upstream's own credit rate for one selector, as reported by ONE account.
+ *
+ * The pooled getter above answers "can this deployment run it without spending
+ * SOMEONE's quota", which is the right question for the gate and the wrong one for
+ * routing: a zero on account A says nothing about whether account B can serve the
+ * same selector for free. Callers that must keep a request on a free account (the
+ * drought free-only admission) ask per account, so one account's zero cannot be
+ * spent on another account's bill.
+ *
+ * No pooling and no "free wins" reconciliation: this is that account's own row, or
+ * null when it never reported one. Null stays null — absence is not free.
+ */
+export function getCloudCreditRateForAccount(selector, accountId) {
+  const key = typeof selector === 'string' ? selector.trim().toLowerCase() : '';
+  if (!key || accountId === undefined || accountId === null || accountId === '') return null;
+  const accountKey = cloudCatalogAccountKey(accountId);
+  const credit = _cloudRatesByAccount.get(accountKey)?.get(key);
+  if (typeof credit !== 'number') return null;
+  return { credit, fetchedAt: _cloudBillingFetchedAtByAccount.get(accountKey) || 0 };
 }
 
 /**
@@ -1221,8 +1262,14 @@ export function mergeCloudCostTiers(configs, { accountId = null, now = Date.now(
     if (!uid) continue;
     const info = cloudCostInfo(m);
     if (info) nextCostTiers.set(uid, info);
-    const credit = Number(m?.creditMultiplier);
-    if (m?.creditMultiplier !== null && m?.creditMultiplier !== undefined
+    // Accept only a real number or a non-empty numeric string. `Number('')`,
+    // `Number(' ')` and `Number(false)` all yield 0 — treating those as a
+    // multiplier would silently bill a paid model at the free tier (M2).
+    const rawCredit = m?.creditMultiplier;
+    const credit = typeof rawCredit === 'number'
+      ? rawCredit
+      : (typeof rawCredit === 'string' && rawCredit.trim() !== '' ? Number(rawCredit.trim()) : NaN);
+    if (rawCredit !== null && rawCredit !== undefined
       && Number.isFinite(credit) && credit >= 0) {
       nextRates.set(uid, credit);
     }

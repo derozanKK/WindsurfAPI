@@ -1,7 +1,13 @@
 import { spawn } from 'child_process';
+import { StringDecoder } from 'node:string_decoder';
+import { setTimeout as delay } from 'node:timers/promises';
 import { VERSION } from './version.js';
 import { log } from './config.js';
-import { sanitizeToolName } from './tool-names.js';
+import { MODELS, resolveModel } from './models.js';
+import { buildSubprocessEnv, buildMinimalSubprocessEnv } from './log-safety.js';
+import { budgetExceededError } from './request-budget.js';
+
+const ACP_PROTOCOL_VERSION = 1;
 
 // Spawn seam: `spawn` is captured behind an indirection so a test can inject a
 // fake child (EventEmitter stdio) to exercise the stdin 'error'/EPIPE guard
@@ -83,7 +89,15 @@ function probeOnce() {
     const done = (r) => { if (!settled) { settled = true; resolve(r); } };
     let child;
     try {
-      child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'] });
+      // STRICTEST env of any spawn in the repo: this binary is resolved via
+      // PATH (or an operator-supplied DEVIN_CLI_PATH), so a hijacked binary
+      // would have received every credential in process.env — including the
+      // credential-store KEK. `--version` needs nothing beyond exec basics.
+      child = spawn(command, args, {
+        env: buildMinimalSubprocessEnv(),
+        windowsHide: true,
+        stdio: ['ignore', 'ignore', 'ignore'],
+      });
     } catch (err) {
       done({ available: false, reason: 'spawn_failed', detail: err?.code || err?.message || 'spawn threw' });
       return;
@@ -184,6 +198,10 @@ function parseJsonLine(line) {
 //   - RATE_LIMITED    → status 429 → markRateLimited.
 //   - else            → 502 backend_error (unchanged legacy behaviour).
 export function classifyAcpError(message, rpcCode = null) {
+  const rpc = String(rpcCode);
+  if (ACP_REQUEST_ERROR_CODES.has(rpc)) {
+    return { code: rpc, type: 'backend_protocol_error', status: 502, retryable: false };
+  }
   const body = String(message || '').trim();
   const lc = body.toLowerCase();
 
@@ -209,20 +227,38 @@ export function classifyAcpError(message, rpcCode = null) {
   return { code: rpcCode ? String(rpcCode) : 'UPSTREAM_ERROR', type: 'backend_error', status: 502, retryable: false };
 }
 
+const ACP_TRANSPORT_CODES = new Set([
+  'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'EAI_AGAIN',
+  'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAGAIN',
+]);
+const ACP_UNCORRELATED_ERROR_CODES = new Set(['-32700', '-32600']);
+const ACP_REQUEST_ERROR_CODES = new Set([...ACP_UNCORRELATED_ERROR_CODES, '-32601', '-32602']);
+const ACP_TERMINAL_ERROR_CODES = new Set([
+  ...ACP_REQUEST_ERROR_CODES, '-32000', '-32002', '-32800',
+]);
+
 function errorFromRpcResponse(resp, fallback = 'ACP request failed') {
   const msg = resp?.error?.message || fallback;
+  const rpcCode = String(resp?.error?.code);
   const { code, type, status, retryable } = classifyAcpError(msg, resp?.error?.code);
   const err = new Error(msg);
   err.status = status;
   err.type = type;
   err.code = code;
-  err.retryable = retryable;
+  // An RPC error only warrants replay if it identifies a transient fault.
+  const transport = type === 'backend_error' && (
+    ACP_TRANSPORT_CODES.has(rpcCode) || ['502', '503', '504'].includes(rpcCode) || /\bsocket hang up\b/i.test(msg)
+  );
+  err.retryable = !ACP_TERMINAL_ERROR_CODES.has(rpcCode) && (retryable || transport);
   return err;
+}
+
+function acpUpdateKind(update) {
+  return String(update?.sessionUpdate || update?.type || update?.kind || update?.name || '');
 }
 
 function extractAcpUpdate(params) {
   const update = params?.update || params?.sessionUpdate || params;
-  const kind = update?.sessionUpdate || update?.type || update?.kind || update?.name || '';
   let text = '';
   const content = update?.content || update?.delta || update?.message || null;
   if (typeof update?.text === 'string') text = update.text;
@@ -234,98 +270,97 @@ function extractAcpUpdate(params) {
       .filter(Boolean)
       .join('');
   }
-  return { kind: String(kind || ''), text };
+  return { kind: acpUpdateKind(update), text };
 }
 
-// The assistant's user-visible reply. Only these land in the final text.
-const MESSAGE_CHUNK_KINDS = new Set([
-  'agent_message_chunk',
-  'agent_message_delta',
-  'assistant_message_chunk',
-]);
-// The agent's thinking stream (verified live 2026-06-29 with SWE-1.6 over real
-// ACP). It is intentionally kept OUT of the reply text and captured separately
-// as reasoning so callers can drop it by default or surface it explicitly.
-const THOUGHT_CHUNK_KINDS = new Set([
-  'agent_thought_chunk',
-  'agent_thought_delta',
-  'agent_reasoning_chunk',
+// Keep reasoning (observed with SWE-1.6 over ACP) separate from visible text
+// so callers can drop it by default or surface it explicitly.
+const ACP_TEXT_CHANNELS = new Map([
+  ['agent_message_chunk', 'message'],
+  ['agent_message_delta', 'message'],
+  ['assistant_message_chunk', 'message'],
+  ['agent_thought_chunk', 'thought'],
+  ['agent_thought_delta', 'thought'],
+  ['agent_reasoning_chunk', 'thought'],
 ]);
 
-// ── Tool-call notifications (GFHarness P1) ──────────────────────────────────
-// ACP reports the agent's tool use as `session/update` notifications:
-//   tool_call        {toolCallId, title, kind, status, rawInput?, content?}
-//   tool_call_update {toolCallId, status?, rawInput?, content?, rawOutput?}
-// They used to be dropped: the text pump only knew message/thought kinds, so a
-// turn that ended in a tool call surfaced as plain text with finish_reason
-// "stop" and the caller never learned a tool ran. Collect them keyed by
-// toolCallId and expose them as protocol tool-call events. A `tool_call_update`
-// carries the tool's output in `content`/`rawOutput`; that is deliberately NOT
-// emitted as a tool result — the API client never produced that result, and
-// synthesizing one would fabricate a conversation turn.
+// ACP tool notifications describe agent-owned activity. Only assistant reply
+// text and reasoning are projected from session/update into the HTTP result.
 const TOOL_UPDATE_KINDS = new Set(['tool_call', 'tool_call_update']);
 
-function normalizeAcpToolInput(rawInput) {
-  if (rawInput == null) return {};
-  if (typeof rawInput !== 'string') return rawInput;
-  // rawInput is ACP `unknown`: it may already be JSON text. Parse it so the
-  // egress serializes exactly once; a non-JSON string stays a plain value.
-  try { return JSON.parse(rawInput); } catch { return rawInput; }
-}
-
-function applyAcpToolUpdate(buffers, update, updateKind) {
-  const id = update?.toolCallId || update?.tool_call_id;
-  if (!id) return;
-  let call = buffers.toolCalls.get(id);
-  if (!call) {
-    if (updateKind !== 'tool_call') {
-      // ACP requires tool_call before its updates. An update for an unknown id
-      // carries no tool identity to forward; keep the turn alive and log it.
-      log.warn(`Devin ACP ${updateKind} for unknown toolCallId ${String(id)} ignored`);
-      return;
-    }
-    call = { id, title: '', kind: '', status: '', rawInput: undefined, hasRawInput: false };
-    buffers.toolCalls.set(id, call);
-  }
-  if (typeof update.title === 'string' && update.title) call.title = update.title;
-  if (typeof update.kind === 'string' && update.kind) call.kind = update.kind;
-  if (typeof update.status === 'string' && update.status) call.status = update.status;
-  // rawInput is authoritative when present; a status-only update must not
-  // erase the arguments announced by the original tool_call.
-  if (Object.prototype.hasOwnProperty.call(update, 'rawInput')) {
-    call.rawInput = update.rawInput;
-    call.hasRawInput = true;
-  } else if (Object.prototype.hasOwnProperty.call(update, 'raw_input')) {
-    call.rawInput = update.raw_input;
-    call.hasRawInput = true;
-  }
-}
-
-function collectAcpTextFromNotification(obj, buffers, onChunk) {
-  if (obj?.method !== 'session/update') return;
-  const { kind, text } = extractAcpUpdate(obj.params || {});
+function collectAcpUpdate(params, buffers, onChunk, blockReplay) {
+  const { kind, text } = extractAcpUpdate(params);
   if (TOOL_UPDATE_KINDS.has(kind)) {
-    const update = obj.params?.update || obj.params || {};
-    applyAcpToolUpdate(buffers, update, kind);
+    blockReplay();
     return;
   }
-  if (!text) return;
-  if (MESSAGE_CHUNK_KINDS.has(kind)) {
-    buffers.message.push(text);
-    // Real-time fan-out: fire the chunk as it arrives so callers can stream it
-    // verbatim. Buffers are still filled, so getText() remains the source of
-    // truth for non-streaming callers. onChunk is optional — when absent the
-    // behaviour is identical to before (collect-then-return).
-    if (onChunk) { try { onChunk({ kind: 'message', text }); } catch { /* never let a consumer error kill the pump */ } }
-  } else if (THOUGHT_CHUNK_KINDS.has(kind)) {
-    buffers.thought.push(text);
-    if (onChunk) { try { onChunk({ kind: 'thought', text }); } catch { /* ignore consumer error */ } }
+  const channel = ACP_TEXT_CHANNELS.get(kind);
+  if (!text || !channel) return;
+  if (!buffers) {
+    // Late content still proves this child did work before any replacement
+    // prompt, even though its closed prompt no longer owns the response.
+    blockReplay();
+    return;
   }
-  // Remaining update kinds (plan, mode, commands, status) are not part of the
-  // text/reasoning/tool-call split and are ignored here on purpose.
+  buffers[channel].push(text);
+  try { onChunk?.({ kind: channel, text }); } catch { /* isolate consumer errors */ }
 }
 
-function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onChunk }) {
+function permissionResponse(options, cancelled) {
+  if (cancelled) return { result: { outcome: { outcome: 'cancelled' } } };
+
+  const optionKinds = new Map();
+  if (Array.isArray(options)) {
+    for (const option of options) {
+      const id = option?.optionId;
+      if (typeof id !== 'string' || !id.trim()) continue;
+      // A duplicate ID is ambiguous even if one entry claims it rejects.
+      optionKinds.set(id, optionKinds.has(id) ? null : option.kind);
+    }
+  }
+  let rejectOnce;
+  let rejectAlways;
+  for (const [id, kind] of optionKinds) {
+    if (kind === 'reject_once') rejectOnce ??= id;
+    if (kind === 'reject_always') rejectAlways ??= id;
+  }
+  const optionId = rejectOnce ?? rejectAlways;
+  if (optionId) return { result: { outcome: { outcome: 'selected', optionId } } };
+  return { error: { code: -32602, message: 'Permission request has no usable rejection option' } };
+}
+
+function acpTransportError(message) {
+  return Object.assign(new Error(message), { status: 502, type: 'backend_error', retryable: true });
+}
+
+function acpTimeoutError(operation, timeoutMs, retryable = false) {
+  return Object.assign(new Error(`Devin ACP ${operation} timed out after ${timeoutMs}ms`), {
+    status: 504,
+    type: 'backend_timeout',
+    retryable,
+  });
+}
+
+function acpAbortError() {
+  return Object.assign(new Error('Request aborted'), { status: 499, type: 'request_aborted' });
+}
+
+function acpTurnDeadline(timeoutMs, budget) {
+  const started = performance.now();
+  const localEnd = started + timeoutMs;
+  const routeEnd = started + (budget?.remainingMs() ?? Infinity);
+  const end = Math.min(localEnd, routeEnd);
+  return {
+    // Keep the original monotonic ceiling across retries, and also consult
+    // the route clock in case it has already advanced past its deadline.
+    remainingMs: () => Math.min(end - performance.now(), budget?.remainingMs() ?? Infinity),
+    error: () => budget && (routeEnd <= localEnd || budget.remainingMs() <= Math.max(0, localEnd - performance.now()))
+      ? budgetExceededError('Request deadline reached during Devin ACP')
+      : acpTimeoutError('turn', timeoutMs),
+  };
+}
+
+function makeAcpClient({ command, args, env, signal, deadline, timeoutMs, outputLimit, onChunk, blockReplay, beforeWrite }) {
   const child = _spawn(command, args, {
     env,
     windowsHide: true,
@@ -339,6 +374,8 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
   let closeCode = null;
   let fatalError = null;
   let stdoutBuffer = '';
+  const stdoutDecoder = new StringDecoder('utf8');
+  const stderrDecoder = new StringDecoder('utf8');
   // Active session id, set after session/new. Held here so an abort can send a
   // graceful `session/cancel` notification (spec §6.1) before SIGTERM.
   let activeSessionId = null;
@@ -348,7 +385,8 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
   // otherwise the child is killed before it can read the cancel notification.
   let gracefulKillPending = false;
   const pending = new Map();
-  const buffers = { message: [], thought: [], toolCalls: new Map() };
+  let promptId = null;
+  const buffers = { message: [], thought: [] };
 
   const cleanup = () => {
     for (const { timer } of pending.values()) clearTimeout(timer);
@@ -364,9 +402,20 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
     pending.clear();
   };
 
+  const appendStderr = (text) => {
+    stderr += text;
+    if (stderr.length > 8192) stderr = stderr.slice(-8192);
+  };
+
   const onData = (name, chunk) => {
-    const s = chunk.toString('utf8');
-    outputBytes += Buffer.byteLength(s);
+    if (!signal?.aborted && deadline.remainingMs() <= 0) {
+      failAll(deadline.error());
+      return;
+    }
+    // A pipe chunk can end inside a UTF-8 character. Count the original bytes
+    // before decoding and keep each pipe's unfinished character separate.
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+    outputBytes += bytes.byteLength;
     if (outputBytes > outputLimit) {
       const err = Object.assign(new Error(`Devin ACP output exceeded ${outputLimit} bytes`), {
         status: 502,
@@ -377,24 +426,36 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
       return;
     }
     if (name === 'stderr') {
-      stderr += s;
-      if (stderr.length > 8192) stderr = stderr.slice(-8192);
+      appendStderr(stderrDecoder.write(bytes));
       return;
     }
-    stdoutBuffer += s;
+    stdoutBuffer += stdoutDecoder.write(bytes);
     const lines = stdoutBuffer.split(/\r?\n/);
     stdoutBuffer = lines.pop() || '';
     for (const line of lines) {
       if (!line.trim()) continue;
       const obj = parseJsonLine(line);
       if (!obj) continue;
-      collectAcpTextFromNotification(obj, buffers, onChunk);
-      if (obj.method === 'session/request_permission' && obj.id != null) {
-        writeJsonLine(child, {
-          jsonrpc: '2.0',
-          id: obj.id,
-          result: { outcome: 'cancelled' },
-        });
+      if (obj.method === 'session/update') {
+        // Resolving a prompt removes its pending entry synchronously, including
+        // when its response and trailing updates arrive in the same pipe read.
+        collectAcpUpdate(obj.params || {}, pending.has(promptId) ? buffers : null, onChunk, blockReplay);
+      }
+      if (obj.method === 'session/request_permission') {
+        blockReplay();
+        if (obj.id != null) {
+          writeJsonLine(child, {
+            jsonrpc: '2.0',
+            id: obj.id,
+            ...permissionResponse(obj.params?.options, signal?.aborted),
+          });
+        }
+        continue;
+      }
+      if (obj.id === null && pending.size === 1 && ACP_UNCORRELATED_ERROR_CODES.has(String(obj.error?.code))) {
+        // JSON-RPC uses a null ID when the peer cannot identify the request.
+        // This client sends only one RPC at a time.
+        failAll(errorFromRpcResponse(obj));
         continue;
       }
       if (obj.id == null) continue;
@@ -408,6 +469,7 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
 
   child.stdout.on('data', c => onData('stdout', c));
   child.stderr.on('data', c => onData('stderr', c));
+  child.stderr.on('end', () => appendStderr(stderrDecoder.end()));
   // stdin 'error' guard (audit finding): every writeJsonLine already checks
   // child.stdin?.writable, but that check races the child dying mid-write — if
   // the CLI exits between the guard and the write, the write emits EPIPE on
@@ -437,18 +499,14 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
         type: 'backend_unavailable',
       }));
     } else {
-      failAll(Object.assign(err, { status: 502, type: 'backend_error' }));
+      failAll(Object.assign(err, { status: 502, type: 'backend_error', retryable: ACP_TRANSPORT_CODES.has(err.code) }));
     }
   });
   child.on('close', code => {
     closed = true;
     closeCode = code;
-    const err = fatalError || Object.assign(new Error(`Devin ACP exited with code ${code}`), {
-      status: 502,
-      type: 'backend_error',
-    });
     if (code !== 0) {
-      failAll(err);
+      failAll(fatalError || acpTransportError(`Devin ACP exited with code ${code}`));
     } else if (pending.size > 0) {
       // GAP-ACP-01: a clean exit (code 0) that still has in-flight requests
       // means the CLI closed before answering — e.g. it exited without
@@ -456,10 +514,7 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
       // pending map WITHOUT settling those promises, hanging the awaiting
       // caller forever and permanently leaking its concurrency slot (fatal
       // under DEVIN_MAX_PROCS=1). Reject them so the slot releases.
-      failAll(Object.assign(new Error('Devin ACP exited (code 0) before responding'), {
-        status: 502,
-        type: 'backend_error',
-      }));
+      failAll(acpTransportError('Devin ACP exited (code 0) before responding'));
     } else {
       cleanup();
     }
@@ -477,8 +532,7 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
     // The reject below uses request_aborted (499) which classifyAcpError leaves
     // alone — an abort is a CLIENT action, never an upstream fault, so it must
     // not touch pool health.
-    const err = Object.assign(new Error('Request aborted'), { status: 499, type: 'request_aborted' });
-    failAll(err);
+    failAll(acpAbortError());
     const graceMs = intEnv('DEVIN_ACP_CANCEL_GRACE_MS', 250, 0);
     if (activeSessionId && child.stdin?.writable && graceMs > 0) {
       gracefulKillPending = true;
@@ -492,25 +546,27 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
   if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
   const request = (method, params = {}, timeout = timeoutMs) => {
+    if (signal?.aborted) return Promise.reject(acpAbortError());
+    if (fatalError) return Promise.reject(fatalError);
     if (closed) {
-      return Promise.reject(Object.assign(new Error(`Devin ACP is closed (code ${closeCode})`), {
-        status: 502,
-        type: 'backend_error',
-      }));
+      return Promise.reject(acpTransportError(`Devin ACP is closed (code ${closeCode})`));
     }
     const id = nextId++;
-    const payload = { jsonrpc: '2.0', id, method, params };
+    const line = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
+    const remaining = deadline.remainingMs();
+    if (remaining <= 0) return Promise.reject(deadline.error());
+    if (!child.stdin?.writable) return Promise.reject(acpTransportError('Devin ACP stdin is closed'));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
-        reject(Object.assign(new Error(`Devin ACP ${method} timed out after ${timeout}ms`), {
-          status: 504,
-          type: 'backend_timeout',
-        }));
-      }, timeout);
+        const phaseTimedOut = timeout < remaining && deadline.remainingMs() > 0;
+        reject(phaseTimedOut ? acpTimeoutError(method, timeout, true) : deadline.error());
+      }, Math.ceil(Math.min(timeout, remaining)));
       timer.unref?.();
       pending.set(id, { resolve, reject, timer });
-      writeJsonLine(child, payload);
+      beforeWrite(method);
+      if (method === 'session/prompt') promptId = id;
+      child.stdin.write(line);
     });
   };
 
@@ -528,17 +584,6 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
     setSessionId: (id) => { activeSessionId = id || null; },
     getText: () => buffers.message.join('').trim(),
     getReasoning: () => buffers.thought.join('').trim(),
-    // Protocol-neutral view of the turn's tool calls. `input` is the parsed
-    // rawInput ({} when the agent announced none); `name` is null when ACP gave
-    // neither a title nor a kind, which the caller must treat as unmappable.
-    getToolCalls: () => Array.from(buffers.toolCalls.values(), (call) => ({
-      id: call.id,
-      name: sanitizeToolName(call.title) || sanitizeToolName(call.kind) || null,
-      kind: call.kind || null,
-      title: call.title || null,
-      status: call.status || null,
-      input: normalizeAcpToolInput(call.hasRawInput ? call.rawInput : null),
-    })),
     getStderr: () => stderr.trim(),
   };
 }
@@ -580,99 +625,207 @@ export function buildAcpPromptBlocks(prompt, modelHint = '', env = process.env) 
   return blocks;
 }
 
-// One bounded retry for TRANSPORT/5xx faults. The whole ACP turn is the retry
-// unit: the child process, its handshake and the prompt are re-created, because
-// a dead `devin acp` child cannot be resumed. Deliberately excluded:
-//   - tool-mapping failures (backend_tool_call_unmapped): deterministic given
-//     the same turn; replaying burns a session for the same answer;
-//   - UPSTREAM_INTERNAL: measured persistent (3/3), same-token replay just
-//     amplifies load — mirrors devin-connect.js isRetryable();
-//   - auth / rate-limit / abort / environment faults (missing CLI, oversized
-//     output): retrying cannot change the verdict.
-const ACP_TRANSPORT_CODES = new Set([
-  'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE', 'EAI_AGAIN',
-  'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH',
-]);
-
-function isAcpRetryable(err) {
-  if (!err) return false;
-  if (err.status === 499 || err.type === 'request_aborted') return false;
-  if (err.type === 'backend_tool_call_unmapped') return false;
-  if (err.type === 'backend_unavailable' || err.type === 'backend_output_too_large'
-    || err.type === 'backend_mode_unsupported') return false;
-  if (err.type === 'upstream_internal' || err.code === 'UPSTREAM_INTERNAL') return false;
-  if (err.type === 'unauthorized' || err.code === 'UNAUTHORIZED') return false;
-  if (err.code === 'RATE_LIMITED') return false;
-  // Explicit capacity ("high demand") is classified retryable by the ACP
-  // classifier; one replay is exactly the mitigation it asks for.
-  if (err.retryable === true) return true;
-  if (err.type === 'backend_timeout' || err.status === 504) return true;
-  if (err.code && ACP_TRANSPORT_CODES.has(err.code)) return true;
-  // A raw RPC 5xx / dead child (502 backend_error) is transport-shaped.
-  if (typeof err.status === 'number' && err.status >= 500 && err.status !== 501) return true;
-  return false;
-}
-
 function acpRetryBaseMs() {
   const raw = Number(process.env.DEVIN_ACP_RETRY_BASE_MS);
   return Number.isFinite(raw) && raw >= 0 ? raw : 250;
 }
 
-export async function runDevinAcpProcess(prompt, { modelKey = '', apiKey = '', apiServerUrl = '', signal = null, onChunk = null } = {}) {
+// Capture the bundled keys before runtime catalog sync can add provider data.
+const diagnosticModelKeys = new Set(Object.keys(MODELS));
+
+function diagnosticModel(value) {
+  if (typeof value !== 'string' || !/^[a-z0-9][a-z0-9._:/-]{0,95}$/i.test(value)) return null;
+  return diagnosticModelKeys.has(resolveModel(value)) ? value : null;
+}
+
+function observeLaunchModel(args, operatorArgCount) {
+  let source = 'none';
+  let value = null;
+  for (let i = 0; i < args.length && args[i] !== '--'; i++) {
+    const arg = args[i];
+    if (arg !== '--model' && !arg.startsWith('--model=')) continue;
+    // Keep the existing argv semantics, including mixed equal/split forms.
+    if (source !== 'none') return { source: 'ambiguous', value: null };
+    source = i < operatorArgCount ? 'operator_argv' : 'request_argv';
+    const candidate = arg === '--model' ? args[i + 1] : arg.slice('--model='.length);
+    value = typeof candidate === 'string' && candidate && !candidate.startsWith('-') ? candidate : null;
+  }
+  return { source, value };
+}
+
+function readAcpConfigSelection(response, configId) {
+  const configOptions = response.result?.configOptions;
+  if (response.jsonrpc !== '2.0' || typeof configId !== 'string' || !Array.isArray(configOptions)) return null;
+  // ACP v1 returns the complete option list. The reply is correlated to the
+  // request by the pump, and the same option id must appear exactly once.
+  const matches = configOptions.filter(option => option?.id === configId);
+  if (matches.length !== 1) return null;
+  const { name, type, currentValue, options } = matches[0];
+  if (type !== 'select' || typeof name !== 'string' || typeof currentValue !== 'string'
+    || !currentValue || !Array.isArray(options)) return null;
+  const grouped = options.some(option => option?.group !== undefined || Array.isArray(option?.options));
+  if (grouped && !options.every(group => typeof group?.group === 'string'
+    && typeof group.name === 'string' && Array.isArray(group.options))) return null;
+  const choices = grouped ? options.flatMap(group => group.options) : options;
+  if (!choices.every(choice => typeof choice?.value === 'string' && typeof choice.name === 'string')) return null;
+  const values = new Set(choices.map(choice => choice.value));
+  return values.size === choices.length && values.has(currentValue) ? currentValue : null;
+}
+
+function logAcpModelSelection({ modelDiagnostics, launch, sessionStatus, sessionAttempt, sessionCurrent, hasHint, attempt }) {
+  const { requestId, requestedModel } = modelDiagnostics || {};
+  const rejected = sessionStatus === 'rejected';
+  if (!requestId && !rejected) return;
+  const launchModel = diagnosticModel(launch.value);
+  const sessionModel = diagnosticModel(sessionCurrent);
+  let source = 'unknown';
+  let effectiveModel = null;
+
+  if (launch.source !== 'ambiguous' && sessionStatus !== 'unresolved') {
+    if (sessionStatus === 'acknowledged') {
+      if (launch.source !== 'none' && launch.value !== sessionCurrent) {
+        source = 'conflict';
+      } else if (sessionModel) {
+        source = 'session_config';
+        effectiveModel = sessionModel;
+      }
+    } else if (launchModel) {
+      source = launch.source;
+      effectiveModel = launchModel;
+    } else if (launch.source === 'none' && hasHint) {
+      source = 'prompt_hint';
+    }
+  }
+
+  const level = rejected ? 'warn' : 'info';
+  log[level]('Devin ACP model selection', {
+    requestId: typeof requestId === 'string' && /^[a-z0-9_-]{1,96}$/i.test(requestId) ? requestId : null,
+    attempt,
+    requested_model: diagnosticModel(requestedModel),
+    launch_model: launchModel,
+    launch_source: launch.source,
+    session_attempted_model: diagnosticModel(sessionAttempt),
+    session_model: sessionModel,
+    session_config_status: sessionStatus,
+    prompt_hint: hasHint,
+    // Effective refers to local selection evidence such as submitted argv.
+    effective_model: effectiveModel,
+    selection_source: source,
+    // No calibrated upstream served-model field is consumed by this adapter.
+    backend_confirmed_model: null,
+    tool_owner: 'agent',
+  });
+}
+
+export async function runDevinAcpProcess(prompt, { modelKey = '', apiKey = '', apiServerUrl = '', signal = null, onChunk = null, modelDiagnostics = null, budget = null } = {}) {
+  if (signal?.aborted) throw acpAbortError();
   if (!apiKey) {
     throw Object.assign(new Error('Devin ACP mode requires an upstream Windsurf account apiKey.'), {
       status: 503,
       type: 'backend_unavailable',
     });
   }
+  const timeoutMs = runTimeoutMs();
+  const deadline = acpTurnDeadline(timeoutMs, budget);
   const command = process.env.DEVIN_CLI_PATH || 'devin';
-  const env = { ...process.env };
+  // Denylist env: the CLI gets the operator's general environment (PATH, HOME,
+  // proxy vars, DEVIN_* config like DEVIN_PERMISSION_MODE) but no credentials —
+  // the upstream apiKey travels ONLY through the ACP `authenticate` RPC's
+  // _meta.api_key, never env. keep: SSH agent vars so the agent's local tools
+  // can still reach git-over-ssh; nothing else secret-shaped survives.
+  const env = buildSubprocessEnv(process.env, {
+    keep: ['SSH_AUTH_SOCK', 'SSH_AGENT_PID'],
+  });
   const args = parseAcpArgs();
+  const operatorArgCount = args.length;
   // One channel only: `devin acp --model` (do not also set DEVIN_MODEL — the
   // two can disagree). Leave DEVIN_PERMISSION_MODE to the operator; do not
   // default it to auto.
   if (modelKey && !args.includes('--model')) {
     args.push('--model', modelKey);
   }
+  const launch = observeLaunchModel(args, operatorArgCount);
 
-  // A replay after ANY chunk crossed onChunk would duplicate the visible answer.
-  let emitted = false;
-  const trackedChunk = onChunk
-    ? (chunk) => { emitted = true; onChunk(chunk); }
-    : null;
+  // A retry starts another child and replays the whole turn. Stop when the
+  // client has received content or the agent has reported tool activity.
+  let previousAttempt = null;
+  const checkRetry = () => {
+    if (previousAttempt?.progressed) throw previousAttempt.error;
+  };
+  const checkAdmission = () => {
+    if (signal?.aborted) throw acpAbortError();
+    checkRetry();
+    if (deadline.remainingMs() <= 0) throw deadline.error();
+    if (budget && !budget.canStartAttempt()) throw budgetExceededError('No upstream turns remaining for Devin ACP');
+  };
+  const beforeWrite = (method) => {
+    checkRetry();
+    if (method === 'session/prompt') {
+      budget?.takeTurnOrThrow('Devin ACP');
+      // This prompt is now being issued. Later activity from the retired child
+      // cannot change which attempt's terminal error belongs to this prompt.
+      previousAttempt = null;
+    }
+  };
 
   const maxRetries = 1;
   for (let attempt = 0; ; attempt++) {
+    checkAdmission();
+    const currentAttempt = { progressed: false, error: null };
+    const blockReplay = () => { currentAttempt.progressed = true; };
+    const trackedChunk = onChunk ? (chunk) => { blockReplay(); onChunk(chunk); } : null;
     try {
       return await runDevinAcpAttempt(prompt, {
-        command, args, env, modelKey, apiKey, apiServerUrl, signal, onChunk: trackedChunk,
+        command, args, env, modelKey, apiKey, apiServerUrl, signal, deadline, timeoutMs,
+        onChunk: trackedChunk, blockReplay, beforeWrite, modelDiagnostics, launch, attempt: attempt + 1,
       });
     } catch (err) {
-      if (attempt >= maxRetries || emitted || signal?.aborted || !isAcpRetryable(err)) throw err;
+      if (signal?.aborted) throw acpAbortError();
+      checkRetry();
+      if (attempt >= maxRetries || currentAttempt.progressed || err?.retryable !== true) throw err;
+      // Keep listening to this child's stdio until the next prompt write. A
+      // notice from that child's pipe may arrive during the new handshake.
+      currentAttempt.error = err;
+      previousAttempt = currentAttempt;
+      checkAdmission();
+      const remaining = deadline.remainingMs();
       const backoff = acpRetryBaseMs();
+      if (backoff >= remaining) throw err;
       log.warn(`Devin ACP: retryable ${err.code || err.type || err.status} (${err.message}); retry ${attempt + 1}/${maxRetries} in ${backoff}ms`);
-      if (backoff) await new Promise((r) => setTimeout(r, backoff));
-      // The caller may have gone away while we waited; a fresh child would
-      // outlive its request (an already-aborted signal never fires onAbort).
-      if (signal?.aborted) throw err;
+      try {
+        if (backoff) await delay(backoff, undefined, { signal: signal ?? undefined });
+      } catch (waitError) {
+        if (signal?.aborted) throw acpAbortError();
+        throw waitError;
+      }
     }
   }
 }
 
-async function runDevinAcpAttempt(prompt, { command, args, env, modelKey, apiKey, apiServerUrl, signal, onChunk }) {
+async function runDevinAcpAttempt(prompt, {
+  command, args, env, modelKey, apiKey, apiServerUrl, signal, deadline, timeoutMs,
+  onChunk, blockReplay, beforeWrite, modelDiagnostics, launch, attempt,
+}) {
   const client = makeAcpClient({
     command,
     args,
     env,
     signal,
-    timeoutMs: runTimeoutMs(),
+    deadline,
+    timeoutMs,
     outputLimit: outputLimitBytes(),
     onChunk,
+    blockReplay,
+    beforeWrite,
   });
 
+  let sessionStatus = 'not_reached';
+  let sessionAttempt = null;
+  let sessionCurrent = null;
+  let hasHint = false;
   try {
     const init = await client.request('initialize', {
-      protocolVersion: 1,
+      protocolVersion: ACP_PROTOCOL_VERSION,
       clientCapabilities: {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
@@ -680,6 +833,13 @@ async function runDevinAcpAttempt(prompt, { command, args, env, modelKey, apiKey
       clientInfo: { name: process.env.DEVIN_ACP_CLIENT_NAME || 'WindsurfAPI', version: VERSION },
     }, 30_000);
     if (init.error) throw errorFromRpcResponse(init, 'Devin ACP initialize failed');
+    const selectedVersion = init.result?.protocolVersion;
+    if (selectedVersion !== ACP_PROTOCOL_VERSION) {
+      const received = Number.isSafeInteger(selectedVersion) ? selectedVersion : 'missing or invalid';
+      throw Object.assign(new Error(`Devin ACP protocol version mismatch: expected ${ACP_PROTOCOL_VERSION}, received ${received}`), {
+        status: 502, type: 'backend_protocol_error', code: 'ACP_PROTOCOL_VERSION', retryable: false,
+      });
+    }
 
     const authMeta = {
       api_key: apiKey,
@@ -709,7 +869,9 @@ async function runDevinAcpAttempt(prompt, { command, args, env, modelKey, apiKey
     // Optional native config: the CLI advertises configOptions on session/new.
     // Flag-off by default because the live option ids/values are not calibrated
     // against a real ACP peer yet; the prompt hint remains the fallback.
+    sessionStatus = 'disabled';
     if (modelKey && process.env.DEVIN_ACP_CONFIG_OPTIONS === '1') {
+      sessionStatus = 'not_advertised';
       const rawOptions = session?.result?.configOptions || session?.result?.config_options || [];
       const modelOption = Array.isArray(rawOptions)
         ? rawOptions.find((o) => {
@@ -725,42 +887,37 @@ async function runDevinAcpAttempt(prompt, { command, args, env, modelKey, apiKey
           return v === modelKey;
         });
         const value = chosen ? (chosen.value ?? chosen.id ?? chosen.name) : modelKey;
+        sessionAttempt = value;
+        sessionStatus = 'unresolved';
         const cfg = await client.request('session/set_config_option', {
           sessionId,
           configId,
           value,
         }, 15_000);
         if (cfg.error) {
-          log.warn(`Devin ACP set_config_option ${configId}=${value} failed: ${cfg.error.message || cfg.error.code || 'unknown'}`);
+          sessionStatus = 'rejected';
+        } else {
+          sessionCurrent = readAcpConfigSelection(cfg, configId);
+          if (sessionCurrent !== null) sessionStatus = 'acknowledged';
         }
       }
     }
 
     const modelHint = modelKey ? `Model requested by caller: ${modelKey}\n\n` : '';
+    hasHint = Boolean(modelHint);
     const result = await client.request('session/prompt', {
       sessionId,
       prompt: buildAcpPromptBlocks(prompt, modelHint, env),
-    }, runTimeoutMs());
+    });
     if (result.error) throw errorFromRpcResponse(result, 'Devin ACP session/prompt failed');
 
     const stopReason = result?.result?.stopReason || result?.result?.stop_reason || null;
-    const toolCalls = client.getToolCalls();
-    // A tool-ish stop is only representable as tool_calls/tool_use when the ACP
-    // pump actually captured the call. Degrading to finish_reason:"stop" here
-    // would tell the client a turn that stopped to use a tool was a normal
-    // answer (GFHarness probe D). No call (or a call without the title/kind
-    // needed for a protocol tool name) is an unmappable turn: fail explicitly.
+    // ACP v1 has no tool stop reason. An extension would need an explicit
+    // delegation path to the HTTP caller before it can end a turn this way.
     if (/tool/i.test(String(stopReason || ''))) {
-      const unnamed = toolCalls.filter(tc => !tc.name);
-      if (!toolCalls.length || unnamed.length) {
-        throw Object.assign(new Error(
-          `Devin ACP stopped with stopReason "${stopReason}" but ` +
-          (toolCalls.length
-            ? `${unnamed.length} tool call(s) had no title/kind to map to a tool name`
-            : 'no tool_call update was received') +
-          '; refusing to report a clean completion',
-        ), { status: 502, type: 'backend_tool_call_unmapped' });
-      }
+      throw Object.assign(new Error(
+        `Devin ACP stopped with stopReason "${stopReason}" without a supported caller tool handoff`,
+      ), { status: 502, type: 'backend_tool_call_unmapped' });
     }
     return {
       text: client.getText(),
@@ -768,15 +925,9 @@ async function runDevinAcpAttempt(prompt, { command, args, env, modelKey, apiKey
       stderr: client.getStderr(),
       usage: result?.result?.usage || null,
       stopReason,
-      // Only named calls can become protocol tool-call events. A non-tool stop
-      // may carry metadata-only calls; they are dropped with a trace.
-      toolCalls: toolCalls.filter(tc => {
-        if (tc.name) return true;
-        log.warn(`Devin ACP tool_call ${String(tc.id)} has no title/kind; not forwarded`);
-        return false;
-      }),
     };
   } finally {
     client.close();
+    logAcpModelSelection({ modelDiagnostics, launch, sessionStatus, sessionAttempt, sessionCurrent, hasHint, attempt });
   }
 }

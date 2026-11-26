@@ -83,6 +83,8 @@ git push origin v<version>
 
 The tag must land **on master** or `git describe` and provenance both get awkward.
 
+The `git tag` count in `CHANGELOG.md` is checkout-invariant: `node scripts/sync-changelog-counts.mjs` subtracts the tags listed in `docs/releases/UNPUBLISHED-TAGS.txt` that this checkout carries **and the tag this release creates** (`v<package.json version>`), so neither a tag created locally and never pushed nor the release tag appearing at the push can make the row disagree with a `fetch-depth: 0` CI checkout.
+
 **8. Verify the terminal state of every job — do not read intent from comments.**
 The macOS x64 job showed as `queued` for four consecutive releases while its real
 terminal state was `cancelled`; the workflow comment saying "x64 may queue for hours"
@@ -108,10 +110,10 @@ comes from the matching file in this folder.
 
 ### Release assets and verification
 
-The release job attaches four assets plus `SHA256SUMS`, and — from v3.10.0 —
+The release job attaches four assets plus `SHA256SUMS`, and, for signed releases,
 cosign keyless signature bundles for each of the five signed blobs
 (`<name>.sigstore.json` — signature, Fulcio certificate and Rekor proof in one
-file; since v3.10.0 this is the only signature artifact attached). The manifest uses the **flat asset names**
+file; this is the signature artifact for each blob). The manifest uses the **flat asset names**
 (`windsurfapi.exe`, `windsurfapi-windows.zip`, `windsurfapi-macos-arm64`,
 `windsurfapi-macos.zip`), so `sha256sum -c SHA256SUMS` works in the directory
 where the files were downloaded. Do not change it back to build-tree paths
@@ -120,19 +122,19 @@ shape, and it made the documented command fail for three of the four files.
 `test/release-workflow.test.js` pins the flat form; `test/release-signing.test.js`
 pins the signed file list and the upload globs.
 
-Releases from v3.10.0 are signed with cosign keyless (GitHub OIDC; no repository
+Binary signing began with v3.10.0. Subsequently published v3.2.10 and v3.2.11 are also signed with cosign keyless (GitHub OIDC; no repository
 key or signing secret). Verify `SHA256SUMS.sigstore.json` first, then the hashes,
 or run `node scripts/verify-release-assets.mjs <download-dir>`. A signing failure
 fails the release job: never publish assets whose notes claim signatures but
-which carry no `.sigstore.json`. The git and Docker OTA paths still verify
-tags/ancestry and health, not these signatures, because they do not download
-release assets. The trust boundary and the exact commands are in
+which carry no `.sigstore.json`. The source and Docker installation paths use their own source-attestation
+and image-digest checks. The trust boundary and the exact commands are in
 [RELEASE-SIGNING.md](../RELEASE-SIGNING.md).
 
 ## House style for the notes themselves
 
 These files are **published** — each one becomes a GitHub Release body — and they are
-**append-only history** afterwards. Both facts shape how to write them.
+**append-only history** afterwards. Use absolute links pinned to the release
+tag for repository documents so they resolve when GitHub displays the release body.
 
 - **User-visible first, engineering second.** Open with what changes for someone
   running the proxy. A reader deciding whether to upgrade should not have to parse a
@@ -152,3 +154,5 @@ These files are **published** — each one becomes a GitHub Release body — and
   original error, because the next reader cannot tell the note changed. Version
   attributions especially — they drive "which release do I upgrade from".
 - Notes for a superseded claim get a forward pointer, not a rewrite.
+
+For a Git-source move from the legacy v3.141 series to v3.2.x, [select the signed tag manually](../RELEASE-SIGNING.md#manual-git-source-migration-from-v3141-to-v32x). Verify bundles with Cosign v3 or newer.

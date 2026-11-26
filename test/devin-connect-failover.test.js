@@ -9,6 +9,7 @@ import { classifyUpstreamError } from '../src/devin-connect.js';
 import {
   handleChatCompletions, __setConnectDeps, __resetConnectDeps,
 } from '../src/handlers/chat.js';
+import { getRequestLog, withStatsScope } from '../src/dashboard/stats.js';
 
 // DEVIN_CONNECT cross-account failover: when a pooled account's session token is
 // dead (UNAUTHORIZED) and same-account re-login can't revive it, the request
@@ -22,6 +23,9 @@ const prevEnv = {};
 function seed(label) {
   const key = `devin-session-token$fo-${label}-${Math.random().toString(36).slice(2)}`;
   const acct = addAccountByKey(key, label);
+  // Re-login requires a proven identity; the label itself is display-only.
+  acct.identityEmail = `${label}@failover.example.test`;
+  acct.credentialEmail = acct.identityEmail;
   createdIds.push(acct.id);
   return acct;
 }
@@ -120,9 +124,9 @@ describe('DEVIN_CONNECT cross-account failover — non-stream', () => {
     __setReloginDeps({
       isCredStoreEnabled: () => true,
       getCredential: () => 'stored-password',
-      windsurfLogin: async () => {
+      windsurfLogin: async (email) => {
         freshToken = `devin-session-token$fresh-${Math.random().toString(36).slice(2)}`;
-        return { apiKey: freshToken, name: 'relogin-1' };
+        return { apiKey: freshToken, name: 'relogin-1', identityEmail: email };
       },
     });
 
@@ -163,7 +167,7 @@ describe('DEVIN_CONNECT cross-account failover — non-stream', () => {
     __setReloginDeps({
       isCredStoreEnabled: () => true,
       getCredential: () => 'stored-password',
-      windsurfLogin: async () => ({ apiKey: `devin-session-token$fresh-${Math.random().toString(36).slice(2)}`, name: 'paidwall-1' }),
+      windsurfLogin: async (email) => ({ apiKey: `devin-session-token$fresh-${Math.random().toString(36).slice(2)}`, name: 'paidwall-1', identityEmail: email }),
     });
     const seen = [];
     __setConnectDeps({
@@ -422,19 +426,26 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
         if (params.token === a.apiKey) throw Object.assign(new Error('rate limited'), { code: 'RATE_LIMITED' });
         send({ id: 's', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'OK' }, finish_reason: null }] });
         send({ id: 's', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+        return { usage: { prompt_tokens: 0, completion_tokens: 0 } };
       },
     });
 
-    const result = await handleChatCompletions(
-      { model: 'swe-1-6-slow', stream: true, messages: [{ role: 'user', content: 'hi' }] },
-      { callerKey: '' },
-    );
     const res = fakeRes();
-    await result.handler(res);
+    await withStatsScope(async () => {
+      const result = await handleChatCompletions(
+        { model: 'swe-1-6-slow', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+        { callerKey: '' },
+      );
+      await result.handler(res);
+    });
     const frames = parseFrames(res.body);
     assert.equal(seen.length, 2, 'RATE_LIMITED on account 1 triggered one stream failover hop');
     assert.ok(frames.some(f => f !== '[DONE]' && f.choices?.[0]?.delta?.content === 'OK'), 'streamed from the healthy account');
     assert.ok(!frames.some(f => f !== '[DONE]' && f.error), 'no error frame — the request was recovered');
+    assert.deepEqual(getRequestLog({ limit: 2 }).items.map(row => [row.success, row.reportedUsage]), [
+      [true, { tokensIn: 0, tokensOut: 0 }],
+      [false, null],
+    ], 'the successful attempt owns its report, not the preceding failed attempt');
   });
 
   // R1 guard (stream): once a byte is on the wire, a RATE_LIMITED mid-stream must
@@ -474,7 +485,7 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     __setReloginDeps({
       isCredStoreEnabled: () => true,
       getCredential: () => 'stored-password',
-      windsurfLogin: async () => ({ apiKey: `devin-session-token$fresh-${Math.random().toString(36).slice(2)}`, name: 's-paidwall-1' }),
+      windsurfLogin: async (email) => ({ apiKey: `devin-session-token$fresh-${Math.random().toString(36).slice(2)}`, name: 's-paidwall-1', identityEmail: email }),
     });
     const seen = [];
     __setConnectDeps({
@@ -530,7 +541,7 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     __setReloginDeps({
       isCredStoreEnabled: () => true,
       getCredential: () => 'stored-password',
-      windsurfLogin: async () => { reloginCalls++; return { apiKey: 'devin-session-token$should-never-mint', name: 's-capacity-1' }; },
+      windsurfLogin: async (email) => { reloginCalls++; return { apiKey: 'devin-session-token$should-never-mint', name: 's-capacity-1', identityEmail: email }; },
     });
     let calls = 0;
     const seen = [];
@@ -566,7 +577,7 @@ describe('DEVIN_CONNECT cross-account failover — stream', () => {
     __setReloginDeps({
       isCredStoreEnabled: () => true,
       getCredential: () => 'stored-password',
-      windsurfLogin: async () => { reloginCalls++; return { apiKey: 'devin-session-token$nope', name: 's-capacity-persist-1' }; },
+      windsurfLogin: async (email) => { reloginCalls++; return { apiKey: 'devin-session-token$nope', name: 's-capacity-persist-1', identityEmail: email }; },
     });
     let calls = 0;
     __setConnectDeps({
@@ -645,6 +656,8 @@ describe('DEVIN_CONNECT quota vs tier wall (P1 #33)', () => {
     // Before the fix the classified code was `failed_precondition`, which is in
     // TRANSPORT_FAULT_CODES → reportInternalError, and the request surfaced 502.
     const a = seed('quota-live');
+    const reset = Math.floor(Date.now() / 1000) + 7200;
+    getAccountInternal(a.id).credits = { dailyResetAt: reset, weeklyResetAt: reset + 86400 };
     process.env.DEVIN_CONNECT_FAILOVER_MAX = '0';
     const live = 'Your daily usage quota has been exhausted. Visit '
       + 'https://app.devin.ai/settings/usage to review your plan and usage. (trace ID: 6f1c9a2e)';
@@ -666,7 +679,7 @@ describe('DEVIN_CONNECT quota vs tier wall (P1 #33)', () => {
     assert.equal(internal.internalErrorStreak || 0, 0,
       'a quota-dry account is healthy; charging the internal-error breaker quarantines it '
       + 'after 2 hits and takes the only working account offline');
-    assert.ok(internal.quotaResetAt > Date.now(), 'cooled on the self-healing quota dimension');
+    assert.equal(internal.quotaResetAt, reset * 1000, 'honor this account’s daily reset');
     assert.equal(getAccountAvailability(a.apiKey, 'swe-2-medium').reason, 'quota_exhausted');
   });
 

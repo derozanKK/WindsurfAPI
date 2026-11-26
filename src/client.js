@@ -31,11 +31,19 @@ import {
   buildGetTrajectoryRequest,
   parseTrajectoryInfo, buildHandleReadUrlContentInteractionRequest,
   buildGetTrajectoryStepsRequest, parseTrajectorySteps,
-  buildGetGeneratorMetadataRequest, parseGeneratorMetadata,
+  buildGetGeneratorMetadataRequest, parseGeneratorMetadata, sumCascadeUsage,
   buildGetUserStatusRequest, extractUserStatusBytes, parseGetUserStatusResponse,
 } from './windsurf.js';
 
 const LS_SERVICE = '/exa.language_server_pb.LanguageServerService';
+
+function reportedStepUsage(usage) {
+  if (!usage) return {};
+  // Older snapshots kept padded counters. Only their positive values are
+  // evidence; a padded zero cannot be recovered as a real report.
+  return usage.reportedUsage ?? Object.fromEntries(
+    Object.entries(usage).filter(([, value]) => Number.isFinite(value) && value > 0));
+}
 
 // Host the GetUserJwt RPC is minted against. The chat RPCs go through the
 // local LS, whose metadata is forwarded upstream — the JWT must be signed for
@@ -44,8 +52,8 @@ const LS_SERVICE = '/exa.language_server_pb.LanguageServerService';
 const SERVER_JWT_HOST = 'server.codeium.com';
 
 export function acquireLsUseOrThrow(port) {
-  const entry = beginLsUse(port);
-  if (entry) return entry;
+  const lease = beginLsUse(port);
+  if (lease) return lease;
   if (!getLsEntryByPort(port)) return null;
   const err = new Error('Language server is busy with maintenance; try another account or retry shortly');
   err.code = 'LS_MAINTENANCE_BUSY';
@@ -184,8 +192,16 @@ export function contentToString(content) {
   return content == null ? '' : JSON.stringify(content);
 }
 
-function escapeHistoryTag(text, tag) {
-  return text.replaceAll(`</${tag}>`, `<\\/${tag}>`);
+// Both role closers are escaped in EVERY body — history lines and the latest
+// turn. Escaping only the body's own closer let user text close the wrapper
+// with `</assistant>`, and let a history turn smuggle the other role's closer
+// into the replayed prompt. `<\/tag>` is the existing reversible
+// representation; unrelated XML/code (`<div>`, `<human-readable>`) is untouched.
+const CASCADE_ROLE_CLOSERS = ['</human>', '</assistant>'];
+function escapeHistoryTags(text) {
+  let out = String(text ?? '');
+  for (const closer of CASCADE_ROLE_CLOSERS) out = out.replaceAll(closer, `<\\/${closer.slice(2)}`);
+  return out;
 }
 
 /**
@@ -211,25 +227,25 @@ function neutralizeIdentityForCascade(sysText) {
   // Codex session tokens containing "devin" trigger Windsurf's filter
   text = text.replace(/devin[_-]?(?:session|sess|id|token|key|auth)/gi, 'cloud-session');
   // Devin-related internal metadata (brand names in tool output headers)
-  text = text.replace(/(?:^|\n)\s*(?:#\s*)?Devin\s+(?:AI|Assistant|Agent|IDE|CLI|Code)/gi, '\nCloud IDE');
+  text = text.replace(/(?:^|\n)[ \t]*(?:#[ \t]*)?Devin[ \t]+(?:AI|Assistant|Agent|IDE|CLI|Code)/gi, '\nCloud IDE');
   // Generic: strip "You are Devin/OpenClaw/etc" identity overrides
-  text = text.replace(/(^|[\n.!?]\s*)You are (?:Devin|Codex|OpenClaw|Aider|Cline)(?:[,.]|\s|$)/gi, '$1The assistant is a coding tool');
+  text = text.replace(/(^|[\n.!?][ \t]*)You are (?:Devin|Codex|OpenClaw|Aider|Cline)(?:[,.]|\s|$)/gi, '$1The assistant is a coding tool');
   // v2.0.91 — Windsurf safety filter also flags prompt-injection shaped
   // content (system prompt dumps from other agents). Normalize common
   // patterns that trigger false positives.
   text = text.replace(/\b(?:prompt[_-]?injection|jailbreak|ignore (?:all |previous |above )?instructions)\b/gi, 'malformed-input');
   text = text.replace(/\b(?:bypass|override) (?:the |your )?(?:safety|content|policy|filter)\b/gi, 'request-parameter');
-  return text.replace(/(^|[\n.!?]\s*)You are /g, '$1The assistant is ');
+  return text.replace(/(^|[\n.!?][ \t]*)You are /g, '$1The assistant is ');
 }
 
 function extractCompactSystemFacts(sysText) {
   const facts = [];
   const patterns = [
-    [/current working directory(?:\s+is)?\s*[:=]?\s*`?([/~][^\s`'"<>\n.,;)]+)/i, 'Working directory'],
-    [/(?:^|\n)\s*(?:[-*]\s+)?Working directory\s*[:=]\s*`?([/~][^\s`'"<>\n.,;)]+)/i, 'Working directory'],
-    [/(?:^|\n)\s*(?:[-*]\s+)?Is directory a git repo\s*[:=]\s*([^\n<]+)/i, 'Is directory a git repo'],
-    [/(?:^|\n)\s*(?:[-*]\s+)?Platform\s*[:=]\s*([^\n<]+)/i, 'Platform'],
-    [/(?:^|\n)\s*(?:[-*]\s+)?OS Version\s*[:=]\s*([^\n<]+)/i, 'OS version'],
+    [/current working directory(?:[ \t]+is)?[ \t]*[:=]?[ \t]*`?([/~][^\s`'"<>\n.,;)]+)/i, 'Working directory'],
+    [/(?:^|\n)[ \t]*(?:[-*][ \t]+)?Working directory[ \t]*[:=][ \t]*`?([/~][^\s`'"<>\n.,;)]+)/i, 'Working directory'],
+    [/(?:^|\n)[ \t]*(?:[-*][ \t]+)?Is directory a git repo[ \t]*[:=][ \t]*([^\n<]+)/i, 'Is directory a git repo'],
+    [/(?:^|\n)[ \t]*(?:[-*][ \t]+)?Platform[ \t]*[:=][ \t]*([^\n<]+)/i, 'Platform'],
+    [/(?:^|\n)[ \t]*(?:[-*][ \t]+)?OS Version[ \t]*[:=][ \t]*([^\n<]+)/i, 'OS version'],
   ];
   const seen = new Set();
   for (const [re, label] of patterns) {
@@ -249,7 +265,7 @@ export function compactSystemPromptForCascade(sysText) {
   if (process.env.CASCADE_COMPACT_CLAUDE_SYSTEM === '0') return neutralizeIdentityForCascade(stripped);
   // Title-generation side requests depend on their short system instruction;
   // keep them intact after removing billing headers.
-  if (/Generate a concise,\s*sentence-case title/i.test(stripped) && stripped.length < 2000) {
+  if (/Generate a concise,[ \t]*sentence-case title/i.test(stripped) && stripped.length < 2000) {
     return neutralizeIdentityForCascade(stripped);
   }
   // Shared source of truth with src/handlers/cc-compat.js so the "is this Claude
@@ -330,6 +346,49 @@ function cascadeHistoryImageCaps() {
   };
 }
 
+/**
+ * Spend the shared field-6 image budget on one turn's extracted images, in
+ * block order. G08: the caps are ONE count/byte budget over the WHOLE field-6
+ * list, not a history-only allowance — MAX_BODY_SIZE bounds the HTTP body,
+ * not the model context, so an uncapped current turn could push unbounded
+ * image bytes into the context window. The single-turn/resume path calls
+ * this for its only turn; the multi-turn builder seeds its history counters
+ * with the result for the current turn, so every route into
+ * SendUserCascadeMessage enforces the same bound.
+ * Returns { kept, dropped } — the caller reports `dropped`, never silently.
+ */
+function capCascadeImageBudget(sourceImages, caps = cascadeHistoryImageCaps()) {
+  const kept = [];
+  let bytes = 0;
+  let dropped = 0;
+  for (const image of sourceImages) {
+    const imageBytes = image.base64_data.length;
+    if (kept.length >= caps.maxImages || bytes + imageBytes > caps.maxBytes) {
+      dropped += 1;
+      continue;
+    }
+    kept.push(image);
+    bytes += imageBytes;
+  }
+  return { kept, dropped };
+}
+
+/**
+ * Emit the structured drop record for CURRENT-turn images that did not fit
+ * the shared field-6 budget. Distinct key from
+ * `cascade_image_history_dropped` so an operator can tell "the latest turn
+ * was oversized" apart from "replayed history did not fit".
+ */
+function reportCascadeImageCurrentDrops(dropped) {
+  if (!dropped) return;
+  bumpCascadeImage('cascade_image_current_dropped', dropped);
+  log.warn(
+    `cascade_image_current_dropped count=${dropped}`
+    + ' — the current turn shares the single field-6 image budget with replayed history;'
+    + ' the images that did not fit were dropped, not sent',
+  );
+}
+
 function countImageLikeBlocks(content) {
   if (!Array.isArray(content)) return 0;
   let n = 0;
@@ -360,7 +419,7 @@ function buildCascadeHistoryEntries(convo, budgetBytes, openingText = '', bodyFo
     const m = convo[i];
     const tag = m.role === 'user' ? 'human' : 'assistant';
     const body = (bodyForTurn ? bodyForTurn(i) : undefined) ?? contentToString(m.content);
-    const lineBytes = Buffer.byteLength(`<${tag}>\n${escapeHistoryTag(body, tag)}\n</${tag}>`, 'utf8');
+    const lineBytes = Buffer.byteLength(`<${tag}>\n${escapeHistoryTags(body)}\n</${tag}>`, 'utf8');
     if (historyBytes + lineBytes > budgetBytes && entries.length > 0) {
       log.info(`Cascade: trimmed history at turn ${i}/${convo.length} (${Math.round(historyBytes/1024)}KB kept, ${convo.length - 2 - i} turns dropped)`);
       firstIncluded = i + 1;
@@ -376,18 +435,22 @@ function buildCascadeHistoryEntries(convo, budgetBytes, openingText = '', bodyFo
 function renderCascadeHistoryLines(entries, bodyForEntry = null) {
   return entries.map((entry) => {
     const body = (bodyForEntry ? bodyForEntry(entry) : undefined) ?? entry.body;
-    return `<${entry.tag}>\n${escapeHistoryTag(body, entry.tag)}\n</${entry.tag}>`;
+    return `<${entry.tag}>\n${escapeHistoryTags(body)}\n</${entry.tag}>`;
   });
 }
 
 /**
- * Emit the structured drop record. One line, stable key first, so an operator
- * can grep `cascade_image_history_dropped` and see exactly how many attachments
- * vanished, why, and that the wire (not the caller) is the limit.
+ * Emit the structured drop records. One line per drop class, stable key
+ * first — `cascade_image_current_dropped` for the current turn (see
+ * reportCascadeImageCurrentDrops), then `cascade_image_history_dropped` for
+ * replayed history — so an operator can grep each key and see exactly how
+ * many attachments vanished, why, and that the wire (not the caller) is the
+ * limit.
  */
 function reportCascadeImageHistoryDrops(stats, meta) {
   const dropped = stats.droppedCap + stats.droppedBytes + stats.droppedTruncated + stats.droppedNoVision;
   if (stats.attached) bumpCascadeImage('cascade_image_history_attached', stats.attached);
+  reportCascadeImageCurrentDrops(stats.droppedCurrent || 0);
   if (!dropped) return;
   bumpCascadeImage('cascade_image_history_dropped', dropped);
   log.warn(
@@ -415,16 +478,21 @@ function reportCascadeImageHistoryDrops(stats, meta) {
  * may never see is not worth it, so history images are not attached in that
  * mode; they are counted as `no_vision` drops.
  */
-async function buildCascadeMultiTurnPrompt(convo, { budgetBytes, openingText = '', allowHistoryImages = true } = {}) {
+async function buildCascadeMultiTurnPrompt(convo, { budgetBytes, openingText = '', allowHistoryImages = true, signal = null, beforeFetch = null } = {}) {
   const caps = cascadeHistoryImageCaps();
   const latest = convo[convo.length - 1];
-  const latestExtracted = await extractImages(latest?.content ?? '');
-  const images = [...latestExtracted.images];
+  const latestExtracted = await extractImages(latest?.content ?? '', { signal, beforeFetch });
 
-  const stats = { attached: 0, droppedCap: 0, droppedBytes: 0, droppedTruncated: 0, droppedNoVision: 0 };
+  const stats = { attached: 0, droppedCap: 0, droppedBytes: 0, droppedTruncated: 0, droppedNoVision: 0, droppedCurrent: 0 };
   const extractedByTurn = new Map(); // turn index -> { text, kept, omitted }
-  let keptCount = 0;
-  let keptBytes = 0;
+  // G08: the current turn is the most recent turn, so it spends the shared
+  // field-6 budget FIRST; `keptCount`/`keptBytes` are seeded with what it
+  // kept, and replayed history below gets whatever remains.
+  const currentSpent = capCascadeImageBudget(latestExtracted.images, caps);
+  stats.droppedCurrent = currentSpent.dropped;
+  const images = currentSpent.kept;
+  let keptCount = images.length;
+  let keptBytes = images.reduce((n, image) => n + image.base64_data.length, 0);
 
   // Pass 1 — newest first: decide which replayed turns contribute images.
   // Extraction stops as soon as the caps are exhausted, so an old remote
@@ -440,7 +508,7 @@ async function buildCascadeMultiTurnPrompt(convo, { budgetBytes, openingText = '
       stats.droppedCap += countImageLikeBlocks(content);
       continue;
     }
-    const extracted = await extractImages(content);
+    const extracted = await extractImages(content, { signal, beforeFetch });
     // A turn whose image blocks produced nothing (guard rejection, failed
     // fetch, unsupported mime) keeps its plain `contentToString` body: the
     // placeholder stays in the text, and the guard already logged the reason.
@@ -489,7 +557,7 @@ async function buildCascadeMultiTurnPrompt(convo, { budgetBytes, openingText = '
   }
 
   const lines = renderCascadeHistoryLines(entries, (entry) => bodies.get(entry.index));
-  const text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${latestExtracted.text}\n</human>`;
+  const text = `The following is a multi-turn conversation. You MUST remember and use all information from prior turns.\n\n${lines.join('\n\n')}\n\n<human>\n${escapeHistoryTags(latestExtracted.text)}\n</human>`;
   reportCascadeImageHistoryDrops(stats, { turns: convo.length });
   return { text, images, firstIncluded };
 }
@@ -800,7 +868,7 @@ export class WindsurfClient {
    * @param {object} opts - { onChunk, onEnd, onError, signal }
    */
   async rawGetChatMessage(messages, modelEnum, modelName, opts = {}) {
-    acquireLsUseOrThrow(this.port);
+    const lease = acquireLsUseOrThrow(this.port);
     try {
       const { onChunk, onEnd, onError, signal } = opts;
       // Reuse the LS-scoped session_id instead of letting buildMetadata
@@ -870,9 +938,9 @@ export class WindsurfClient {
           // with NGHTTP2_CANCEL and rejects with an AbortError.
           signal,
         });
-      }).finally(() => endLsUse(this.port));
+      }).finally(() => endLsUse(lease));
     } catch (err) {
-      endLsUse(this.port);
+      endLsUse(lease);
       throw err;
     }
   }
@@ -970,11 +1038,10 @@ export class WindsurfClient {
   async cascadeChat(messages, modelEnum, modelUid, opts = {}) {
     let onChunk, onEnd, onError, signal, reuseEntry, toolPreamble, displayModel, nativeEnvironment;
     let nativeMode, nativeAllowlist, additionalSteps, additionalStepsFrom, requestMaxWaitMs;
-    let resumeTurn, leaseHeld, detach, accountId, modelKey, lsGeneration, completion;
-    // Lease seam. The handler owns the lease for a resumed request (it
-    // acquired it before claim), so the producer must release exactly that
-    // hold and never take a second one. Production defaults are the module
-    // helpers; the injection exists so a test can observe the count.
+    let resumeTurn, detach, accountId, modelKey, lsGeneration, completion;
+    let leaseHandle;
+    // The handler supplies a handoff for a detached resume. A fresh Cascade
+    // turn uses the normal LS acquisition and release helpers.
     const acquireLease = opts.acquireLease || acquireLsUseOrThrow;
     const releaseLease = opts.releaseLease || endLsUse;
     // Assigned inside the poll setup. Declared here so the abort catch can
@@ -1001,7 +1068,7 @@ export class WindsurfClient {
       // Detach P1: resume a frozen turn instead of starting one, and the
       // handler-supplied admission handle the producer calls on a client-gone
       // abort. The producer never imports the registry.
-      resumeTurn, leaseHeld, detach,
+      resumeTurn, detach,
       // Billing/pin identity. The producer only forwards these; the handler
       // owns the account and the registry policy.
       accountId, modelKey, lsGeneration,
@@ -1010,12 +1077,14 @@ export class WindsurfClient {
       // key this producer forwards; the handler has already rejected the rest.
       completion,
     } = opts);
-    // `leaseHeld` is set by the resume path: the handler already acquired the
-    // LS lease for this request, so the producer must not take a second hold.
-    // Correctness then depends on one owner and one release (the finally
-    // below), not on every handler exit path remembering to end a duplicate.
-    if (!leaseHeld) acquireLease(this.port);
+    // Accept the exact issued handle inside its cleanup scope, after parsing
+    // the options. A setup error before this point leaves ownership with the
+    // handler on resume and does not enter the release hook on a fresh turn.
+    leaseHandle = opts.takeLease?.() ?? acquireLease(this.port);
     const aborted = () => signal?.aborted;
+    const abortError = () => Object.assign(new Error('Cascade aborted by client'), {
+      name: 'AbortError', code: 'ABORT_ERR',
+    });
     const inputChars = messages.reduce((n, m) => n + contentToString(m?.content).length, 0);
 
     log.debug(`CascadeChat: uid=${modelUid} enum=${modelEnum} msgs=${messages.length} reuse=${!!reuseEntry}${resumeTurn ? ' resume=1' : ''}`);
@@ -1059,24 +1128,29 @@ export class WindsurfClient {
         `request budget exhausted during ${phase} (${turnBudgetMs}ms)`, err,
       );
     };
-    // Awaits a shared promise (the per-LS workspace init is shared and cannot
-    // be cancelled) under the turn deadline; the work keeps running for its
-    // owner, this turn stops spending time on it.
-    const awaitWithinBudget = (promise, label) => {
+    // Bound this caller's wait without cancelling shared workspace or JWT work.
+    const awaitWithinBudget = async (promise, label, waitSignal) => {
       const left = remainingBudgetMs();
-      if (left <= 0) return Promise.reject(turnDeadlineError(`request budget exhausted before ${label} (${turnBudgetMs}ms)`));
-      return new Promise((resolve, reject) => {
-        // Deliberately NOT unref'd: while this await is the only pending work,
-        // the timer is what makes the deadline real.
-        const timer = setTimeout(
-          () => reject(turnDeadlineError(`${label} exceeded the ${turnBudgetMs}ms request budget`)),
-          left,
-        );
-        Promise.resolve(promise).then(
-          (value) => { clearTimeout(timer); resolve(value); },
-          (err) => { clearTimeout(timer); reject(err); },
-        );
-      });
+      if (left <= 0) throw turnDeadlineError(`request budget exhausted before ${label} (${turnBudgetMs}ms)`);
+      let timer, onAbort;
+      try {
+        return await new Promise((resolve, reject) => {
+          // Keep the timer referenced when the shared work is the only pending task.
+          timer = setTimeout(
+            () => reject(turnDeadlineError(`${label} exceeded the ${turnBudgetMs}ms request budget`)),
+            left,
+          );
+          if (waitSignal) {
+            onAbort = () => reject(abortError());
+            if (waitSignal.aborted) onAbort();
+            else waitSignal.addEventListener('abort', onAbort, { once: true });
+          }
+          Promise.resolve(promise).then(resolve, reject);
+        });
+      } finally {
+        clearTimeout(timer);
+        waitSignal?.removeEventListener('abort', onAbort);
+      }
     };
 
     // One-shot per-LS workspace init (idempotent; typically pre-warmed at
@@ -1243,6 +1317,13 @@ export class WindsurfClient {
         const ctx = `[Context: The underlying model serving this request is ${opts.displayModel || modelLabel}, developed by ${provider}.]`;
         sysText = sysText ? sysText + '\n' + ctx : ctx;
       }
+      // M6: sysText is prepended to the wire text on every path below (single
+      // turn, multi-turn, resume rebuild) and used to ride RAW — a system
+      // prompt carrying </human>/</assistant> could close the pseudo-tag
+      // wrappers the history renderer relies on, the same injection the body
+      // escaping exists to stop. Escape once here so every prepend site and
+      // the openingText byte accounting see the same escaped text.
+      if (sysText) sysText = escapeHistoryTags(sysText);
 
       const isResume = !!reuseEntry;
 
@@ -1260,9 +1341,17 @@ export class WindsurfClient {
       // Budget is UTF-8 bytes (what the wire encoder writes), not UTF-16 units.
       if (isResume || convo.length <= 1) {
         const last = convo[convo.length - 1];
-        const extracted = await extractImages(last?.content ?? '');
+        const extracted = await extractImages(last?.content ?? '', {
+          signal,
+          beforeFetch: () => assertBudget('Cascade image extraction'),
+        });
         text = extracted.text;
-        images = extracted.images;
+        // G08: this path is all current turn — the same shared field-6 budget
+        // applies, so "no history" does not mean "no cap". Drops are counted
+        // and logged, never silent.
+        const currentSpent = capCascadeImageBudget(extracted.images);
+        images = currentSpent.kept;
+        reportCascadeImageCurrentDrops(currentSpent.dropped);
         if (!isResume && sysText) text = sysText + '\n\n' + text;
       } else {
         const maxHistoryBytes = cascadeHistoryBudget(modelUid);
@@ -1276,6 +1365,8 @@ export class WindsurfClient {
           budgetBytes: maxHistoryBytes,
           openingText: sysText,
           allowHistoryImages,
+          signal,
+          beforeFetch: () => assertBudget('Cascade image extraction'),
         });
         const { firstIncluded } = built;
         historyCoverage = {
@@ -1316,7 +1407,10 @@ export class WindsurfClient {
       const sendMessage = async () => {
         // Same best-effort JWT as the legacy channel (env-gated, default OFF);
         // a mint failure must not fail the cascade message.
-        const userJwt = await this._fetchUserJwtForChat().catch(() => null);
+        if (aborted()) throw abortError();
+        const userJwt = await awaitWithinBudget(
+          this._fetchUserJwtForChat().catch(() => null), 'Cascade user JWT lookup', signal,
+        );
         const sendProto = buildSendCascadeMessageRequest(this.apiKey, cascadeId, text, modelEnum, modelUid, sessionId, {
           toolPreamble, images,
           nativeMode: !!nativeMode,
@@ -1325,8 +1419,13 @@ export class WindsurfClient {
           additionalSteps: effectiveAdditionalSteps(),
           maxOutputTokens: completion?.maxTokens,
         }, userJwt);
+        const body = grpcFrame(sendProto);
+        // A lookup can settle before its timer runs, or framing can spend the
+        // final tick. Check ownership at the point the Send leaves this process.
+        if (aborted()) throw abortError();
+        assertBudget('Cascade SendUserCascadeMessage');
         await grpcUnary(
-          this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, grpcFrame(sendProto),
+          this.port, this.csrfToken, `${LS_SERVICE}/SendUserCascadeMessage`, body,
           budgetTimeout(30_000)
         );
       };
@@ -1343,6 +1442,8 @@ export class WindsurfClient {
         const built = await buildCascadeMultiTurnPrompt(convo, {
           budgetBytes: cascadeHistoryBudget(modelUid),
           allowHistoryImages,
+          signal,
+          beforeFetch: () => assertBudget('Cascade image extraction'),
         });
         const { firstIncluded } = built;
         historyCoverage = {
@@ -1366,6 +1467,7 @@ export class WindsurfClient {
           await sendMessage();
           break;
         } catch (e) {
+          if (aborted()) throw abortError();
           // The Send was bounded by what the turn had left: once that is gone
           // the failure is the route deadline, not a panel/transport fault.
           throwIfSpent(e, 'Cascade SendUserCascadeMessage');
@@ -1820,10 +1922,16 @@ export class WindsurfClient {
             }
           }
 
-          // Per-step token usage. Re-reads overwrite with the latest reported
-          // numbers (they grow monotonically as the generator emits more
-          // output). We sum across steps at the end to compute total usage.
-          if (step.usage) usageByStep.set(stepIndex, step.usage);
+          // Keep the old positive reading for billing. The reported view
+          // updates only fields the new poll actually carried.
+          if (step.usage) {
+            const previous = usageByStep.get(stepIndex);
+            const billable = Object.values(step.usage).some(n => n > 0) ? step.usage : previous;
+            usageByStep.set(stepIndex, {
+              ...billable,
+              reportedUsage: { ...reportedStepUsage(previous), ...step.usage },
+            });
+          }
 
           // Collect tool calls — dedupe by id so the same step seen across
           // polls only emits once. A tool call with an existing `result`
@@ -2132,10 +2240,7 @@ export class WindsurfClient {
         // Mirror the normal return's reset so a reused client instance never
         // carries this turn's recovery flag into the next call.
         this._lastReuseInvalidated = false;
-        const err = new Error('Cascade aborted by client');
-        err.name = 'AbortError';
-        err.code = 'ABORT_ERR';
-        throw err;
+        throw abortError();
       }
 
       // Structured summary so we can diagnose short/empty completions after
@@ -2234,22 +2339,11 @@ export class WindsurfClient {
       // Fallback: if the generator metadata RPC didn't give us anything,
       // check the per-step metadata we collected during polling (some LS
       // versions do populate CortexStepMetadata.model_usage directly).
-      if (!serverUsage && usageByStep.size > 0) {
-        let inT = 0, outT = 0, cacheR = 0, cacheW = 0;
-        for (const u of usageByStep.values()) {
-          inT += u.inputTokens || 0;
-          outT += u.outputTokens || 0;
-          cacheR += u.cacheReadTokens || 0;
-          cacheW += u.cacheWriteTokens || 0;
-        }
-        if (inT || outT || cacheR || cacheW) {
-          serverUsage = {
-            inputTokens: inT,
-            outputTokens: outT,
-            cacheReadTokens: cacheR,
-            cacheWriteTokens: cacheW,
-          };
-        }
+      if (!serverUsage) {
+        const steps = [...usageByStep.values()];
+        const billable = sumCascadeUsage(steps);
+        const reportedUsage = metaResult?.reportedUsage ?? sumCascadeUsage(steps.map(reportedStepUsage));
+        if (billable || reportedUsage) serverUsage = { ...billable, reportedUsage };
       }
 
       // Attach cascade metadata so the caller can check it back into the
@@ -2311,7 +2405,7 @@ export class WindsurfClient {
       onError?.(err);
       throw err;
     } finally {
-      releaseLease(this.port);
+      if (leaseHandle) releaseLease(leaseHandle);
     }
   }
 
@@ -2333,7 +2427,7 @@ export class WindsurfClient {
   // model allowlist + credit usage + trial end time. Replaces the
   // probe-based tier inference for accounts where this call succeeds.
   async getUserStatus() {
-    acquireLsUseOrThrow(this.port);
+    const lease = acquireLsUseOrThrow(this.port);
     try {
       const proto = buildGetUserStatusRequest(this.apiKey);
       const resp = await grpcUnary(
@@ -2353,7 +2447,7 @@ export class WindsurfClient {
       });
       return parseGetUserStatusResponse(resp);
     } finally {
-      endLsUse(this.port);
+      endLsUse(lease);
     }
   }
 }

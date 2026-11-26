@@ -25,6 +25,7 @@ export function isCacheEnabled() {
 const _store = new Map();
 const _stats = { hits: 0, misses: 0, stores: 0, evictions: 0, skips: 0 };
 let _bytes = 0;
+let _generation = Symbol('response cache generation');
 
 function bytesEnv(names, fallback) {
   for (const name of names) {
@@ -115,19 +116,54 @@ function normalizeBinary(messages) {
 // logit_bias map — hashed to different cache keys and split the slot, silently
 // halving the hit rate (never wrong data, just a miss). Arrays keep their order
 // (order is semantic there); only object keys are sorted. (audit #10)
-function stableClone(value) {
-  if (Array.isArray(value)) return value.map(stableClone);
+// JSON.parse accepts deeper nesting than an unguarded recursive clone can
+// survive: a body nested ~10k deep parsed fine, then the clone overflowed the
+// stack into a per-request RangeError. Same depth idiom as retainedBytes /
+// SUB_DUMP_MAX_DEPTH (S4-D14). Literal stays inline: test harnesses evaluate
+// function text without module scope.
+function stableClone(value, depth = 0) {
+  if (depth > 64) throw new Error('stableClone: value exceeds maximum nesting depth (64)');
+  if (Array.isArray(value)) return value.map((v) => stableClone(v, depth + 1));
   if (value && typeof value === 'object') {
-    const out = {};
-    for (const k of Object.keys(value).sort()) out[k] = stableClone(value[k]);
+    // Null prototype: a JSON field literally named "__proto__" (valid in a
+    // tools/response_format JSON Schema, e.g. a parameter of that name) is an
+    // own property here. Plain `{}` would route the assignment through the
+    // inherited __proto__ accessor, silently dropping the field so the key
+    // collided with a schema that never had it. Sorting/ordering and the
+    // serialized bytes for ordinary names are unchanged.
+    const out = Object.create(null);
+    for (const k of Object.keys(value).sort()) out[k] = stableClone(value[k], depth + 1);
     return out;
   }
   return value;
 }
 
-function normalize(body) {
+// The request cache and Chat's model/thinking selection must interpret the
+// two effort spellings identically. Keep the router's existing truthy flat-
+// then-nested precedence, followed by case/whitespace normalization.
+export function resolveReasoningEffort(body) {
+  try {
+    return String(body?.reasoning_effort || body?.reasoning?.effort || '').toLowerCase().trim();
+  } catch {
+    // Keys are built before request validation. A malformed JSON object with
+    // non-callable coercion properties must not make normalization throw.
+    return '';
+  }
+}
+
+function normalize(body, identity = null) {
+  // The handler resolves the output-affecting routing decisions (model alias +
+  // effort merge + thinking-sibling route; the connect sequential preference)
+  // and threads them here. The key must describe the GENERATION the request
+  // selects, not the raw client spelling: two accepted spellings can route to
+  // different Cascade models while normalizing to one raw key, and a warm cache
+  // would replay the first variant's answer for the second (BLUE-CACHE P2).
+  // Only the dimensions the caller actually resolved are overridden — an
+  // identity without `model` keeps the raw spelling, so non-routing callers
+  // (tests, other handlers) hash exactly what they always did.
+  const ident = identity && typeof identity === 'object' ? identity : null;
   return {
-    model: body.model || '',
+    model: ident && ident.model !== undefined ? ident.model : (body.model || ''),
     messages: normalizeBinary(body.messages || []),
     // tools / tool_choice / response_format / thinking / stream_options are
     // nested objects whose inner JSON-Schema key order is not canonical across
@@ -136,14 +172,19 @@ function normalize(body) {
     // slot instead of splitting it (a miss, never wrong data). Arrays keep order.
     tools: body.tools ? stableClone(body.tools) : null,
     tool_choice: body.tool_choice ? stableClone(body.tool_choice) : null,
+    // Only the opt-in sequential preference changes the Connect encoder's
+    // output. Off, true and omitted all retain the default policy and the
+    // existing key bytes. The provider meaning of this field remains opt-in.
+    ...(String(process.env.DEVIN_CONNECT_TOOL_CHOICE ?? '').trim() === '1' && body.parallel_tool_calls === false
+      ? { parallel_tool_calls: false }
+      : {}),
     response_format: body.response_format ? stableClone(body.response_format) : null,
-    // cache-01: resolve the reasoning effort the SAME way the router does
-    // (chat.js mergeReasoningEffortIntoModel: reasoning_effort || reasoning.effort).
-    // The nested `reasoning:{effort}` form (codex CLI, OpenAI Responses) merges
-    // into the model id before routing but never mutates body.model, so keying
-    // only the flat field collapsed two different reasoning tiers into one slot →
-    // the second request got the first's wrong-tier answer.
-    reasoning_effort: (body.reasoning_effort ?? body.reasoning?.effort) ?? null,
+    // With a routing identity the handler passes the ROUTER-CANONICAL effort
+    // (normalizeReasoningEffortValue — the same canonical spelling the
+    // router's mergeReasoningEffortIntoModel uses) so spellings that route
+    // identically share the slot; the raw normalized spelling stays for
+    // identity-less callers.
+    reasoning_effort: ident && ident.effort !== undefined ? ident.effort : (resolveReasoningEffort(body) || null),
     thinking: body.thinking ? stableClone(body.thinking) : null,
     stream_options: body.stream_options ? stableClone(body.stream_options) : null,
     temperature: body.temperature ?? null,
@@ -171,6 +212,22 @@ function normalize(body) {
     // so two key-order-permuted-but-equal maps land in the same cache slot (#10).
     logit_bias: body.logit_bias ? stableClone(body.logit_bias) : null,
     n: body.n ?? null,
+    // Routing-identity dimensions (identity callers only, so identity-less
+    // keys stay byte-identical):
+    //   - reasoning_mode: the thinking-sibling route already folds into the
+    //     model override, but when NO sibling exists (or the opus-4.7 auto-route
+    //     is disabled) wantThinking still changes output handling — it gates the
+    //     thinking→text promotion (chat.js shouldFallbackThinkingToText). Two
+    //     requests on the same base model with opposite reasoning modes can
+    //     diverge there, so they must not share a slot.
+    //   - parallel_tool_calls: the DEVIN_CONNECT encoder emits the sequential
+    //     flag (#11) only when the passthrough is enabled AND the caller asked
+    //     for `parallel_tool_calls:false`. The handler passes
+    //     connectSequential:true exactly then; any other state (switch off,
+    //     field absent/true) is default-equivalent on the wire and must keep
+    //     sharing the slot — a miss, never a wrong replay.
+    ...(ident && ident.thinking !== undefined ? { reasoning_mode: ident.thinking ? 'thinking' : 'plain' } : {}),
+    ...(ident && ident.connectSequential === true ? { parallel_tool_calls: false } : {}),
   };
 }
 
@@ -183,13 +240,19 @@ function normalize(body) {
  * model. Pass an empty string only for tests; production callers must
  * thread the request's authenticated callerKey through.
  *
+ * `identity` (optional) carries the effective routed generation the handler
+ * resolved for this body: `{ model, effort, thinking, connectSequential }`.
+ * Lookup and store MUST pass the same identity — chat.js derives it from the
+ * body alone, so both sides agree by construction. Omit it to hash the raw
+ * request spelling (tests, non-routing callers).
+ *
  * Implementation note: prefix the JSON with the caller scope and a
  * separator so two distinct callers can't collide by crafting bodies
  * that serialize to identical strings.
  */
-export function cacheKey(body, callerKey = '') {
+export function cacheKey(body, callerKey = '', identity = null) {
   const scope = String(callerKey || '');
-  const json = JSON.stringify(normalize(body));
+  const json = JSON.stringify(normalize(body, identity));
   return createHash('sha256').update(scope).update('\0').update(json).digest('hex');
 }
 
@@ -209,12 +272,20 @@ export function cacheGet(key) {
   return entry.value;
 }
 
-export function cacheSet(key, value) {
+// Capture this before an asynchronous miss is dispatched.
+export function cacheGeneration() {
+  return _generation;
+}
+
+export function cacheSet(key, value, generation = _generation) {
   if (!isCacheEnabled()) return;
   // Don't cache empty or partial results
   if (!value || (!value.text && !(value.chunks && value.chunks.length))) return;
   const bytes = valueBytes(value);
   const limit = maxBytes();
+  // A clear invalidates earlier misses, even when their response is delivered
+  // successfully. Check here before deleting or accounting for any entry.
+  if (generation !== _generation) return;
   deleteEntry(key);
   if (!Number.isFinite(bytes) || bytes > limit) {
     _stats.skips++;
@@ -245,11 +316,14 @@ export function cacheStats() {
     stores: _stats.stores,
     evictions: _stats.evictions,
     skips: _stats.skips,
+    eligibleLookups: total,
+    hitRatePercent: total ? 100 * _stats.hits / total : null,
     hitRate: total > 0 ? ((_stats.hits / total) * 100).toFixed(1) : '0.0',
   };
 }
 
 export function cacheClear() {
+  _generation = Symbol('response cache generation');
   _store.clear();
   _bytes = 0;
   _stats.hits = 0; _stats.misses = 0; _stats.stores = 0; _stats.evictions = 0; _stats.skips = 0;

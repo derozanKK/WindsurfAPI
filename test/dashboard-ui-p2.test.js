@@ -94,16 +94,16 @@ describe('provider swatches (P2-12 / AC-COLOR-1)', () => {
   it('renders swatches from tokens, not an inline hex map', () => {
     assert.ok(!/providerColors/.test(HTML), 'the hardcoded colour map is gone');
     assert.ok(!/provider-swatch" style="background:/.test(HTML), 'no inline background on the swatch');
-    assert.match(HTML, /<span class="provider-swatch" data-provider="\$\{this\.escAttr\(p\)\}"><\/span>/);
+    assert.match(HTML, /<span class="provider-swatch" data-provider="\$\{this\.esc\(p\)\}"><\/span>/);
     for (const provider of PROVIDERS) {
       assert.match(HTML, new RegExp(`\\.provider-swatch\\[data-provider="${provider}"\\] \\{ background: var\\(--prov-${provider}\\); \\}`));
     }
   });
 
-  it('keeps the brand blocks out of the markup and above AA', () => {
+  it('uses the shared button style for local browser sign-in', () => {
     assert.ok(!/style="[^"]*background:\s*#4285F4/i.test(HTML), 'no inline Google blue');
     assert.ok(!/style="[^"]*background:\s*#24292e/i.test(HTML), 'no inline GitHub black');
-    assert.match(HTML, /class="btn oauth-brand-btn oauth-brand-google"/);
+    assert.match(HTML, /id="devin-browser-start" class="btn btn-primary"/);
   });
 });
 

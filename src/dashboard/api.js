@@ -1,10 +1,15 @@
+import { browserLoginOrigin, browserLogin } from './devin-browser-login.js';
 /**
  * Dashboard API route handlers.
  * All routes are under /dashboard/api/*.
  */
 
+import { getApplyPatchDiagnostics } from '../apply-patch-diagnostic.js';
 import { config, log } from '../config.js';
-import { accountRef } from '../log-safety.js';
+import { parseRemoteStableReleaseTags, selectReleaseLine } from '../update-release-line.js';
+import { accountLoginIdentity, loginResultIdentity } from '../account/login-identity.js';
+import * as credentials from '../devin-connect-credentials.js';
+import { accountRef, buildSubprocessEnv } from '../log-safety.js';
 import {
   existsSync,
   mkdirSync,
@@ -19,9 +24,11 @@ import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import {
   getAccountList, getAccountCount, getAccountListStats, getAccountPublic, addAccountByKey, addAccountByPastedSecret,
+  addAccountByKeyWithDisposition, addAccountByPastedSecretWithDisposition,
   countAccountList, ACCOUNT_STATE_VALUES, ACCOUNT_SORT_VALUES,
   removeAccount, setAccountStatus, resetAccountErrors, updateAccountLabel,
-  markAccountReauthenticated, requestReauthCheck, setAccountCredentialEmail,
+  markAccountReauthenticated, requestReauthCheck, setAccountCredentialEmail, setAccountIdentityEmail,
+  captureAccountCredential, isCurrentAccountCredential,
   isAuthenticated, probeAccount, ensureLsForAccount,
   refreshCredits, searchWebForAccount,
   setAccountBlockedModels, setAccountTokens, setAccountTier, setAccountSpendPolicy,
@@ -30,6 +37,7 @@ import {
   getDroughtSummary, getPoolHealthWindow, getRateLimitHistory,
   getAccountRequests,
   getConnectSelectorPricing, isConnectSelectorBlockedByDrought,
+  sanitizeLabelText,
 } from '../auth.js';
 import { restartLsForProxy } from '../langserver.js';
 import { getLsStatus, stopLanguageServerAndWait, startLanguageServer, isLanguageServerRunning, getLsAdmissionStatus } from '../langserver.js';
@@ -37,7 +45,7 @@ import { getStats, getRequestLog, resetStats, recordRequest, exportStats, import
 import { getConnectMetrics, resetConnectMetrics } from '../devin-connect-metrics.js';
 import { getCascadeImageMetrics, resetCascadeImageMetrics } from '../cascade-image-metrics.js';
 import { detachedRegistry, cascadeDetachEnabled } from '../detached-registry.js';
-import { getStickyStats, isStickyEnabled } from '../account/sticky-session.js';
+import { getStickyStats, getStickyCacheOutcomes, isStickyEnabled } from '../account/sticky-session.js';
 import { getResponseStoreStats } from '../response-store.js';
 import { cacheStats, cacheClear } from '../cache.js';
 import {
@@ -53,7 +61,10 @@ import { getClineCompatStats } from '../handlers/cline-compat.js';
 import { getCcCompatStats } from '../handlers/cc-compat.js';
 import { getLogs, subscribeToLogs, unsubscribeFromLogs } from './logger.js';
 import { getProxyConfig, getProxyConfigMasked, setGlobalProxy, setAccountProxy, removeProxy, getEffectiveProxy } from './proxy-config.js';
-import { MODELS, MODEL_TIER_ACCESS as _TIER_TABLE, getTierModels as _getTierModels, filterModelKeysByCloudCatalog, resolveModel } from '../models.js';
+import {
+  MODELS, MODEL_TIER_ACCESS as _TIER_TABLE, getTierModels as _getTierModels,
+  filterModelKeysByCloudCatalog, resolveModel, getCloudCreditRate, getCloudBillingSyncState,
+} from '../models.js';
 import { buildConnectReachability } from '../handlers/models.js';
 import { FREE_REACHABLE_SELECTORS, getLiveCatalog, getSnapshotSelectors, resolveConnectSelector } from '../devin-connect-models.js';
 import { buildCatalogDiff } from './catalog-diff.js';
@@ -81,15 +92,18 @@ import {
   buildTurnsSection,
   MAX_SCAN_ACCOUNTS,
   RUNTIME_SWITCH_KEYS,
+  TURN_PAGE_SIZES,
+  TURN_ROW_CAP,
 } from './devin-panel.js';
 import { listRequests, requestRingStats } from './request-ring.js';
 import { windsurfLogin, refreshFirebaseToken, reRegisterWithCodeium, probeLoginMethod, emailLoginStart, emailLoginComplete, checkEmailLocked, assertLoginIdentity } from './windsurf-login.js';
-import { getModelAccessConfig, setModelAccessMode, setModelAccessList, addModelToList, removeModelFromList, setDefaultModel } from './model-access.js';
+import { getModelAccessConfig, updateModelAccess } from './model-access.js';
 import { checkMessageRateLimit } from '../windsurf-api.js';
 import { getNativeBridgeConfigStatus } from '../cascade-native-bridge.js';
 import { getNativeBridgeStats } from '../native-bridge-stats.js';
 import { assertPublicUrlHost } from '../image.js';
 import { validateHostFormat, resolveProxyConnectHost, trustedClientIp } from '../net-safety.js';
+import { createProxyTunnel, proxyScheme } from '../proxy-connector.js';
 import { discoverWindsurfCredentials, isLoopbackAddress } from './local-windsurf.js';
 import { parseAccountText, classifyToken } from './account-text-parser.js';
 import {
@@ -98,7 +112,7 @@ import {
   reconcileDockerSelfUpdateState,
   runDockerSelfUpdate,
 } from './docker-self-update.js';
-import { BatchImportParseError, parseBatchImportInput } from './import-parser.js';
+import { BatchImportParseError, parseBatchImportInput, redactedProxyLabel } from './import-parser.js';
 import {
   DEFAULT_ATTESTATION_REPOSITORY,
   normalizeAttestationMode,
@@ -211,8 +225,8 @@ export async function validateProxyHost(proxy) {
 export function buildBatchProxyBinding(result, proxy) {
   const accountId = result?.account?.id || null;
   if (!result?.success || !proxy || !accountId) return null;
-  const parsed = parseProxyUrl(proxy);
-  if (!parsed) return null;
+  const parsed = typeof proxy === 'string' ? parseProxyUrl(proxy) : proxy;
+  if (!redactedProxyLabel(parsed)) return null;
   return {
     accountId,
     proxy: parsed,
@@ -229,12 +243,15 @@ export function buildBatchProxyBinding(result, proxy) {
 // derived from the PARSED item (kind, line number, error code) plus a
 // credential-free proxy label. Nothing here is a substring of the input.
 
-/** `type://host:port` — never the username/password the proxy URL carried. */
-function redactedProxyLabel(proxy) {
-  if (!proxy || typeof proxy !== 'object' || !proxy.host) return null;
-  const type = typeof proxy.type === 'string' && proxy.type ? proxy.type : 'http';
-  const port = Number.isInteger(proxy.port) && proxy.port > 0 ? proxy.port : null;
-  return `${type}://${proxy.host}${port ? `:${port}` : ''}`;
+// Single-login export can return a raw key. Both batch routes publish this
+// narrower representation, including only the public account summary.
+export function publicBatchLoginResult(result) {
+  const { success, email, name, apiServerUrl, method, reauthenticated, viaHost, credentialStored, account } = result;
+  return {
+    success, email, name, apiServerUrl, method, reauthenticated, viaHost, credentialStored,
+    account: account && { id: account.id, email: account.email, status: account.status },
+    apiKey_masked: result.apiKey ? maskApiKey(result.apiKey) : result.apiKey_masked,
+  };
 }
 
 const IMPORT_KIND_LABELS = Object.freeze({
@@ -249,6 +266,14 @@ function describeImportItem(item) {
   const kind = IMPORT_KIND_LABELS[item?.kind] || IMPORT_KIND_LABELS.issue;
   const proxy = redactedProxyLabel(item?.proxy);
   return proxy ? `${kind} · proxy ${proxy}` : kind;
+}
+
+function importErrorCode(error) {
+  for (const value of [error?.code, error?.message]) {
+    const match = typeof value === 'string' && /^(ERR_[A-Z0-9_]{1,64})(?::|$)/.exec(value);
+    if (match) return match[1];
+  }
+  return 'ERR_IMPORT_ITEM_FAILED';
 }
 
 // AUTH-1 CORS hardening: the dashboard used to answer every request (and
@@ -854,11 +879,10 @@ function maskEmail(email) {
 //   - ERR_INTERMEDIATE_CALLBACK: the pasted URL is a federated *intermediate*
 //     callback (has ?code= on a /auth/<provider>/callback path). That code can
 //     only be exchanged by windsurf.com's backend (holds the client_secret) —
-//     the user pasted too early; they must wait for the show-auth-token page and
-//     paste the token shown there.
+//     the dashboard refuses the code and asks for an existing credential.
 //   - ERR_OAUTH_UPSTREAM:<error>[:<desc>]: the provider redirected back an
 //     ?error= (e.g. access_denied) — surface the real reason.
-// Exported for unit testing (also used by the /oauth/callback endpoint).
+// Also used by the existing manual credential intake.
 //
 // ANY absolute URL scheme is accepted, not just http(s): the Windsurf desktop
 // app's sign-in callback is `windsurf://codeium.windsurf?access_token=…` (F4).
@@ -910,16 +934,18 @@ export function extractOAuthToken(input) {
 }
 
 // Decide whether to persist a login password into the encrypted cred store so a
-// dead session can auto-relogin. Storing a user's password is privacy-sensitive,
-// so on a PUBLIC bind it requires BOTH an operator opt-in env AND a per-request
-// opt-in (the dashboard checkbox). The "local" fast-path requires the request to
+// dead session can auto-relogin. Shared by the dashboard login and the legacy
+// /auth/login import so the two cannot drift into different consent rules.
+// Storing a user's password is privacy-sensitive, so on a PUBLIC bind it
+// requires BOTH an operator opt-in env AND a per-request opt-in (the dashboard
+// checkbox / the legacy storeCredential flag). The "local" fast-path requires the request to
 // ALSO come from a trusted loopback client — not just a loopback BIND host. Behind a
 // reverse proxy (openresty → app on 127.0.0.1) isLocalBindHost() is always true,
 // so checking bind alone would let any authenticated REMOTE user silently
 // persist their plaintext password, defeating the DEVIN_CONNECT_ALLOW_REMOTE_CRED_STORE
 // gate. Mirror the /accounts/import-local double gate. Store is still a no-op
 // unless DEVIN_CONNECT_CRED_KEY is set.
-function credStoreGateOpen(wantStore, req) {
+export function credStoreGateOpen(wantStore, req) {
   if (wantStore !== true) return false;
   // Consistency with v2.0.55 AUTH-1 and checkAuth: the proxy is not the client.
   const remote = dashboardClientIp(req);
@@ -927,7 +953,21 @@ function credStoreGateOpen(wantStore, req) {
   return process.env.DEVIN_CONNECT_ALLOW_REMOTE_CRED_STORE === '1';
 }
 
-async function processWindsurfLogin({ email, password, loginProxy, autoAdd, storeCredential: wantStore, req, accountId = null }) {
+function captureBoundWindsurfLogin(accountId) {
+  const account = getAccountInternal(accountId);
+  if (!account) throw Object.assign(new Error('ERR_ACCOUNT_NOT_FOUND'), { code: 'ERR_ACCOUNT_NOT_FOUND', statusCode: 404 });
+  const bound = captureAccountCredential(account);
+  if (!bound.identity) {
+    throw Object.assign(new Error('ERR_ACCOUNT_IDENTITY_UNVERIFIED'), {
+      code: 'ERR_ACCOUNT_IDENTITY_UNVERIFIED',
+      statusCode: 409,
+      detail: 'This account needs a verified login address. Sign in without an account selected.',
+    });
+  }
+  return bound;
+}
+
+async function processWindsurfLogin({ email, password, loginProxy, autoAdd, storeCredential: wantStore, req, accountId = null, reportPoolDisposition = false }) {
   if (!email || !password) {
     const err = new Error('ERR_EMAIL_PASSWORD_REQUIRED');
     err.statusCode = 400;
@@ -937,53 +977,60 @@ async function processWindsurfLogin({ email, password, loginProxy, autoAdd, stor
 
   // Use provided proxy, or global proxy
   const proxy = loginProxy?.host ? loginProxy : getProxyConfig().global;
+  const bound = accountId ? captureBoundWindsurfLogin(accountId) : null;
   const result = await windsurfLogin(email, password, proxy);
-  return finalizeWindsurfLogin(result, { password, loginProxy, autoAdd, storeCredential: wantStore, req, accountId });
+  return finalizeWindsurfLogin(result, { password, loginProxy, autoAdd, storeCredential: wantStore, req, bound, reportPoolDisposition });
 }
 
-// Shared tail of every successful login (password, email code, pasted token):
-// add the account to the pool — or, when `accountId` is set, REPLACE that
-// account's token — persist the per-account proxy, optionally persist the
-// password for auto-relogin, and shape the response. `password` is null for the
-// email-code flow — there is nothing to store.
-//
-// `accountId` is the re-auth binding (SessionReauth): the operator proved
-// control of an existing account by logging in, so the fresh token lands on
-// that row. Adding it again would create a duplicate for the same person and
-// leave the dead one in the list.
-async function finalizeWindsurfLogin(result, { password, loginProxy, autoAdd, storeCredential: wantStore, req, accountId = null }) {
+// Keep validation and all credential writes synchronous after upstream login.
+function finalizeWindsurfLogin(result, { password, loginProxy, autoAdd, storeCredential: wantStore, req, bound = null, reportPoolDisposition = false }) {
   const email = result.email || '';
+  // The address this login proved. Independent of whether a password is kept:
+  // a retention:false password login and an email-code login both establish it.
+  const resultIdentity = loginResultIdentity(result);
   let account = null;
+  let poolDisposition = 'login_only';
   let reauthenticated = false;
   // Whether the password the caller asked to store actually landed. null = not
   // asked / store unavailable, true = encrypted and persisted, false = the save
   // failed (busy store, missing key, record loss) and auto-relogin stays disarmed.
   let credentialStored = null;
 
-  if (accountId) {
-    const existing = getAccountInternal(accountId);
-    if (!existing) throw Object.assign(new Error('ERR_ACCOUNT_NOT_FOUND'), { code: 'ERR_ACCOUNT_NOT_FOUND', statusCode: 404 });
+  if (bound) {
+    if (!isCurrentAccountCredential(bound)) {
+      throw Object.assign(new Error('ERR_REAUTH_ACCOUNT_CHANGED'), {
+        code: 'ERR_REAUTH_ACCOUNT_CHANGED',
+        statusCode: 409,
+        detail: 'The account changed during login. Start a new login if the account still needs it.',
+      });
+    }
     if (!result.apiKey) throw Object.assign(new Error('ERR_LOGIN_FAILED'), { code: 'ERR_LOGIN_FAILED', statusCode: 502 });
-    // V-24 (audit A23): a bound login REPLACES this row's credential, so the
-    // login must prove it belongs to this row's identity. This runs before
-    // markAccountReauthenticated() — a token for someone else must not rotate
-    // the key, clear error/ban state, or flip `reauth` back to `active`.
-    assertLoginIdentity(result, existing.email);
+    assertLoginIdentity(result, bound.identity);
     // A successful login IS the proof that the new key works, so a same-key
     // re-login is legitimate (`allowSameKey`). The refusal exists for the
     // operator asserting an UNCHANGED key without logging in.
-    markAccountReauthenticated(accountId, {
+    markAccountReauthenticated(bound.account.id, {
       apiKey: result.apiKey,
       via: result.viaEmailCode ? 'email_code' : 'password',
       allowSameKey: true,
     });
-    account = existing;
+    account = bound.account;
     reauthenticated = true;
   } else if (autoAdd !== false) {
-    account = addAccountByKey(result.apiKey, result.name || email);
+    // `result.name` is upstream-supplied: sanitize (never assert) so a hostile
+    // login response cannot fail the whole login via the caller-facing label
+    // boundary inside addAccountByKey.
+    ({ account, poolDisposition } = addAccountByKeyWithDisposition(result.apiKey, sanitizeLabelText(result.name) || email));
+    const knownIdentity = accountLoginIdentity(account);
+    if (resultIdentity && knownIdentity) assertLoginIdentity(result, knownIdentity);
   }
 
   if (account) {
+    // A successful login proves the identity regardless of retention consent
+    // (password with storeCredential:false, or an email-code login with no
+    // password at all). Persist it before the store tail so a failed store
+    // cannot erase the proof.
+    if (resultIdentity) setAccountIdentityEmail(account.id, resultIdentity);
     // Persist refresh token via the setter so it survives restart and
     // the background Firebase-renewal loop can find it.
     if (result.refreshToken) {
@@ -1000,22 +1047,23 @@ async function finalizeWindsurfLogin(result, { password, loginProxy, autoAdd, st
     // request's storeCredential:true. Best-effort: a store failure must never
     // break the login that already succeeded. Plaintext password is never
     // logged (only the masked email).
-    if (password && credStoreGateOpen(wantStore, req)) {
+    if (password && resultIdentity && credStoreGateOpen(wantStore, req)) {
       // True only after a credential was actually persisted. It used to start
       // true, so a store that is disabled (no DEVIN_CONNECT_CRED_KEY) reported
       // "stored" without ever calling the store (2026-09-17 review, F3).
       credentialStored = false;
       try {
-        const { storeCredential, isCredStoreEnabled } = await import('../devin-connect-credentials.js');
-        if (isCredStoreEnabled()) {
-          credentialStored = storeCredential(email, password) === true;
+        if (credentials.isCredStoreEnabled()) {
+          // Key the record by the verified identity, not the response's
+          // display-shaped `email` and never the renameable label.
+          credentialStored = credentials.storeCredential(resultIdentity, password) === true;
           // Remember WHICH address the record is keyed by: the row can be
           // renamed, and re-login / removal must still find the secret.
-          if (credentialStored) setAccountCredentialEmail(account.id, email);
-          if (credentialStored) log.info(`Credential stored for auto-relogin: ${maskEmail(email)}`);
-          else log.warn(`Credential NOT stored for ${maskEmail(email)} — auto-relogin stays disarmed for this account`);
+          if (credentialStored) setAccountCredentialEmail(account.id, resultIdentity);
+          if (credentialStored) log.info(`Credential stored for auto-relogin: ${maskEmail(resultIdentity)}`);
+          else log.warn(`Credential NOT stored for ${maskEmail(resultIdentity)} — auto-relogin stays disarmed for this account`);
         } else {
-          log.warn(`Credential NOT stored for ${maskEmail(email)} — credential storage is disabled (no DEVIN_CONNECT_CRED_KEY); auto-relogin stays disarmed for this account`);
+          log.warn(`Credential NOT stored for ${maskEmail(resultIdentity)} — credential storage is disabled (no DEVIN_CONNECT_CRED_KEY); auto-relogin stays disarmed for this account`);
         }
       } catch (e) {
         // A failed save used to be invisible in the response: the user asked for
@@ -1042,6 +1090,7 @@ async function finalizeWindsurfLogin(result, { password, loginProxy, autoAdd, st
     email: result.email,
     apiServerUrl: result.apiServerUrl,
     account: account ? { id: account.id, email: account.email, status: account.status } : null,
+    ...(reportPoolDisposition ? { poolDisposition } : {}),
     // How the session was obtained, so the UI can show it instead of making
     // the operator guess which path ran.
     method: result.viaEmailCode ? 'email_code' : 'password',
@@ -1069,11 +1118,25 @@ function applyReauthToken(id, rawToken, { via = 'token' } = {}) {
   if (account.status === 'disabled' || account.status === 'banned') {
     throw Object.assign(new Error('ERR_REAUTH_NOT_APPLICABLE'), { code: 'ERR_REAUTH_NOT_APPLICABLE', statusCode: 409 });
   }
-  const token = extractOAuthToken(String(rawToken ?? ''));
-  if (!token) throw Object.assign(new Error('ERR_NO_TOKEN_IN_INPUT'), { code: 'ERR_NO_TOKEN_IN_INPUT', statusCode: 400 });
+  const input = String(rawToken ?? '').trim();
+  const invalid = (code) => Object.assign(new Error(code), { code, statusCode: 400 });
+  let token;
+  try {
+    token = extractOAuthToken(input);
+  } catch (err) {
+    if (err.code !== 'ERR_OAUTH_UPSTREAM') throw err;
+    const rejected = /invalid[ _-]redirect[ _-]uri|redirect_uri_mismatch/i.test(err.message);
+    throw invalid(rejected ? 'ERR_REAUTH_REDIRECT_REJECTED' : 'ERR_REAUTH_CALLBACK_FAILED');
+  }
+  if (!token) {
+    const origin = URL.canParse(input) ? new URL(input).origin : '';
+    const portal = origin === 'https://app.devin.ai' || origin === 'https://devin.ai';
+    throw invalid(portal ? 'ERR_REAUTH_DEVIN_PORTAL_URL' : 'ERR_NO_TOKEN_IN_INPUT');
+  }
+  if (token.startsWith('cog_')) throw invalid('ERR_REAUTH_DEVIN_API_CREDENTIAL');
   const kind = classifyToken(token);
-  if (kind === 'auth1') throw Object.assign(new Error('ERR_AUTH1_NOT_A_POOL_KEY'), { code: 'ERR_AUTH1_NOT_A_POOL_KEY', statusCode: 400 });
-  if (kind !== 'session') throw Object.assign(new Error('ERR_REAUTH_TOKEN_INVALID'), { code: 'ERR_REAUTH_TOKEN_INVALID', statusCode: 400 });
+  if (kind === 'auth1') throw invalid('ERR_AUTH1_NOT_A_POOL_KEY');
+  if (kind !== 'session' || token === 'devin-session-token$') throw invalid('ERR_REAUTH_TOKEN_INVALID');
   // A PASTED token is not proof of anything — unlike a completed login, the
   // operator can paste the very token upstream just retired. Installing the
   // same key on a reauth account is refused (409) so the state cannot be
@@ -1082,9 +1145,119 @@ function applyReauthToken(id, rawToken, { via = 'token' } = {}) {
   return {
     success: true,
     reauthenticated: true,
+    modelVerification: 'pending',
     account: { id: account.id, email: account.email, method: account.method, status: account.status },
     apiKey_masked: maskApiKey(account.apiKey),
   };
+}
+
+// Marker set on the IncomingMessage by preflightDashboardRequest(). A Symbol
+// (not a string key) so a handler-level fixture cannot forge it and an HTTP
+// client can never set it: request headers live under req.headers.
+const DASHBOARD_PREFLIGHT_PASSED = Symbol('dashboardPreflightPassed');
+
+/**
+ * Host/mutation/lockout/auth gate shared by `preflightDashboardRequest` and
+ * `handleDashboardApi`. Returns true when the request may proceed; otherwise
+ * writes the 403/415/429/401 response itself and returns false.
+ *
+ * Extracted from handleDashboardApi unchanged (S03/G05) so server.js can run
+ * it BEFORE reading a /dashboard/api/* body: an unauthenticated mutation must
+ * not be able to make the process buffer and JSON-parse up to the 10 MiB body
+ * cap. Keeping one implementation is what keeps the two call sites from
+ * drifting apart.
+ */
+function runDashboardRequestGate(method, subpath, req, res) {
+  // A04: reject cross-site/simple-form mutations before auth counters, body
+  // handling, or any route side effect. This is deliberately before the
+  // lockout so a hostile page cannot spend a victim's auth attempts.
+  if (!enforceDashboardMutationGate(method, subpath, req, res)) return false;
+
+  // v2.0.56: brute-force lockout — apply BEFORE the auth check so the
+  // password comparison itself can't be used as an oracle once the IP is
+  // banned. /auth route is exempt (unauthenticated probe used by the UI
+  // to learn whether auth is required) but still feeds the lockout when
+  // it serves as a credential-verification endpoint.
+  const clientIp = dashboardClientIp(req);
+  const lock = checkLockout(clientIp);
+  if (lock.blocked) {
+    res.setHeader?.('Retry-After', String(Math.ceil(lock.retryAfterMs / 1000)));
+    json(res, 429, {
+      error: `Too many failed attempts. IP banned for ${Math.ceil(lock.retryAfterMs / 1000)}s.`,
+      retryAfterMs: lock.retryAfterMs,
+    });
+    return false;
+  }
+
+  // Auth check (except for auth verification endpoint)
+  if (subpath !== '/auth' && !checkAuth(req)) {
+    // Only count this toward the brute-force lockout when a NON-EMPTY password
+    // was actually submitted — a wrong guess. A missing/empty header is the
+    // normal pre-login state: the dashboard fires ~a dozen authed API calls
+    // (overview/stats/accounts/…) on page load before the user has typed
+    // anything, and counting each empty-password 401 as a "failed attempt"
+    // banned the IP the instant the page opened. Mirrors the /auth probe below.
+    if (String(req.headers['x-dashboard-password'] || '')) failedAuthAttempt(clientIp);
+    json(res, 401, { error: 'Unauthorized. Set X-Dashboard-Password header.' });
+    return false;
+  }
+  if (subpath !== '/auth') successfulAuthAttempt(clientIp);
+  return true;
+}
+
+/**
+ * Pre-body gate for /dashboard/api/*.
+ *
+ * server.js calls this BEFORE readBody() so an unauthenticated mutation is
+ * rejected at the Host/mutation/lockout/auth boundary without touching the
+ * request stream (S03/G05: the body read used to run first, letting an
+ * anonymous caller force up to MAX_BODY_SIZE of buffering + JSON parsing per
+ * request). Reuses the same gate handleDashboardApi runs.
+ *
+ * Returns true when the caller may proceed (and, for a mutation, read the
+ * body); false when the rejection response was already written. OPTIONS
+ * carries no body and is answered by handleDashboardApi's early 204 exactly
+ * as before, so it passes through untouched.
+ */
+export function preflightDashboardRequest(method, subpath, req, res) {
+  if (res) res._dashboardCorsOrigin = resolveCorsOrigin(req);
+  if (method === 'OPTIONS') return true;
+  if (!runDashboardRequestGate(method, subpath, req, res)) return false;
+  if (req && typeof req === 'object') req[DASHBOARD_PREFLIGHT_PASSED] = true;
+  return true;
+}
+
+/**
+ * Shape one model-access transaction outcome as the HTTP body the dashboards
+ * consume. A pre-publication failure is an honest 500; a published rename whose
+ * directory sync failed is still a success (the policy is live) carrying an
+ * explicit warning code, never an ordinary unqualified success.
+ */
+function modelAccessResponse(res, result) {
+  if (!result.applied) {
+    // Diagnostics must not replace the honest failure envelope with a throw.
+    try {
+      log.warn(`Dashboard model-access update was NOT applied: ${result.error?.message || 'persistence failure'}`);
+    } catch {}
+    return json(res, 500, {
+      success: false,
+      applied: false,
+      changed: result.changed,
+      durability: 'not-applied',
+      error: 'ERR_MODEL_ACCESS_PERSIST_FAILED',
+      config: result.config,
+    });
+  }
+  return json(res, 200, {
+    success: true,
+    applied: true,
+    changed: result.changed,
+    durability: result.durability,
+    ...(result.durability === 'unconfirmed'
+      ? { warnings: ['ERR_MODEL_ACCESS_DURABILITY_UNCONFIRMED'] }
+      : {}),
+    config: result.config,
+  });
 }
 
 /**
@@ -1097,41 +1270,21 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (res) res._dashboardCorsOrigin = resolveCorsOrigin(req);
   if (method === 'OPTIONS') return json(res, 204, '');
 
-  // A04: reject cross-site/simple-form mutations before auth counters, body
-  // handling, or any route side effect. This is deliberately before the
-  // lockout so a hostile page cannot spend a victim's auth attempts.
-  if (!enforceDashboardMutationGate(method, subpath, req, res)) return;
-
-  // v2.0.56: brute-force lockout — apply BEFORE the auth check so the
-  // password comparison itself can't be used as an oracle once the IP is
-  // banned. /auth route is exempt (unauthenticated probe used by the UI
-  // to learn whether auth is required) but still feeds the lockout when
-  // it serves as a credential-verification endpoint.
-  const clientIp = dashboardClientIp(req);
-  const lock = checkLockout(clientIp);
-  if (lock.blocked) {
-    res.setHeader?.('Retry-After', String(Math.ceil(lock.retryAfterMs / 1000)));
-    return json(res, 429, {
-      error: `Too many failed attempts. IP banned for ${Math.ceil(lock.retryAfterMs / 1000)}s.`,
-      retryAfterMs: lock.retryAfterMs,
-    });
+  // server.js already ran preflightDashboardRequest() before reading the body;
+  // running the gate again would re-validate the Host and double-count the
+  // successful-auth reset. Direct callers (unit tests, in-process handlers)
+  // never set the marker and still get the full gate here, exactly as before.
+  if (!(req && req[DASHBOARD_PREFLIGHT_PASSED] === true)) {
+    if (!runDashboardRequestGate(method, subpath, req, res)) return;
   }
-
-  // Auth check (except for auth verification endpoint)
-  if (subpath !== '/auth' && !checkAuth(req)) {
-    // Only count this toward the brute-force lockout when a NON-EMPTY password
-    // was actually submitted — a wrong guess. A missing/empty header is the
-    // normal pre-login state: the dashboard fires ~a dozen authed API calls
-    // (overview/stats/accounts/…) on page load before the user has typed
-    // anything, and counting each empty-password 401 as a "failed attempt"
-    // banned the IP the instant the page opened. Mirrors the /auth probe below.
-    if (String(req.headers['x-dashboard-password'] || '')) failedAuthAttempt(clientIp);
-    return json(res, 401, { error: 'Unauthorized. Set X-Dashboard-Password header.' });
-  }
-  if (subpath !== '/auth') successfulAuthAttempt(clientIp);
 
   // ─── Auth ─────────────────────────────────────────────
   if (subpath === '/auth') {
+    // The gate that used to declare clientIp now lives in
+    // runDashboardRequestGate (and may have already run as the server.js
+    // preflight). Re-resolve the same pure value for the probe's counter
+    // updates — no lockout/auth side effect is repeated.
+    const clientIp = dashboardClientIp(req);
     const storedPw = getEffectiveDashboardPasswordStored();
     const effectiveApiKey = getEffectiveApiKey();
     const hasSecret = !!(storedPw || effectiveApiKey);
@@ -1417,6 +1570,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       return json(res, 200, withJournal({ ok: true, mode: 'git', ...info }));
     } catch (err) {
       if (isSelfUpdateUnavailableError(err)) {
+        if (process.env.WINDSURFAPI_UPDATE_RELEASE_LINE) return json(res, 200, { ok: false, error: 'ERR_RELEASE_LINE_REQUIRES_GIT' });
         // Git path is unavailable (most often docker). Fall back to
         // docker self-update via /var/run/docker.sock if the user
         // mounted it into the container; otherwise report the same
@@ -1729,6 +1883,10 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     let mutationLockHandedOff = false;
     try {
       try {
+        const line = process.env.WINDSURFAPI_UPDATE_RELEASE_LINE;
+        if (line && (body?.forceUpdate || body?.forceReset)) {
+          return json(res, 200, { ok: false, error: 'ERR_RELEASE_LINE_FORCE' });
+        }
         const before = await gitStatus();
         reconcilePendingRollbackPoint(before.commitFull);
       // M1: resolve the update target before any write (including forceReset).
@@ -1742,10 +1900,10 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         // A failed fetch is not permission to operate on stale refs. The docker
         // fallback still activates when git itself is unavailable; every source
         // checkout otherwise fails closed until branch and tag refs are current.
-        await runGit(['fetch', '--quiet', '--no-tags', 'origin', safeBranch]);
+        const lineHead = await fetchSourceUpdateBranch(safeBranch);
         const forceGate = !!(body && body.forceUpdate);
         const targetState = await releaseUpdateState(safeBranch, before.commitFull, {
-          followUnreleased: forceGate,
+          followUnreleased: forceGate, lineHead,
         });
         if (targetState.diverged) {
           return json(res, 200, {
@@ -1758,7 +1916,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         // accounts.json, stats.json, runtime-config.json which live in the
         // repo root but aren't checked in). If tracked files were edited,
         // surface a friendly error instead of a raw git failure.
-        const dirty = (await runGit(['status', '--porcelain', '-uno'])).trim();
+        const dirty = (await runGit(line ? ['status', '--porcelain', '--ignore-submodules=none'] : ['status', '--porcelain', '-uno'])).trim();
         let resetTarget = before.commitFull;
         if (dirty) {
           const allowForce = !!(body && body.forceReset);
@@ -1835,6 +1993,11 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
             });
           }
         }
+        if (line && ((await runGit(['rev-parse', 'HEAD'])).trim() !== before.commitFull
+            || (await runGit(['rev-parse', '--abbrev-ref', 'HEAD'])).trim() !== before.branch
+            || (await runGit(['status', '--porcelain', '--ignore-submodules=none'])).trim())) {
+          return json(res, 200, { ok: false, error: 'ERR_CHECKOUT_CHANGED' });
+        }
         if (willChangeHead) {
           try {
             // Write a durable PENDING point before stash/reset/merge while keeping
@@ -1874,7 +2037,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
           pull = dirty
             ? await runGit(['reset', '--hard', resetTarget]).then(() => 'hard-reset applied')
             : targetState.updateAvailable
-              ? await runGit(['merge', '--ff-only', targetState.targetCommit])
+              ? await runGit(['merge', '--ff-only', ...(line ? ['--no-overwrite-ignore'] : []), targetState.targetCommit])
               : `Already at latest published release ${targetState.latestTag || targetState.targetCommit.slice(0, 7)}`;
         } catch (err) {
           mutationError = err;
@@ -2048,6 +2211,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       });
       } catch (err) {
         if (isSelfUpdateUnavailableError(err)) {
+          if (process.env.WINDSURFAPI_UPDATE_RELEASE_LINE) return json(res, 200, { ok: false, error: 'ERR_RELEASE_LINE_REQUIRES_GIT' });
         // Same fallback as /self-update/check: when git is unavailable
         // (docker), try the docker socket path. The dashboard may already
         // have called /self-update/check first and routed the user
@@ -2276,17 +2440,32 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // classifies each and adds via addAccountByPastedSecret. auth1_ is skipped
   // (PostAuth intermediate, not a pool key). SECURITY: never logs the pasted
   // text or any token; results carry only id/email/kind, never raw token.
-  if (subpath === '/accounts/import-text' && method === 'POST') {
+  if (method === 'POST' && (subpath === '/accounts/import-text' || subpath === '/accounts/import-text/preview')) {
     try {
       const text = String(body.text || '');
-      if (!text.trim()) return json(res, 400, { error: 'ERR_IMPORT_TEXT_EMPTY' });
-      const parsed = parseAccountText(text);
-      const results = { added: [], skipped: [], failed: [] };
+      if (!text.trim()) return json(res, 400, { error: 'ERR_IMPORT_TEXT_EMPTY' }, NO_STORE);
+      const preview = subpath.endsWith('/preview');
+      // Every row on this route adds to the pool, so opting out cannot be
+      // honored row by row. Previews use the explicit /preview route.
+      if (!preview && body.autoAdd === false) return json(res, 400, { error: 'ERR_AUTO_ADD_DISABLED' }, NO_STORE);
+      const parsed = parseAccountText(text, { includeDiagnostics: true, preview });
+      const { tokens, tokenPairs, accounts: passwordAccounts, unrecognizedLines, unrecognizedEntries = [] } = parsed;
+      if (preview) {
+        return json(res, 200, {
+          success: true, preview: true,
+          recognized: tokens.length + tokenPairs.length + passwordAccounts.length,
+          unrecognizedLines, ...(unrecognizedEntries.length ? { unrecognizedEntries } : {}),
+        }, NO_STORE);
+      }
+      // The legacy added array means the account is present after import.
+      // poolDisposition distinguishes a newly created row from an existing one.
+      const results = { added: [], skipped: [], failed: [], unrecognizedLines,
+        ...(unrecognizedEntries.length ? { unrecognizedEntries } : {}) };
       // A devin-session-token$ is itself the apiKey (addAccountByKey); other
       // token shapes run RegisterUser (addAccountByToken). Route by classified
       // kind so a pasted session token doesn't fail against the Firebase-only
       // RegisterUser path.
-      for (const raw of (parsed.tokens || [])) {
+      for (const raw of tokens) {
         const kind = classifyToken(raw);
         // auth1_ is a PostAuth intermediate, not a pool key.
         if (kind === 'auth1') { results.skipped.push({ kind, reason: 'auth1_not_a_pool_key' }); continue; }
@@ -2297,30 +2476,30 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         // routes a session token to the pool key and everything else through
         // RegisterUser, and reports a rejection per token instead of hiding it.
         try {
-          const acc = await addAccountByPastedSecret(raw, '');
-          refreshCredits(acc.id).catch(() => {});
-          results.added.push({ id: acc.id, email: acc.email, kind });
-        } catch (e) { results.failed.push({ kind, error: e.message }); }
+          const { account, poolDisposition } = await addAccountByPastedSecretWithDisposition(raw, '');
+          refreshCredits(account.id).catch(() => {});
+          results.added.push({ id: account.id, email: account.email, kind, poolDisposition });
+        } catch (e) { results.failed.push({ kind, error: importErrorCode(e) }); }
       }
-      for (const pair of (parsed.tokenPairs || [])) {
+      for (const pair of tokenPairs) {
         const pairKind = classifyToken(pair.token);
         if (pairKind === 'auth1') {
           results.skipped.push({ kind: pairKind, email: pair.email, reason: 'auth1_not_a_pool_key' });
           continue;
         }
         try {
-          const acc = await addAccountByPastedSecret(pair.token, pair.email || '');
-          refreshCredits(acc.id).catch(() => {});
-          results.added.push({ id: acc.id, email: acc.email || pair.email, kind: pairKind });
-        } catch (e) { results.failed.push({ email: pair.email, error: e.message }); }
+          const { account, poolDisposition } = await addAccountByPastedSecretWithDisposition(pair.token, pair.email || '');
+          refreshCredits(account.id).catch(() => {});
+          results.added.push({ id: account.id, email: account.email || pair.email, kind: pairKind, poolDisposition });
+        } catch (e) { results.failed.push({ email: pair.email, error: importErrorCode(e) }); }
       }
       // Email/password accounts need the login flow (batch 2+); record as skipped.
-      for (const a of (parsed.accounts || [])) {
+      for (const a of passwordAccounts) {
         results.skipped.push({ kind: 'email_password', email: a.email, reason: 'use_login_flow' });
       }
-      return json(res, 200, { success: true, ...results, ...getAccountCount() });
+      return json(res, 200, { success: true, ...results, ...getAccountCount() }, NO_STORE);
     } catch (err) {
-      return json(res, 400, { error: err.message });
+      return json(res, 400, { error: importErrorCode(err) }, NO_STORE);
     }
   }
 
@@ -2441,7 +2620,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       const canary = body?.canary === true || body?.deep === true;
       const result = await probeAccount(accountProbe[1], { allowLsStart: force, canary });
       if (!result) return json(res, 404, { error: 'Account not found' });
-      return json(res, 200, { success: true, ...result });
+      return json(res, 200, { success: result.ok !== false, ...result });
     } catch (err) {
       return json(res, 500, { error: err.message });
     }
@@ -2583,6 +2762,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         to: num('to'),
         model: u.searchParams.get('model') || null,
         account: u.searchParams.get('account') || null,
+        requestId: u.searchParams.get('requestId'),
         status: u.searchParams.has('status') ? num('status') : null,
         outcome: u.searchParams.get('outcome') || null,
         limit: num('limit') ?? 50,
@@ -2688,6 +2868,14 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     // Sticky-session affinity counters ride along so an operator can verify
     // STICKY_SESSION_ENABLED is actually binding (hits/creates > 0) instead
     // of counting log lines — the only way to check before this.
+    const params = dashboardUrl(req).searchParams;
+    if (params.get('applyPatch') === '1') {
+      return json(res, 200, { applyPatch: getApplyPatchDiagnostics() }, NO_STORE);
+    }
+    if (params.get('cacheBindings') === '1') {
+      return json(res, 200, { sticky: { enabled: isStickyEnabled(),
+        cacheOutcomes: getStickyCacheOutcomes(Number(params.get('offset'))) } }, NO_STORE);
+    }
     return json(res, 200, {
       ...getConnectMetrics(),
       poolHealth: getPoolHealthWindow(),
@@ -2925,6 +3113,11 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     }
     const hasApiKey = Object.prototype.hasOwnProperty.call(body, 'apiKey');
     const hasPassword = Object.prototype.hasOwnProperty.call(body, 'dashboardPassword');
+    // A diagnostic sink failure must not conceal an already-applied rotation
+    // or turn a pre-publication failure into an uncaught handler rejection.
+    const logOutcome = (level, message) => {
+      try { log[level](message); } catch {}
+    };
     let committed;
     try {
       committed = setRuntimeCredentials({
@@ -2933,22 +3126,48 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       });
     } catch (err) {
       if (err?.code === 'ERR_CREDENTIAL_PERSIST_FAILED') {
-        // The file write failed and both fields were rolled back; saying
-        // "success" here would leave the operator with credentials that only
-        // exist until the next restart.
-        log.warn(`Settings: credential rotation was NOT persisted: ${err.cause?.message || err.message}`);
-        return json(res, 500, { error: 'ERR_CREDENTIAL_PERSIST_FAILED' });
+        // Nothing reached the file and both fields were rolled back in memory.
+        // `applied:false` keeps this distinct from the applied-but-unconfirmed
+        // outcome below; a client must not read this as a warning on a
+        // rotation that happened.
+        logOutcome('warn', `Settings: credential rotation was NOT applied: ${err.cause?.message || err.message}`);
+        return json(res, 500, {
+          success: false,
+          applied: false,
+          durability: 'not-applied',
+          protection: 'not-applicable',
+          error: 'ERR_CREDENTIAL_PERSIST_FAILED',
+        });
       }
       return json(res, 400, { error: err.message });
     }
-    const out = {};
+    // 200 means the pair is applied (live + visible on disk). Durability and
+    // ACL hardening are reported separately: 'unconfirmed' / 'failed' are
+    // warnings about an already-applied rotation, not an unapplied failure, so
+    // they must never be encoded as a rollback or as an ordinary success.
+    const warnings = [];
+    if (committed.durability === 'unconfirmed') warnings.push('ERR_CREDENTIAL_DURABILITY_UNCONFIRMED');
+    if (committed.protection === 'failed') warnings.push('ERR_CREDENTIAL_PROTECTION_FAILED');
+    if (committed.durability === 'unconfirmed') {
+      logOutcome('warn', 'Settings: credential rotation is visible in runtime-config.json but its directory entry durability is unconfirmed');
+    }
+    if (committed.protection === 'failed') {
+      logOutcome('warn', 'Settings: credential rotation applied but owner-only protection of runtime-config.json failed');
+    }
+    const out = {
+      success: true,
+      applied: true,
+      durability: committed.durability,
+      protection: committed.protection,
+      ...(warnings.length ? { warnings } : {}),
+    };
     if (hasApiKey) {
       out.apiKeyUpdated = true;
       out.apiKey_masked = maskApiKey(committed.apiKey || getEffectiveApiKey());
     }
     if (hasPassword) out.dashboardPasswordUpdated = true;
-    log.info(`Settings: credentials rotated from ${dashboardClientIp(req) || 'unknown'} (apiKey=${!!out.apiKeyUpdated}, dashboardPassword=${!!out.dashboardPasswordUpdated})`);
-    return json(res, 200, { success: true, ...out });
+    logOutcome('info', `Settings: credentials rotated from ${dashboardClientIp(req) || 'unknown'} (apiKey=${!!out.apiKeyUpdated}, dashboardPassword=${!!out.dashboardPasswordUpdated}, durability=${committed.durability}, protection=${committed.protection})`);
+    return json(res, 200, out);
   }
 
   // GET /settings/prefs — dashboard UI preferences (booleans, shared across
@@ -2981,7 +3200,17 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         return json(res, 400, { error: e?.message || 'ERR_PROXY_PRIVATE_HOST' });
       }
     }
-    setGlobalProxy(body);
+    try {
+      setGlobalProxy(body);
+    } catch (e) {
+      if (e?.code === 'ERR_PROXY_PASSWORD_IDENTITY_CHANGED') {
+        // A saved password is bound to its destination + username. The edit
+        // was refused before either config was touched; the caller must send
+        // the password explicitly or send an explicit empty value to clear it.
+        return json(res, 400, { error: e.message, code: e.code });
+      }
+      throw e;
+    }
     return json(res, 200, { success: true, config: getProxyConfigMasked() });
   }
 
@@ -3001,7 +3230,16 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         return json(res, 400, { error: e?.message || 'ERR_PROXY_PRIVATE_HOST' });
       }
     }
-    setAccountProxy(proxyAccount[1], body);
+    try {
+      setAccountProxy(proxyAccount[1], body);
+    } catch (e) {
+      if (e?.code === 'ERR_PROXY_PASSWORD_IDENTITY_CHANGED') {
+        // Same identity boundary as /proxy/global: refuse before admission or
+        // warmup so a rejected edit cannot partially rebind the account.
+        return json(res, 400, { error: e.message, code: e.code });
+      }
+      throw e;
+    }
     const admission = getLsAdmissionStatus(body?.host ? body : null);
     const warmupRequested = body?.warmup === true || body?.prewarm === true || shouldPrewarmLsOnAccountAdd();
     let warmup = { ok: true, skipped: true, reason: 'warmup_not_requested' };
@@ -3150,7 +3388,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       try { unlinkSync(installTarget); } catch { /* already gone */ }
     };
     const env = {
-      ...process.env,
+      ...buildSubprocessEnv(),
       LS_INSTALL_PATH: config.lsBinaryPath,
     };
     if (staged) env.LS_INSTALL_STAGE_PATH = installTarget;
@@ -3317,6 +3555,8 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     // panel called its only working models paid and a phantom selector free.
     const drought = getDroughtSummary();
     const dailyDry = typeof drought.lowestDailyPercent === 'number' && drought.lowestDailyPercent <= 0;
+    const priceNow = Date.now();
+    const { staleAfterMs } = getCloudBillingSyncState(priceNow);
     // One resolver for every row producer below, so a synthesized row and a MODELS
     // row can never disagree about price or catalog membership.
     //
@@ -3326,6 +3566,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     // which is why a model the catalog omits (swe-1-6-slow) could read as FREE.
     const pricingFields = (selector) => {
       const pricing = getConnectSelectorPricing(selector);
+      const quote = selector ? getCloudCreditRate(selector) : null;
       let quotaState = null;
       if (!selector) quotaState = null; // not a Connect-namespace row
       else if (pricing.inLiveCatalog === false) quotaState = 'not_in_catalog';
@@ -3337,6 +3578,11 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         // Upstream cost tier ("MODEL_COST_TIER_FREE" | LOW | MEDIUM | HIGH), null
         // when the account's Cascade catalog has not reported it.
         costTier: pricing.costTier,
+        // The cached catalog quote has its own timestamp. A fresh rate for a
+        // different selector must never make this quote appear fresh.
+        creditRate: quote?.credit ?? null,
+        creditRateFetchedAt: quote?.fetchedAt || null,
+        creditRateStale: quote?.fetchedAt > 0 ? priceNow - quote.fetchedAt > staleAfterMs : null,
         // ISO end of the active promotion, when the upstream sent one.
         promoEndsAt: pricing.promoEndsAt,
         // Tri-state price: true free, false billable, null no data. Never a guess.
@@ -3476,22 +3722,21 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   }
 
   if (subpath === '/model-access' && method === 'PUT') {
-    if (body.mode) setModelAccessMode(body.mode);
-    if (body.list) setModelAccessList(body.list);
-    if (body.defaultModel !== undefined) setDefaultModel(body.defaultModel);
-    return json(res, 200, { success: true, config: getModelAccessConfig() });
+    return modelAccessResponse(res, updateModelAccess(body));
   }
 
   if (subpath === '/model-access/add' && method === 'POST') {
-    if (!body.model) return json(res, 400, { error: 'model is required' });
-    addModelToList(body.model);
-    return json(res, 200, { success: true, config: getModelAccessConfig() });
+    if (!body?.model) return json(res, 400, { error: 'model is required' });
+    const current = getModelAccessConfig();
+    // An idempotent add of an already-listed model is a no-op, not a duplicate.
+    const list = current.list.includes(body.model) ? current.list : [...current.list, body.model];
+    return modelAccessResponse(res, updateModelAccess({ list }));
   }
 
   if (subpath === '/model-access/remove' && method === 'POST') {
-    if (!body.model) return json(res, 400, { error: 'model is required' });
-    removeModelFromList(body.model);
-    return json(res, 200, { success: true, config: getModelAccessConfig() });
+    if (!body?.model) return json(res, 400, { error: 'model is required' });
+    const current = getModelAccessConfig();
+    return modelAccessResponse(res, updateModelAccess({ list: current.list.filter(m => m !== body.model) }));
   }
 
   // ─── Windsurf Login ────────────────────────────────────
@@ -3592,22 +3837,19 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     const { flowId, code, proxy: loginProxy, autoAdd } = body || {};
     if (!flowId || !code) return json(res, 400, { error: 'ERR_EMAIL_FLOW_CODE_REQUIRED' });
     try {
-      // V-24: when the caller binds the exchange to an account, the flow's own
-      // identity must match it BEFORE the single-use code is spent. finalize
-      // re-checks before any mutation; this early check keeps a mismatch from
-      // costing the operator a second email.
-      const boundAccount = body?.accountId ? getAccountInternal(body.accountId) : null;
+      // Bind the row and its revision before spending the single-use code.
+      const bound = body?.accountId ? captureBoundWindsurfLogin(body.accountId) : null;
       const result = await emailLoginComplete(
         flowId,
         code,
         loginProxy?.host ? loginProxy : getProxyConfig().global,
-        { expectedIdentityEmail: boundAccount?.email },
+        { expectedIdentityEmail: bound?.identity },
       );
       // No password exists in this flow, so there is nothing for the credential
       // store to persist — pass storeCredential:false regardless of the request.
-      return json(res, 200, await finalizeWindsurfLogin(result, {
+      return json(res, 200, finalizeWindsurfLogin(result, {
         password: null, loginProxy, autoAdd, storeCredential: false, req,
-        accountId: body?.accountId || null,
+        bound,
       }));
     } catch (err) {
       return json(res, err.statusCode || 400, {
@@ -3621,18 +3863,9 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     }
   }
 
-  // Import a token captured from the official sign-in page
-  // (windsurf.com/editor/show-auth-token) or from any OAuth / deep-link
-  // redirect, in ONE step.
-  //
-  // Stateless on purpose. `/oauth/callback` is the state-bound flow for CLI and
-  // remote-onboarding clients; requiring a pending session here meant a valid
-  // token failed with ERR_INVALID_STATE whenever the page had been opened by a
-  // different button (or the session had expired). The token itself is the
-  // credential — the state adds nothing to this path.
-  //
-  // `devin-session-token$…` is stored as the pool key; a Firebase idToken /
-  // show-auth-token value goes through RegisterUser. `auth1_` is an
+  // Import an existing credential supplied for this gateway. This is separate
+  // from browser sign-in. Legacy token-bearing input formats remain accepted.
+  // A devin-session-token is stored as the pool key. An auth1_ value is an
   // intermediate and is rejected. The raw input is NEVER echoed or logged.
   if (subpath === '/windsurf-login/token' && method === 'POST') {
     const raw = body?.token ?? body?.redirect_url ?? '';
@@ -3674,16 +3907,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         const password = String(acct?.password || '').trim();
         try {
           const result = await processWindsurfLogin({ email, password, loginProxy, autoAdd, storeCredential, req });
-          // V-25: /windsurf-login returns the raw key for a one-time export
-          // when autoAdd:false. A BATCH response has no such contract — every
-          // row is keyed by an address whose password the caller just sent, so
-          // a raw key here is only a leak. Mask it and keep the same shape.
-          if (result && result.apiKey) {
-            const { apiKey, ...rest } = result;
-            results.push({ ...rest, apiKey_masked: maskApiKey(apiKey) });
-          } else {
-            results.push(result);
-          }
+          results.push(publicBatchLoginResult(result));
         } catch (err) {
           results.push({
             success: false,
@@ -3710,16 +3934,32 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   }
 
   // ─── Batch proxy + account import ─────────────────────
-  // POST /batch-import — each line: "proxy email password" or "email password"
-  if (subpath === '/batch-import' && method === 'POST') {
+  // POST /batch-import/preview reports parsed formats without attempting
+  // logins, validating proxy reachability, or writing any account or proxy.
+  if (method === 'POST' && (subpath === '/batch-import' || subpath === '/batch-import/preview')) {
     try {
       const { text, autoAdd = true, storeCredential } = body || {};
-      if (!text || typeof text !== 'string') return json(res, 400, { error: 'ERR_TEXT_REQUIRED' });
+      if (!text || typeof text !== 'string') return json(res, 400, { error: 'ERR_TEXT_REQUIRED' }, NO_STORE);
       const parsed = parseBatchImportInput(text, parseProxyUrl);
-      if (!parsed.items.length) return json(res, 400, { error: 'ERR_NO_VALID_LINES' });
+      if (!parsed.items.length) return json(res, 400, { error: 'ERR_NO_VALID_LINES' }, NO_STORE);
+      if (subpath.endsWith('/preview')) {
+        return json(res, 200, {
+          success: true, preview: true, mode: parsed.mode,
+          results: parsed.items.map(item => {
+            const error = item.error || (classifyToken(item.token || item.apiKey) === 'auth1' ? 'ERR_AUTH1_NOT_A_POOL_KEY' : undefined);
+            return { lineNumber: item.lineNumber, importKind: item.kind, error };
+          }),
+        }, NO_STORE);
+      }
       const results = [];
       let skippedCount = 0;
       for (const item of parsed.items) {
+        if (autoAdd === false && (item.kind === 'token' || item.kind === 'api_key')) {
+          skippedCount++;
+          results.push({ success: false, skipped: true, lineNumber: item.lineNumber,
+            importKind: item.kind, error: 'ERR_AUTO_ADD_DISABLED' });
+          continue;
+        }
         if (item.kind === 'issue') {
           skippedCount++;
           results.push({
@@ -3728,6 +3968,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
             email: item.label,
             error: item.error,
             lineNumber: item.lineNumber,
+            importKind: item.kind,
             // V-25: never `item.raw` — that string is the operator's pasted
             // line (password/token included). The kind label is derived from
             // the parsed shape, so it cannot contain any of the input.
@@ -3747,32 +3988,35 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
               autoAdd,
               storeCredential,
               req,
+              reportPoolDisposition: true,
             });
-            const binding = buildBatchProxyBinding(result, item.proxyRaw);
+            const binding = buildBatchProxyBinding(result, item.proxy);
             if (binding) {
               setAccountProxy(binding.accountId, binding.proxy);
               scheduleAccountWarmup(binding.accountId);
             }
           } else if (item.kind === 'token') {
-            const account = await addAccountByPastedSecret(item.token, item.label);
+            const { account, poolDisposition } = await addAccountByPastedSecretWithDisposition(item.token, item.label);
             if (item.proxy) {
               setAccountProxy(account.id, item.proxy);
               scheduleAccountWarmup(account.id);
             }
             result = {
               success: true,
+              poolDisposition,
               email: account.email,
               apiKey_masked: maskApiKey(account.apiKey),
               account: { id: account.id, email: account.email, status: account.status },
             };
           } else if (item.kind === 'api_key') {
-            const account = await addAccountByPastedSecret(item.apiKey, item.label, item.apiServerUrl || '', { unknownAsKey: true });
+            const { account, poolDisposition } = await addAccountByPastedSecretWithDisposition(item.apiKey, item.label, item.apiServerUrl || '', { unknownAsKey: true });
             if (item.proxy) {
               setAccountProxy(account.id, item.proxy);
               scheduleAccountWarmup(account.id);
             }
             result = {
               success: true,
+              poolDisposition,
               email: account.email,
               apiKey_masked: maskApiKey(account.apiKey),
               account: { id: account.id, email: account.email, status: account.status },
@@ -3782,17 +4026,19 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
           }
           // V-25: `proxyRaw` carried user:pass@; the label drops the userinfo
           // and is what the dashboard shows / stores in login history.
-          result.proxy = redactedProxyLabel(item.proxy);
-          result.importKind = item.kind;
-          results.push(result);
+          results.push({
+            ...publicBatchLoginResult(result),
+            poolDisposition: result.poolDisposition,
+            lineNumber: item.lineNumber,
+            proxy: redactedProxyLabel(item.proxy),
+            importKind: item.kind,
+          });
         } catch (err) {
           results.push({
             success: false,
             skipped: false,
             email: item.email || item.label || '',
-            // Prefer the stable code; a bare Error message can carry upstream
-            // prose, so it is bounded as a last resort.
-            error: err.code || String(err.message || 'ERR_IMPORT_ITEM_FAILED').slice(0, 200),
+            error: importErrorCode(err),
             lineNumber: item.lineNumber,
             proxy: redactedProxyLabel(item.proxy),
             importKind: item.kind,
@@ -3813,9 +4059,9 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       }, NO_STORE);
     } catch (err) {
       if (err instanceof BatchImportParseError) {
-        return json(res, 400, { error: err.code });
+        return json(res, 400, { error: err.code }, NO_STORE);
       }
-      return json(res, 400, { error: err.message });
+      return json(res, 400, { error: importErrorCode(err) }, NO_STORE);
     }
   }
 
@@ -3831,7 +4077,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
       let account = null;
       if (autoAdd !== false) {
-        account = addAccountByKey(apiKey, name || email || provider || 'OAuth');
+        account = addAccountByKey(apiKey, sanitizeLabelText(name) || email || provider || 'OAuth');
         if (refreshToken) {
           setAccountTokens(account.id, { refreshToken, idToken });
         }
@@ -3855,50 +4101,31 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     }
   }
 
-  // ─── OAuth remote-onboarding state machine ──────────────────────
-  // Lets a PUBLIC deploy onboard via the official Windsurf sign-in page without
-  // the server ever receiving a localhost callback: start -> user logs in in
-  // their own browser -> they paste the whole redirect URL back -> server pulls
-  // the token out of it -> poll for the result. Ported (in-memory) from
-  // CLIProxyAPI's oauth_sessions/oauth_callback. All three inherit checkAuth.
-  if (subpath === '/oauth/start' && method === 'POST') {
-    const { registerSession } = await import('./oauth-sessions.js');
-    const state = registerSession('windsurf');
-    // Windsurf editor backup-token signin URL (response_type=token). state rides
-    // the OAuth state param so we can correlate the pasted callback.
-    const url = 'https://windsurf.com/windsurf/signin?response_type=token'
-      + '&client_id=3GUryQ7ldAeKEuD2obYnppsnmj58eP5u&redirect_uri=show-auth-token'
-      + '&state=' + encodeURIComponent(state)
-      + '&prompt=login&redirect_parameters_type=query&workflow=';
-    return json(res, 200, { success: true, url, state });
+  if (subpath === '/devin-browser-login/status' && method === 'GET') {
+    const origin = browserLoginOrigin(req);
+    if (!origin) return json(res, 200, { available: false }, NO_STORE);
+    const id = dashboardUrl(req).searchParams.get('id');
+    return json(res, 200, id ? browserLogin.status(origin, id) : { available: true }, NO_STORE);
   }
-  if (subpath === '/oauth/callback' && method === 'POST') {
-    const { validateState, getSession, completeSession, failSession } = await import('./oauth-sessions.js');
-    const { state, redirect_url } = body || {};
-    if (!validateState(state)) return json(res, 400, { error: 'ERR_INVALID_STATE' });
-    const session = getSession(state);
-    if (!session || session.status !== 'pending') return json(res, 409, { error: 'ERR_SESSION_NOT_PENDING' });
-    try {
-      // Extract the token from whatever the user pasted: a full redirect URL
-      // (query or #hash), or the bare token itself. NEVER log redirect_url.
-      const token = extractOAuthToken(redirect_url);
-      if (!token) throw new Error('ERR_NO_TOKEN_IN_INPUT');
-      // A devin-session-token$ IS the apiKey — it must go through addAccountByKey,
-      // NOT addAccountByToken (which runs RegisterUser and only accepts a Firebase
-      // idToken). Route by prefix so both token shapes onboard correctly.
-      const account = await addAccountByPastedSecret(token, '');
+  if (method === 'POST' && ['/devin-browser-login/start', '/devin-browser-login/complete', '/devin-browser-login/cancel'].includes(subpath)) {
+    const origin = browserLoginOrigin(req);
+    if (!origin) return json(res, 404, { error: 'ERR_BROWSER_ENROLLMENT_UNAVAILABLE' }, NO_STORE);
+    if (subpath.endsWith('/start')) return json(res, 200, browserLogin.start(origin), NO_STORE);
+    if (subpath.endsWith('/cancel')) return json(res, 200, browserLogin.cancel(origin, body?.id), NO_STORE);
+    const result = await browserLogin.complete(origin, body?.id, key => {
+      const { account } = addAccountByKeyWithDisposition(key, 'Devin browser sign-in');
+      if (!account?.id) return null;
       scheduleAccountWarmup(account.id);
-      completeSession(state);
-      return json(res, 200, { success: true, account: { id: account.id, email: account.email, status: account.status } });
-    } catch (err) {
-      failSession(state, err.message);
-      return json(res, 400, { error: err.message });
-    }
+      return account.id;
+    });
+    return json(res, 200, result, NO_STORE);
   }
-  if (subpath === '/oauth/status' && method === 'GET') {
-    const { getStatus } = await import('./oauth-sessions.js');
-    const st = new URL(req.url, 'http://localhost').searchParams.get('state') || '';
-    return json(res, 200, getStatus(st));
+
+  // Keep an explicit terminal answer for clients with old browser flows.
+  // A portal visit does not create a gateway transaction or admit an account.
+  if ((method === 'POST' && (subpath === '/oauth/start' || subpath === '/oauth/callback'))
+      || (method === 'GET' && subpath === '/oauth/status')) {
+    return json(res, 410, { error: 'ERR_BROWSER_ENROLLMENT_UNAVAILABLE' }, NO_STORE);
   }
 
   // ─── Email OTP Login — SEALED 2026-07-06 ────────────────────────
@@ -3947,7 +4174,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
       let account = null;
       if (autoAdd !== false) {
-        account = addAccountByKey(apiKey, name || email || 'OTP');
+        account = addAccountByKey(apiKey, sanitizeLabelText(name) || email || 'OTP');
         scheduleAccountWarmup(account.id);
       }
 
@@ -4008,8 +4235,14 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       langServer: getLsStatus(),
       detach: { enabled: cascadeDetachEnabled(), ...detachedRegistry.stats() },
     });
+    const turnQuery = dashboardUrl(req).searchParams;
+    const turnPageSize = Number(turnQuery.get('turnPageSize'));
     const sessions = buildSessionsSection({
-      turns: buildTurnsSection({ accounts, totalAccounts: allAccounts.length, readRequests: getAccountRequests, now }),
+      turns: buildTurnsSection({
+        accounts, totalAccounts: allAccounts.length, readRequests: getAccountRequests, now,
+        page: parseBoundedInt(turnQuery.get('turnPage'), 1, { min: 1 }),
+        rowCap: TURN_PAGE_SIZES.includes(turnPageSize) ? turnPageSize : TURN_ROW_CAP,
+      }),
     });
     const quota = buildQuotaSection({
       drought: getDroughtSummary(),
@@ -4656,7 +4889,7 @@ export function runGit(args, opts = {}) {
   return new Promise((resolve, reject) => {
     if (!hasGitMetadata(opts.cwd)) return reject(makeSelfUpdateUnavailableError());
     getGitExecFile().then((execFile) => {
-      execFile('git', args, { timeout: 30_000, maxBuffer: 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+      execFile('git', args, { timeout: 30_000, maxBuffer: 1024 * 1024, ...opts, ...(process.env.WINDSURFAPI_UPDATE_RELEASE_LINE ? { env: { ...process.env, ...opts.env, GIT_NO_REPLACE_OBJECTS: '1' } } : {}) }, (err, stdout, stderr) => {
         if (err?.code === 'ENOENT') return reject(makeSelfUpdateUnavailableError());
         if (err) {
           const failure = new Error((stderr || err.message).toString().slice(0, 500));
@@ -4672,65 +4905,6 @@ export function runGit(args, opts = {}) {
       });
     }).catch(reject);
   });
-}
-
-function stableReleaseVersion(tag) {
-  const match = String(tag || '').match(/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
-  return match ? match.slice(1) : null;
-}
-
-function compareDecimalComponents(left, right) {
-  if (left.length !== right.length) return left.length > right.length ? 1 : -1;
-  if (left === right) return 0;
-  return left > right ? 1 : -1;
-}
-
-function compareStableReleaseTags(left, right) {
-  const a = stableReleaseVersion(left);
-  const b = stableReleaseVersion(right);
-  for (let i = 0; i < 3; i++) {
-    const compared = compareDecimalComponents(a[i], b[i]);
-    if (compared) return compared;
-  }
-  return 0;
-}
-
-function validRemoteTagName(tag) {
-  return !!tag
-    && !tag.startsWith('.')
-    && !tag.endsWith('.')
-    && !tag.startsWith('/')
-    && !tag.endsWith('/')
-    && !tag.includes('..')
-    && !tag.includes('//')
-    && !tag.includes('@{')
-    && !/[\x00-\x20\x7f~^:?*[\\]/.test(tag);
-}
-
-function parseRemoteStableReleaseTags(output) {
-  const byName = new Map();
-  for (const line of String(output || '').split(/\r?\n/).filter(Boolean)) {
-    const match = line.match(/^([0-9a-f]{40}|[0-9a-f]{64})\trefs\/tags\/(.+)$/i);
-    if (!match) throw new Error('remote tag enumeration returned a malformed record');
-    const oid = match[1].toLowerCase();
-    const peeled = match[2].endsWith('^{}');
-    const name = peeled ? match[2].slice(0, -3) : match[2];
-    if (!validRemoteTagName(name)) throw new Error('remote tag enumeration returned an invalid ref name');
-    if (!stableReleaseVersion(name)) continue;
-
-    const entry = byName.get(name) || { name, object: '', peeled: '' };
-    const field = peeled ? 'peeled' : 'object';
-    if (entry[field]) throw new Error(`remote tag enumeration duplicated ${name}${peeled ? '^{}' : ''}`);
-    entry[field] = oid;
-    byName.set(name, entry);
-  }
-
-  const candidates = [...byName.values()];
-  for (const candidate of candidates) {
-    if (!candidate.object) throw new Error(`remote tag ${candidate.name} has a peeled record without its tag ref`);
-  }
-  candidates.sort((left, right) => compareStableReleaseTags(right.name, left.name));
-  return candidates;
 }
 
 async function materializeRemoteReleaseTag(candidate) {
@@ -4769,7 +4943,7 @@ async function gitCommitIsAncestor(commit, ref) {
   }
 }
 
-async function latestReleaseTag(branch) {
+async function latestReleaseTag(branch, lineHead) {
   // Query the remote tag namespace directly. `git fetch --tags` is additive:
   // when a mistaken/revoked release tag is deleted upstream, its local ref
   // survives and `git tag --list` keeps selecting it indefinitely. Remote refs
@@ -4777,7 +4951,13 @@ async function latestReleaseTag(branch) {
   try {
     const output = await runGit(['ls-remote', '--tags', 'origin', 'refs/tags/v[0-9]*']);
     const remoteRef = `origin/${branch}`;
-    for (const advertised of parseRemoteStableReleaseTags(output)) {
+    const tags = parseRemoteStableReleaseTags(output);
+    const line = process.env.WINDSURFAPI_UPDATE_RELEASE_LINE;
+    if (line) {
+      const selected = await selectReleaseLine(line, lineHead, tags, runGit);
+      return await materializeRemoteReleaseTag(selected);
+    }
+    for (const advertised of tags) {
       const candidate = await materializeRemoteReleaseTag(advertised);
       if (await gitCommitIsAncestor(candidate.commit, remoteRef)) return candidate;
     }
@@ -4800,7 +4980,8 @@ async function latestReleaseTag(branch) {
  * updating; `required` makes missing material fatal.
  */
 async function verifySelectedReleaseAttestation(release) {
-  const mode = normalizeAttestationMode(process.env.WINDSURFAPI_UPDATE_ATTESTATION);
+  const line = process.env.WINDSURFAPI_UPDATE_RELEASE_LINE;
+  const mode = line ? 'required' : normalizeAttestationMode(process.env.WINDSURFAPI_UPDATE_ATTESTATION);
   let repository = '';
   try {
     const originUrl = (await runGit(['remote', 'get-url', 'origin'])).trim();
@@ -4822,6 +5003,12 @@ async function verifySelectedReleaseAttestation(release) {
     dir: process.env.WINDSURFAPI_ATTESTATION_DIR || '',
     repository,
   };
+  if (line) {
+    options.repository = DEFAULT_ATTESTATION_REPOSITORY;
+    options.tree = (await runGit(['rev-parse', release.commit + '^{tree}'])).trim();
+    const tag = release.name.replaceAll('.', '\\.');
+    options.identity = '^https://github\\.com/dwgx/WindsurfAPI/\\.github/workflows/release\\.yml@refs/tags/' + tag + '$';
+  }
   const result = releaseAttestationVerifierForTest
     ? await releaseAttestationVerifierForTest(options)
     : await verifyReleaseAttestation(options);
@@ -4838,10 +5025,27 @@ function safeUpdateBranch(branch) {
   return candidate !== 'HEAD' && /^[\w.\-\/]+$/.test(candidate) ? candidate : 'master';
 }
 
-async function releaseUpdateState(branch, currentCommit, { followUnreleased = false } = {}) {
-  const remoteRef = `origin/${branch}`;
+async function fetchSourceUpdateBranch(branch) {
+  if (!process.env.WINDSURFAPI_UPDATE_RELEASE_LINE) {
+    await runGit(['fetch', '--quiet', '--no-tags', 'origin', branch]);
+    return null;
+  }
+  const branchRef = 'refs/heads/master';
+  const advertised = (await runGit(['ls-remote', '--heads', 'origin', branchRef])).trimEnd();
+  const [head, ref, ...extra] = advertised.split('\t');
+  if (ref !== branchRef || extra.length || !validGitObjectId(head)) throw new Error('Invalid advertised release branch');
+  await runGit(['fetch', '--quiet', '--no-tags', 'origin', branchRef]);
+  // Other dashboard checks can fetch tags concurrently and overwrite FETCH_HEAD.
+  // Compare against this request's own branch advertisement before using it.
+  const fetched = (await runGit(['rev-parse', 'FETCH_HEAD^{commit}'])).trim();
+  if (head !== fetched) throw new Error('Release branch changed during fetch; retry the update check');
+  return head;
+}
+
+async function releaseUpdateState(branch, currentCommit, { followUnreleased = false, lineHead = null } = {}) {
+  const remoteRef = lineHead || `origin/${branch}`;
   const remoteHead = (await runGit(['rev-parse', remoteRef])).trim();
-  const release = await latestReleaseTag(branch);
+  const release = await latestReleaseTag(branch, lineHead);
   const latestTag = release.name;
   if (!latestTag && !followUnreleased) {
     throw makeSelfUpdateError(
@@ -4889,8 +5093,8 @@ async function gitStatus() {
   let updateError = '';
   try {
     const safeBranch = safeUpdateBranch(branch);
-    await runGit(['fetch', '--quiet', '--no-tags', 'origin', safeBranch]);
-    update = await releaseUpdateState(safeBranch, commit);
+    const lineHead = await fetchSourceUpdateBranch(safeBranch);
+    update = await releaseUpdateState(safeBranch, commit, { lineHead });
   } catch (err) {
     if (isSelfUpdateUnavailableError(err)) throw err;
     updateError = err?.code || err?.message || 'ERR_UPDATE_CHECK_FAILED';
@@ -4929,39 +5133,35 @@ export async function testProxy({ host, port, username, password, type }, tlsTim
   } else {
     await assertPublicUrlHost(host);
   }
-  const { isSocks, createSocksTunnel } = await import('../socks.js');
   const tls = await import('node:tls');
   const targetHost = 'api.ipify.org';
   const targetPort = 443;
   const proxy = { host, port, username, password, type };
 
-  // Get a raw TCP socket — either via SOCKS5 or HTTP CONNECT
+  // One shared connector decides the first hop: SOCKS5, plaintext HTTP CONNECT,
+  // or certificate-verified TLS to an HTTPS proxy before CONNECT/auth is sent.
+  // The host was validated above; for a TCP first hop resolve it once here and
+  // hand the vetted literal over so the connector performs no second lookup.
   let socket;
-  if (isSocks(proxy)) {
-    socket = await createSocksTunnel(proxy, targetHost, targetPort, 10000);
-  } else {
-    const http = await import('node:http');
-    // #11: pin the proxy host to a vetted IP literal so this CONNECT does not
-    // re-resolve the (already validated) hostname via a second, rebindable lookup.
-    const dialHost = await resolveProxyConnectHost(host, { allowPrivate: config.allowPrivateProxyHosts });
-    socket = await new Promise((resolve, reject) => {
-      const authHeader = username
-        ? { 'Proxy-Authorization': 'Basic ' + Buffer.from(`${username}:${password || ''}`).toString('base64') }
-        : {};
-      const req = http.request({
-        host: dialHost, port, method: 'CONNECT',
-        path: `${targetHost}:${targetPort}`,
-        headers: { Host: `${targetHost}:${targetPort}`, ...authHeader },
-        timeout: 10000,
-      });
-      req.on('connect', (res, sock) => {
-        if (res.statusCode !== 200) { sock.destroy(); return reject(new Error(`ERR_PROXY_HTTP_ERROR:${res.statusCode}`)); }
-        resolve(sock);
-      });
-      req.on('error', (err) => reject(new Error(`ERR_CONNECTION_FAILED:${err.message}`)));
-      req.on('timeout', () => { req.destroy(); reject(new Error('ERR_TIMEOUT')); });
-      req.end();
-    });
+  try {
+    const dialHost = proxyScheme(proxy) === 'socks5'
+      ? undefined
+      : await resolveProxyConnectHost(host, { allowPrivate: config.allowPrivateProxyHosts });
+    socket = await createProxyTunnel(proxy, targetHost, targetPort, { timeoutMs: 10000, dialHost });
+  } catch (err) {
+    // SOCKS errors were surfaced verbatim before this refactor; keep them.
+    if (proxyScheme(proxy) === 'socks5') throw err;
+    // Preserve the dashboard's existing error-code contract (i18n keys).
+    if (err.code === 'ERR_PROXY_CONNECT') {
+      throw new Error(`ERR_PROXY_HTTP_ERROR:${err.statusCode ?? err.message}`);
+    }
+    if (err.code === 'ERR_PROXY_TLS') {
+      throw new Error(`ERR_TLS_FAILED:${err.message}`);
+    }
+    if (err.code === 'ERR_PROXY_CONNECT_TIMEOUT' || err.code === 'ERR_PROXY_TLS_TIMEOUT') {
+      throw new Error('ERR_TIMEOUT');
+    }
+    throw new Error(`ERR_CONNECTION_FAILED:${err.message}`);
   }
 
   // TLS handshake + GET to verify the tunnel works. SEC-W5: verify the cert —

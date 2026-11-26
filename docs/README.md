@@ -17,7 +17,8 @@
 > current / stale / duplicate status.
 
 Project-level entry points: [CONTRIBUTING.md](../CONTRIBUTING.md) (merge bar, review rules and
-testing) · [CHANGELOG.md](../CHANGELOG.md) (version index) · [README.en.md](../README.en.md)
+testing) · [CHANGELOG.md](../CHANGELOG.md) (version index) · [ROADMAP.md](ROADMAP.md)
+(current priorities and acceptance) · [README.en.md](../README.en.md)
 (English README).
 
 ```mermaid
@@ -47,11 +48,38 @@ flowchart TD
 | Point Claude Code / Cline / Cursor at it | [Main README → 客户端接入](../README.md#claude-code--cline--cursor-怎么用) |
 | See which models are available | [Main README → 模型清单](../README.md) — the `/v1/models` endpoint is authoritative |
 
+### Use OpenCode as an ACP agent
+
+OpenCode 1.19.6 can receive a prompt over ACP and send it to WindsurfAPI's Chat Completions endpoint. Set `WINDSURFAPI_CLIENT_KEY` in the environment that launches OpenCode to the client API key accepted by your WindsurfAPI server. In your OpenCode configuration, use the server's address and a model ID returned by its authenticated `/v1/models` endpoint.
+
+```json
+{
+  "model": "windsurf/swe-1-6-slow",
+  "small_model": "windsurf/swe-1-6-slow",
+  "enabled_providers": ["windsurf"],
+  "provider": {
+    "windsurf": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "WindsurfAPI",
+      "options": {
+        "baseURL": "http://127.0.0.1:3003/v1",
+        "apiKey": "{env:WINDSURFAPI_CLIENT_KEY}"
+      },
+      "models": {
+        "swe-1-6-slow": { "name": "swe-1-6-slow" }
+      }
+    }
+  }
+}
+```
+
+Configure your ACP client to launch `opencode acp`. A local Windows check used the OpenCode 1.19.6 executable, completed ACP initialization and session creation, and streamed a prompt through the real WindsurfAPI HTTP server with a simulated model upstream. Devin Desktop supports registering external ACP agents. This example uses OpenCode's agent runtime. [OpenCode 1.19.6 provider configuration](https://github.com/anomalyco/opencode/blob/v1.19.6/packages/web/src/content/docs/providers.mdx) · [Devin Desktop ACP registration](https://docs.devin.ai/desktop/acp-custom)
+
 ## 🔧 Operating it
 
 | Goal | Go here |
 |---|---|
-| Tune behaviour without touching code | **[ENV-SWITCHES.md](ENV-SWITCHES.md)** — the 90 switches that exist only in source. Read its header first: it explains how to count them correctly, because a bare `env.` grep sees only 124 of the 183 (2026-10-26) |
+| Tune behaviour without touching code | **[ENV-SWITCHES.md](ENV-SWITCHES.md)** — the 90 switches that exist only in source. Read its header first: it explains how to count them correctly, because a bare `env.` grep sees only 127 of the 185 (2026-11-10) |
 | Update a Docker deployment in one command | **[DOCKER-UPDATE.md](DOCKER-UPDATE.md)** — pull/build → health gate → automatic rollback; data volumes untouched |
 | Measure the detached-cache rollout gates | **[DETACH-ROLLOUT.md](DETACH-ROLLOUT.md)** — gate 2 stress procedure and the two-week gate 1 serve/admit measurement; default stays OFF until both pass |
 | Take `DEVIN_CONNECT` to production | **[DEVIN-CONNECT-CUTOVER.md](DEVIN-CONNECT-CUTOVER.md)** — production runs with this ON while the code default is OFF, so this is not optional reading |
@@ -59,7 +87,7 @@ flowchart TD
 | Localise the dashboard | [dashboard-i18n.md](dashboard-i18n.md) |
 | Verify a release download / understand the OTA trust boundary | [RELEASE-SIGNING.md](RELEASE-SIGNING.md) — cosign keyless signatures (GitHub OIDC, no key material in the repo), the exact `verify-blob` commands, what the signature does and does not prove, and the D9 controls for Docker digest signing and source-OTA attestation |
 | Audit the D9 supply-chain controls | [D9-GATE.md](../evidence/final/D9-GATE.md) (single-Owner trust assessment) with [BannerLock.md](../evidence/final/BannerLock.md), [DockerSign.md](../evidence/final/DockerSign.md) and [SourceAttest.md](../evidence/final/SourceAttest.md) — what is implemented, what stays `[UNVERIFIED]`, and the residual Owner-channel risk |
-| See what changed in a version | [releases/](releases/) — one file per version, v2.0.6 → present (217 release notes, 2026-10-26) |
+| Review changes and select a signed upgrade | [v4.0.2 release notes](releases/RELEASE_NOTES_4.0.2.md) · [Release archive](releases/) |
 
 ## 🔬 Understand the internals
 
@@ -77,7 +105,7 @@ flowchart TD
 
 | # | File | Why |
 |---|---|---|
-| 1 | **[HANDOFF-2026-10-15.md](HANDOFF-2026-10-15.md)** | Current state (its §0 names the live product tag and SHA), the inbound queue (every open PR/issue with a verdict and its evidence), what is frozen or owner-gated, the local-only assets that never reach git, and the gap register. Read §1 first (operational traps), then §3 (what is deliberately not done). OTA follows the latest annotated tag, not later untagged SHAs. |
+| 1 | **[HANDOFF-2026-10-15.md](HANDOFF-2026-10-15.md)** | Current state (its §0 names the live product tag and SHA), the inbound queue (every open PR/issue with a verdict and its evidence), what is frozen or owner-gated, the local-only assets that never reach git, and the gap register. Read §1 for operational traps and §3 for deferred work. Git-source OTA selects the highest reachable numeric stable tag. [Signed upgrade](releases/RELEASE_NOTES_4.0.2.md) |
 | 2 | **[AUDIT-LEDGER.md](AUDIT-LEDGER.md)** | Which subsystems were *actually probed*, the conclusion, and where the guard lives. Start with its "怎么读这份文件" section: the file is appended to per round and is **not** organised by topic, so that section is the only reliable entry point. It states its own round count and line-scale — **this row deliberately states neither**, because both belong to a file that grows every round, and the version of this row that did cite a round count went stale twice. |
 | 3 | **[DEVIN-CONNECT-CUTOVER.md](DEVIN-CONNECT-CUTOVER.md)** | Production cutover runbook. `DEVIN_CONNECT` is what production actually runs (the code default is OFF; the deployment sets it), so this is not optional. Paid wire-calibration procedure in §8. |
 
@@ -143,8 +171,7 @@ status.
   [2026-08-docs](HISTORY-LEDGER-2026-08-docs.md)
 - [HISTORY-LEDGER-PRS.md](HISTORY-LEDGER-PRS.md) — 69 PRs, one by one.
 - [HISTORY-LEDGER-ISSUES.md](HISTORY-LEDGER-ISSUES.md) — 177 issues, one by one.
-- [HISTORY-LEDGER-VIZ.html](HISTORY-LEDGER-VIZ.html) — interactive visualization (numbers stop
-  at v3.9.34 / 2026-09-15).
+- [Project history and evidence](HISTORY-LEDGER-VIZ.html#history) — searchable public records with snapshot coverage and the original v3.9.34 visualization through 2026-09-15.
 
 ## Verification tooling
 
@@ -184,16 +211,26 @@ silently stopped guarding. These are the tools that close that gap:
 
 ## Release history
 
-- [releases/](releases/): one file per version, v2.0.6 → present — 218 release notes as of
-  2026-10-30. Append-only published history; each file is a GitHub Release body.
-- [ACCEPTANCE_3.141.592658.md](releases/ACCEPTANCE_3.141.592658.md) — the current release's
-  acceptance appendix: Gemini `type[]` lowering, signed-thinking replay, gate commands, skip
-  lists and log hashes.
+- [releases/](releases/) contains 223 release notes as of 2026-11-21. Each file supplies
+  the GitHub Release body.
+- [ACCEPTANCE_3.141.592661.md](releases/ACCEPTANCE_3.141.592661.md) — this release's
+  acceptance appendix: the tag-count invariance and history-scan baseline fixes, the gates
+  re-measured on this tree, and the mutation sweep still outstanding.
+  [ACCEPTANCE_3.141.592660.md](releases/ACCEPTANCE_3.141.592660.md) records the 3.141.592660
+  candidate whose public tag's Release failed with zero assets;
+  [ACCEPTANCE_3.141.592659.md](releases/ACCEPTANCE_3.141.592659.md) keeps the frozen
+  per-wave record for the 3.141.592659 draft that was never published — identity-neutralizer
+  bounded rewrite, A4/catalogue over-delete, CTX-01, S03, IMG-01/TRN-01 and the §0.5
+  budget addendum.
 - **[releases/README.md](releases/README.md) is the release runbook** — the ordered
   procedure, the gate, and the house style for writing notes all live there, next to the
   task, rather than being summarised here. Read it before shipping anything: the version
   it replaced would have failed at step 3, because it told you to commit on `master`
   and the pre-commit hook refuses that.
+- **A Release body is a publication-time snapshot.** Post-publication verification is appended
+  to the published Release through the REST API (see the dated 「发布后核实」 section at the end
+  of the v3.141.592661 body), never by rewriting the notes file's own history. The 2026-11-11
+  run that produced it keeps its plan outside this tree (`OPTIMIZATION-PLAN.md`).
 
 ## Generated output
 

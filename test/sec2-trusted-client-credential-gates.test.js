@@ -3,6 +3,8 @@ import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { trustedClientIp } from '../src/net-safety.js';
 import { isLoopbackAddress } from '../src/dashboard/local-windsurf.js';
+import { sanitizeLabelText } from '../src/auth.js';
+import { accountLoginIdentity, loginResultIdentity } from '../src/account/login-identity.js';
 
 const source = readFileSync(new URL('../src/dashboard/api.js', import.meta.url), 'utf8');
 function functionText(name) {
@@ -21,24 +23,29 @@ function boundary(env = {}, localBind = true) {
     trustedClientIp: req => trustedClientIp(req, env),
     getProxyConfig: () => ({ global: null }),
     windsurfLogin: async email => ({ apiKey: 'offline-key', email, name: 'fixture' }),
-    addAccountByKey: () => ({ id: 'offline-account', email: 'a@example.test', status: 'active' }),
+    addAccountByKeyWithDisposition: () => ({
+      account: { id: 'offline-account', email: 'a@example.test', status: 'active' },
+      poolDisposition: 'added',
+    }),
     setAccountTokens() {}, setAccountProxy() {}, scheduleAccountWarmup() {},
     setAccountCredentialEmail() {},
+    setAccountIdentityEmail() {},
+    accountLoginIdentity, loginResultIdentity,
     maskApiKey: () => '[masked]',
+    // The production function sanitizes upstream-supplied names through the
+    // real boundary — feed the same helper, not a local reimplementation.
+    sanitizeLabelText,
     log: { info() {}, warn() {} },
     credentials: {
       isCredStoreEnabled: () => true,
       storeCredential: (...args) => { calls.push(args); return true; },
     },
   };
-  const names = Object.keys(deps).filter(name => name !== 'credentials');
+  const names = Object.keys(deps);
   // The credential-store tail lives in finalizeWindsurfLogin (shared by the
   // password and email-code logins), so the harness must compile it too.
-  let text = ['dashboardClientIp', 'maskEmail', 'credStoreGateOpen', 'finalizeWindsurfLogin', 'processWindsurfLogin']
+  const text = ['dashboardClientIp', 'maskEmail', 'credStoreGateOpen', 'captureBoundWindsurfLogin', 'finalizeWindsurfLogin', 'processWindsurfLogin']
     .map(functionText).join('\n');
-  const dynamicImport = "await import('../devin-connect-credentials.js')";
-  assert.equal(text.split(dynamicImport).length - 1, 1);
-  text = text.replace(dynamicImport, 'deps.credentials');
   const login = new Function('deps', `const { ${names.join(', ')} } = deps;\n${text}\nreturn processWindsurfLogin;`)(deps);
   return { calls, login, deps };
 }

@@ -1,4 +1,23 @@
 {
+  "browserLogin": {
+    "start": "用 Devin 登录 WindsurfAPI",
+    "hint": "授权本机 WindsurfAPI 接入你选择的 Devin 账号。回调回到本机实例。",
+    "open": "前往 Devin 授权",
+    "complete": "确认添加账号",
+    "starting": "正在准备授权…",
+    "pending": "请前往 Devin 完成授权，然后回到这里。",
+    "ready": "回调已到达 WindsurfAPI。确认后添加账号。",
+    "exchanging": "正在完成登录…",
+    "added": "账号已添加。",
+    "busy": "已有登录事务进行中，请等它结束再重试。",
+    "expired": "本次授权已过期，请重新开始。",
+    "cancelled": "登录已取消。",
+    "unavailable": "当前网页登录不可用。",
+    "client_binding_unverified": "服务商返回了绑定客户端的授权，网关无法确认该授权属于本应用。",
+    "unauthorized_client": "服务商拒绝了本客户端。",
+    "access_denied": "服务商未批准本次授权。",
+    "failed": "登录未能完成。"
+  },
   "_meta": {
     "name": "简体中文",
     "code": "zh-CN"
@@ -214,7 +233,7 @@
     "readClipboard": "读取剪贴板",
     "uploadJson": "上传 JSON",
     "clearFile": "清除文件",
-    "batchImport": "批量导入并登录",
+    "batchImport": "处理此批次",
     "paste": "粘贴",
     "add": "添加",
     "close": "关闭",
@@ -375,10 +394,10 @@
     },
     "oauthLogin": {
       "title": "Google / GitHub 登录",
-      "desc": "在 Windsurf 官方页面完成登录，回到这里粘贴 Token。"
+      "desc": "Windsurf 旧版网页登录和手动凭证输入。"
     },
     "emailLogin": {
-      "title": "邮箱登录",
+      "title": "Windsurf 邮箱登录",
       "desc": "有密码的账号用密码登录；没有密码的账号改用邮箱验证码。"
     },
     "loginProxy": {
@@ -396,12 +415,14 @@
     },
     "smartImport": {
       "title": "智能导入",
-      "desc": "把 Token、登录链接或邮箱密码粘进来，会自动识别并批量导入。",
+      "desc": "粘贴 Token 或登录链接。邮箱密码请使用批量导入。",
       "placeholder": "devin-session-token$...  或  show-auth-token 链接  或  email----password  每行一个,可混合",
       "button": "智能导入",
       "empty": "先粘贴一些 token 或账号",
       "importing": "导入中…",
-      "result": "已添加 {{added}} · 跳过 {{skipped}} · 失败 {{failed}}",
+      "result": "已添加 {{added}} · 已在账号池 {{existing}} · 跳过 {{skipped}} · 失败 {{failed}}",
+      "recognized": "识别到 {{count}} 项",
+      "unrecognized": "无法识别的输入 · {{lines}}",
       "done": "成功导入 {{added}} 个账号"
     },
     "accountList": {
@@ -559,7 +580,7 @@
     },
     "poolHealth": {
       "title": "账号池健康",
-      "desc": "按最坏优先汇总各账号健康信号"
+      "desc": "最近一小时的错误和限流信号"
     },
     "connectMetrics": {
       "title": "连接自愈",
@@ -585,23 +606,105 @@
     },
     "statsLog": {
       "title": "请求日志",
-      "desc": "逐请求明细：时间、模型、账号、状态、延迟、Token 与费用。每次上游尝试一行，费用单位为 Devin credits。",
+      "desc": "入口拒绝单独显示，尝试汇总统计上游尝试。",
+      "attemptAndHttp": "结果 / HTTP",
+      "attemptSucceeded": "成功",
+      "attemptFailed": "失败",
+      "attemptUnknown": "未记录",
+      "requestId": "请求 ID",
+      "findRequest": "查找",
+      "timeAndRequest": "时间 / 请求 ID",
+      "modelAndDispatch": "请求模型 / 派发",
+      "copyRequestId": "复制请求 ID",
+      "requestIdCopied": "请求 ID 已复制",
+      "requestIdSelected": "已选中请求 ID，请用快捷键复制",
+      "dispatchUnknown": "派发情况未知",
+      "moreDispatches": "另记录 {{count}} 次派发",
+      "dispatchUsage": {
+        "unknown": "未知",
+        "notReported": "未见上报",
+        "unknownAccount": "账号未知",
+        "onRootRow": "逐次派发明细见同 ID 最新一行",
+        "tokenCounts": "上游实报 token · 输入 {{input}} · 输出 {{output}}",
+        "tokenTotal": "合计 {{count}}",
+        "charge": "上游实报费用 · credits {{credits}} · ACU {{acu}}"
+      },
+      "failureReason": "失败原因",
+      "failureUnknown": "失败原因未知",
+      "requestNotFound": "保留记录中未找到该请求",
+      "usageMissing": "未上报",
+      "reportedTotal": "合计：{{total}}",
+      "estimatedCredits": "估算费用 (credits)",
       "empty": "当前筛选无请求",
       "unavailable": "请求日志不可用",
       "retention": "保留最近 {{stored}} / {{capacity}} 条",
-      "summary": "{{count}} 条请求 · 输入 {{in}} · 输出 {{out}} · 费用 {{credit}}",
+      "summary": "{{count}} 次尝试 · 计账用量（可能含估算）：输入 {{in}}，输出 {{out}} · 估算 {{credit}} credits。请求行显示可用用量记录，可能不完整；旧记录保留历史数值。",
       "tokenTitle": "新增输入 {{fresh}} · 缓存读取 {{read}} · 缓存写入 {{write}}",
       "filters": {
         "model": "模型",
         "account": "账号",
-        "status": "状态",
+        "status": "HTTP 状态",
         "all": "全部",
         "reset": "清除筛选"
+      },
+      "admissionRejected": "准入拒绝",
+      "summaryAdmission": "{{count}} 次入口拒绝",
+      "noActiveAccounts": "活跃账号为 0，Connect 备用入口未启用或未配置",
+      "dispatchNone": "0 次派发 · 账号准入拒绝",
+      "currentBoot": "当前进程",
+      "previousBoot": "历史进程",
+      "unknownBoot": "进程未知",
+      "clientDisconnected": "客户端断开",
+      "responses": {
+        "inputToolResults": "本次请求携带 {{count}} 条工具结果",
+        "outputToolCalls": "本次响应输出 {{count}} 个工具调用",
+        "outputText": "本次响应含正文",
+        "terminalUnknown": "响应终态未知",
+        "toolOutput": "输出工具调用",
+        "completed": "响应已结束",
+        "incomplete": "响应未完成"
+      },
+      "lifecycle": {
+        "details": "查看传输和回执",
+        "client": "下游客户端",
+        "gateway": "网关中止",
+        "transport": "Connect 传输",
+        "terminal": "上游终态",
+        "usage": "上游用量",
+        "billing": "上游计费字段",
+        "disconnected": "已断开",
+        "writeEnded": "网关已结束写出",
+        "abortEmitted": "已发本地信号",
+        "abortNotEmitted": "未发本地信号",
+        "abortObserved": "观察到本地中止",
+        "abortNotObserved": "未见中止事件",
+        "endFrame": "收到结束帧",
+        "finishMarker": "见结束标记，未见结束帧",
+        "terminalMissing": "未见结束帧",
+        "fieldsReported": "已上报",
+        "fieldsNotObserved": "未见上报",
+        "unknown": "未知",
+        "scope": "Connect 字段仅覆盖最后一次尝试在本地关闭前的观察。服务商是否停止计算与最终账单需另行确认。"
+      },
+      "timing": {
+        "title": "网关时间线",
+        "details": "查看请求时间线",
+        "attempt": "网关时间线 · Connect 第 {{count}} 次尝试",
+        "received": "网关接单",
+        "sent": "Connect 请求写出",
+        "content": "首段上游正文",
+        "tool": "首段原生工具数据",
+        "terminal": "上游结束帧",
+        "disconnected": "下游断开",
+        "finished": "网关处理结束",
+        "unknown": "未知",
+        "afterSend": "写出后 {{time}}",
+        "scope": "加号后的耗时从网关接单开始。Connect 字段对应最后一次观察到的尝试。请求写出由本机传输层记录，服务商排队时间未知。"
       }
     },
     "statsAgg": {
       "title": "聚合统计",
-      "desc": "与请求日志同一筛选窗口；表内合计与日志共用同一分母，不做估算。",
+      "desc": "汇总同一筛选窗口内的尝试与计账用量（可能含估算）。",
       "byModel": "按模型",
       "byAccount": "按账号",
       "byDay": "按天",
@@ -632,7 +735,7 @@
   },
   "help": {
     "token": "推荐用 Token 方式添加账号 点 {{link}} 登录后复制 Token 粘贴到下面就行 所有登录方式（邮箱/Google/GitHub）都能用",
-    "tokenGuide": "推荐用 Token 方式添加账号 点 ",
+    "tokenGuide": "请粘贴已签发给此网关集成的凭证。",
     "tokenGuideEnd": " 登录后复制 Token 粘贴到下面就行 所有登录方式（邮箱/Google/GitHub）都能用"
   },
   "skin": {
@@ -813,8 +916,8 @@
   },
   "card": {
     "activeAccounts": {
-      "title": "活跃账号",
-      "subtitle": "{{total}} 个总账号 · {{error}} 异常"
+      "title": "启用中的账号",
+      "subtitle": "{{total}} 个账号 · {{error}} 个标为异常"
     },
     "poolBalance": {
       "title": "账号池余额",
@@ -836,7 +939,8 @@
     },
     "responseCache": {
       "title": "响应缓存",
-      "subtitle": "{{hits}} 命中 / {{misses}} 未命中 · {{size}}/{{max}} 条"
+      "noSamples": "暂无样本",
+      "subtitle": "{{hits}} 次命中 / {{total}} 次查询 · {{size}}/{{max}} 条"
     },
     "tokens": {
       "title": "Token 用量分布",
@@ -852,11 +956,11 @@
       "cacheEfficiency": "缓存命中率"
     },
     "credits": {
-      "title": "Credits 花销",
+      "title": "Credits 估算",
       "unit": "credits",
-      "byModel": "按模型花销",
-      "subtitle": "今日消耗 {{today}} credits",
-      "empty": "暂无消耗数据"
+      "byModel": "按模型估算",
+      "subtitle": "今日估算 {{today}} credits（UTC）",
+      "empty": "暂无按模型汇总的估算"
     },
     "banStats": {
       "title": "健康概览"
@@ -1012,7 +1116,7 @@
       "devinCliMode": "Devin CLI 传输模式。print：一次性模式，发送提示词并读取打印的回复，不支持工具调用或流式。acp（Agent Client Protocol）：持久双向会话，支持原生工具调用、图片/视觉输入与流式输出。需要工具或多模态的模型用 acp；纯聊天用 print 更轻量。",
       "devinConnect": "直连云端 HTTP 后端。开启后请求直接走 Devin 云端 API（HTTP），不再驱动本地 Devin CLI 进程。属部署级开关——关闭时原生 CLI 工具不可用。",
       "devinOnly": "所有请求仅走 Devin CLI 后端，禁用其它上游提供方。适合只想用单一、可预期后端的场景。",
-      "allowClientTools": "允许客户端工具调用与图片/视觉输入抵达模型（DEVIN_CLI_ALLOW_CLIENT_TOOLS）。原生工具与图片理解必须开启；纯文本聊天可关闭。",
+      "allowClientTools": "接受声明了客户端工具的 Devin CLI 请求（DEVIN_CLI_ALLOW_CLIENT_TOOLS）。CLI 接收对话提示并使用自己的工具。",
       "loginHostFallback": "主登录 host 失败时，回退到 Devin 直连登录端点。在网络不稳定时提升登录成功率。",
       "autoRelogin": "会话在请求中途失效时自动重新登录，而不是直接让请求失败。",
       "remoteCredStore": "服务端是否可存储账号密码以支持远程自愈登录。属于安全边界——此处只读。",
@@ -1127,8 +1231,8 @@
     "github": "GitHub 登录",
     "copyAuthToken": "复制 Auth Token",
     "pasteToken": "去账号管理粘贴 Token",
-    "inlineTokenTitle": "或者直接粘贴 Auth Token（推荐 OAuth-only 账号用这个）",
-    "inlineTokenDesc": "点左边按钮在新 tab 打开 windsurf.com → 用 Google/GitHub 登录 → 页面会显示 Auth Token → 复制粘到右边输入框 → 点添加",
+    "inlineTokenTitle": "粘贴已有凭证",
+    "inlineTokenDesc": "请使用已签发给此网关集成的凭证。",
     "openWindsurfToken": "打开 windsurf.com 拿 Token",
     "tokenPlaceholder": "粘贴 Auth Token...",
     "urlOrTokenPlaceholder": "粘贴回调 URL 或 Auth Token...",
@@ -1164,8 +1268,10 @@
       "open": "打开登录页",
       "copy": "复制登录 URL",
       "copied": "登录 URL 已复制",
-      "dontAsk": "下次不要问我（可在设置里改回）"
-    }
+      "dontAsk": "下次不要问我（可在设置里改回）",
+      "copyUnavailable": "浏览器无法自动复制链接，请点「打开登录页」。"
+    },
+    "legacyRedirectHelp": "旧回调入口已停用。请使用邮箱登录或已签发给此网关集成的凭证。"
   },
   "update": {
     "checking": "正在检查更新...",
@@ -1259,9 +1365,14 @@
     },
     "login": {
       "methodsLabel": "选择添加账号的方式",
-      "pasteToken": "粘贴 Token",
+      "pasteToken": "粘贴凭证",
       "back": "换一种方式",
-      "advanced": "高级选项（代理 / 登录历史 / 存储密码）"
+      "advanced": "高级选项（代理 / 登录历史 / 存储密码）",
+      "devinTitle": "打开 Devin 官网",
+      "devinHint": "官网登录用于 Devin。自动接入此网关需服务商授权，请使用邮箱登录或已签发给此集成的凭证。",
+      "legacyWindsurf": "Windsurf 旧版登录",
+      "focusPaste": "定位到粘贴框",
+      "manualPasteHint": "按 Ctrl+V 或使用浏览器的粘贴菜单，再提交。"
     },
     "toolbar": {
       "fleet": "账号池操作",
@@ -1282,7 +1393,7 @@
       "clear": "清除筛选"
     },
     "status": {
-      "active": "正常",
+      "active": "已启用",
       "disabled": "已停用",
       "banned": "已封禁",
       "reauth": "需要重新授权",
@@ -1294,10 +1405,12 @@
       "watch": "有错误",
       "resumesIn": "重置于 {{time}}",
       "errorCount": "错误数",
-      "blockedCount": "已屏蔽模型"
+      "blockedCount": "已屏蔽模型",
+      "routeUnknown": "模型可用性待确认",
+      "routeTip": "实际能否处理请求取决于所选模型、线路、配额和当前容量。"
     },
     "statusTip": {
-      "active": "能接请求：未停用、未限流、配额未耗尽。",
+      "active": "账号已启用，当前本地状态没有告警。",
       "disabled": "你手动停用的账号。启用后即可重新接请求。",
       "banned": "Windsurf 封禁了这个账号；只能删除或换号。",
       "reauth": "登录凭证已失效；重新登录会替换同一行的凭证。",
@@ -1306,24 +1419,24 @@
       "rate_limited": "被服务限流；限流窗口结束后自动恢复。",
       "capacity": "当前模型容量不足；换模型或稍后重试。",
       "near_limit": "每分钟请求用量已接近上限；降速或等待窗口滚动。",
-      "watch": "有历史错误计数，但仍可接请求。"
+      "watch": "账号有近期错误。具体可用性取决于模型和线路。"
     },
     "kpi": {
       "total": "账号总数",
-      "active": "正常",
+      "active": "无状态告警",
       "disabled": "已停用",
       "attention": "需处理",
       "attentionSub": "封禁 {{banned}} · 重登 {{reauth}} · 限流 {{limited}} · 配额耗尽 {{cooled}}",
       "balance": "池余额",
       "balanceSub": "{{count}} 个账号",
       "balanceSubShared": "{{count}} 个账号 · {{shared}} 个共享余额已去重",
-      "totalTip": "账号池里的全部账号，等于“正常 + 已停用 + 需处理”。",
-      "activeTip": "现在能接请求的账号。限流、配额耗尽、接近上限的账号不算正常。",
+      "totalTip": "账号池的全部账号，包含无状态告警、已停用和需处理的账号。",
+      "activeTip": "已启用且本地状态无告警的账号。请求是否可用需看具体模型和线路。",
       "disabledTip": "你手动停用的账号。封禁、需重新授权、异常不在这一格，它们在“需处理”里。",
       "attentionTip": "需要你处理的账号：封禁、需重新授权、异常、配额耗尽、限流、模型繁忙、接近上限、有错误。和“需处理”筛选是同一个数。",
       "balanceTip": "所有账号的按量计费余额之和。同一个团队共享的余额只计一次；识别不到团队的账号按各自余额相加。"
     },
-    "subtitle": "共 {{total}} · 正常 {{active}} · 需处理 {{attention}} · 余额 {{balance}}",
+    "subtitle": "共 {{total}} · 无状态告警 {{active}} · 需处理 {{attention}} · 余额 {{balance}}",
     "method": {
       "api_key": "API Key",
       "token": "登录凭证",
@@ -1332,11 +1445,17 @@
       "unknown": "其他方式"
     },
     "skip": {
-      "ls_not_idle_resident": "语言服务没在运行，先启动它再检查",
-      "account_busy": "账号正在处理请求，稍后再试",
+      "ls_not_idle_resident": "语言服务繁忙或未就绪。空闲后重试。",
+      "account_busy": "账号正在使用中，空闲后重试。",
       "memory_guard": "内存不足，这次跳过",
       "probe_skipped": "这次没有执行检查",
-      "other": "已跳过（原因见提示）"
+      "other": "已跳过（原因见提示）",
+      "can_start": "该检查需要已运行的语言服务，此账号的语言服务尚未启动。",
+      "start_pending": "语言服务正在启动，请等它就绪后重试。",
+      "ls_stopping": "语言服务正在停止，请在就绪后重试。",
+      "ls_memory_guard": "当前内存限制下无法运行该账号的语言服务。",
+      "ls_pool_exhausted": "该账号暂无可用的语言服务实例。",
+      "already_running": "语言服务正忙，请等它空闲后重试。"
     },
     "selectAllPage": "选择本页",
     "selectRow": "选择账号",
@@ -1353,7 +1472,9 @@
       "neverChecked": "尚未检查",
       "skipCheck": "未检查：{{reason}}",
       "retryCheck": "重试",
-      "rename": "编辑名称"
+      "rename": "编辑名称",
+      "checking": "正在检查…",
+      "checkFailed": "本次检查失败"
     },
     "rename": {
       "prompt": "输入新的显示名称",
@@ -1371,7 +1492,18 @@
       "probeAlive": "登录凭证仍然有效 — 账号已回到轮换",
       "probeDead": "服务端仍然拒绝这份凭证 — 请重新登录换一份新的",
       "probeCooldown": "刚刚检查过 — 请一分钟后再试",
-      "success": "账号已重新授权"
+      "success": "账号已重新授权",
+      "connectTitle": "替换 {{email}} 的凭据",
+      "connectGuide": "Devin Connect 恢复",
+      "connectPortal": "可在官网确认账号能登录。网关恢复需要另外提供凭据。",
+      "connectCredential": "向网关管理员取得此连接支持的替换凭据，粘贴到下方并替换原账号。",
+      "connectVerify": "保存后，用常用客户端发一条短模型请求，确认这份凭据真的能出结果。",
+      "connectDependency": "如果你只有 Devin 门户登录或 Devin API 密钥，需先由管理员提供受支持的连接凭据。自动接入需要 Devin 支持的授权和已登记的回调。",
+      "replaceCredential": "替换凭据",
+      "sessionCredential": "替换会话凭据",
+      "replaceHint": "粘贴替换凭据后，点击「替换凭据」。",
+      "savingCredential": "正在保存凭据…",
+      "credentialSaved": "替换凭据已保存，模型访问待验证。"
     },
     "batch": {
       "selectPage": "选择本页 {{count}} 项",
@@ -1398,12 +1530,12 @@
     },
     "fleet": {
       "cancel": "取消",
-      "busy": "已有一次批量操作在运行，等它结束再开始",
+      "busy": "已有账号操作在进行，请等本次结果。",
       "starting": "正在准备{{action}}…",
       "running": "{{action}} {{done}}/{{total}}",
       "current": "当前：{{email}}",
       "cancelled": "已取消（完成 {{done}}/{{total}}）",
-      "connectionLost": "连接中断，已完成的 {{done}} 项保留",
+      "connectionLost": "进度连接中断，已保留 {{done}} 项结果。可以重新读取进度。",
       "summary": "{{action}} · {{state}}：成功 {{ok}} · 失败 {{fail}} · 跳过 {{skipped}}",
       "stateRunning": "进行中",
       "stateDone": "已完成",
@@ -1416,7 +1548,11 @@
       "resultOk": "成功",
       "resultFail": "失败",
       "resultSkipped": "跳过",
-      "resultExcluded": "未参与"
+      "resultExcluded": "未参与",
+      "reconnect": "重新读取进度",
+      "noTargets": "本次没有符合操作条件的账号。",
+      "stateDisconnected": "进度暂不可读",
+      "stateFailed": "失败"
     },
     "empty": {
       "poolTitle": "还没有账号",
@@ -1426,7 +1562,15 @@
     },
     "loading": "正在加载账号…",
     "loadFailed": "账号列表加载失败：{{detail}}。下方表格是上一次成功加载的结果。",
-    "retry": "重试"
+    "retry": "重试",
+    "connectCatalog": {
+      "observed": "Connect 目录 {{count}} 项",
+      "stale": "Connect 目录已过期",
+      "unknown": "Connect 目录待确认",
+      "help": "这是此账号当前凭据的目录观察。具体模型能否调用、余额和配额需分别核对。",
+      "localPolicy": "本地规则",
+      "localPolicyTip": "本地层级规则允许 {{count}} / {{total}} 项。点击编辑此账号的模型规则。"
+    }
   },
   "account": {
     "tierManualBadge": "手动",
@@ -1663,6 +1807,23 @@
     }
   },
   "batch": {
+    "autoAdd": "将账号加入账号池",
+    "autoAddHint": "取消勾选仅预览所有输入，不登录、不保存账号。",
+    "preview": "预览格式",
+    "previewOnly": "仅检查格式。未尝试登录，未改动账号。",
+    "line": "第 {{line}} 行",
+    "item": "第 {{line}} 项",
+    "input": "输入",
+    "kind": {
+      "email_password": "邮箱和密码",
+      "token": "Token",
+      "api_key": "API Key"
+    },
+    "outcome": {
+      "added": "已加入账号池",
+      "existing": "已在账号池",
+      "login_only": "登录成功，未加入账号池"
+    },
     "pasteFirst": "请先粘贴批量账号",
     "importing": "导入中...",
     "importingDesc": "{{count}} 行，请稍候",
@@ -1687,6 +1848,10 @@
     "applyingSkin": "正在应用皮肤…",
     "copied": "已复制",
     "saved": "已保存",
+    "credentialsAppliedDurabilityWarning": "新凭据已生效，但尚未确认已安全写入磁盘。请保留新值并检查服务器存储。",
+    "credentialsAppliedProtectionWarning": "新凭据已生效，但未能确认文件访问保护。请检查服务器配置文件的权限。",
+    "credentialsAppliedBothWarnings": "新凭据已生效，磁盘保存与文件访问保护待确认。请保留新值，并检查服务器存储和配置文件权限。",
+    "credentialsAppliedWarning": "新凭据已生效，但服务器报告了保存警告。请在重启前检查服务器状态。",
     "settingSaved": "设置已保存",
     "turnstileFailed": "人机验证失败",
     "turnstileRequired": "请先完成人机验证",
@@ -1707,6 +1872,7 @@
     "toggleFailed": "切换失败：{{error}}",
     "modeUpdated": "模式已更新",
     "defaultModelUpdated": "默认模型已更新",
+    "modelAccessAppliedDurabilityWarning": "策略已更新并生效，但尚未确认已安全写入磁盘。请检查服务器存储。",
     "noTierModels": "该账号层级无可用模型",
     "loginSuccess": "{{label}} 登录成功",
     "loginFailed": "{{label}} 登录失败：{{error}}",
@@ -1886,6 +2052,7 @@
     "ERR_NO_VALID_LINES": "没有有效行",
     "ERR_FORMAT_INVALID": "格式错误 需要 [proxy] email password",
     "ERR_UNSUPPORTED_IMPORT_ITEM": "该项无法识别为邮箱密码、Token 或 API Key",
+    "ERR_AUTO_ADD_DISABLED": "未启用加入账号池，已跳过此项。",
     "ERR_JSON_INVALID": "JSON 格式无效",
     "ERR_JSON_FILE_REQUIRED": "请选择 .json 文件",
     "ERR_IDTOKEN_REQUIRED": "缺少 idToken",
@@ -1898,10 +2065,10 @@
     "ERR_TLS_TUNNEL_ERROR": "TLS 隧道建立但返回内容异常",
     "ERR_TLS_FAILED": "TLS 失败",
     "ERR_LOGIN_FAILED": "登录失败",
-    "ERR_EMAIL_NOT_FOUND": "该邮箱未注册邮箱密码登录方式。若通过 Google/GitHub OAuth 注册，请使用 OAuth 按钮或访问 windsurf.com/show-auth-token 复制 Auth Token",
+    "ERR_EMAIL_NOT_FOUND": "这个地址未找到密码账号，请核对地址或使用已签发给此集成的凭证。",
     "ERR_INVALID_PASSWORD": "密码错误",
     "ERR_INVALID_CREDENTIALS": "邮箱或密码错误",
-    "ERR_NO_PASSWORD_SET": "该账号未设置密码登录方式。使用 Google/GitHub OAuth 或访问 windsurf.com/show-auth-token 复制 Auth Token",
+    "ERR_NO_PASSWORD_SET": "该账号没有密码。请使用可用的邮箱验证，或使用已签发给此集成的凭证。",
     "ERR_USER_DISABLED": "账号已被停用",
     "ERR_TOO_MANY_ATTEMPTS": "尝试太多次 请稍后再试",
     "ERR_INVALID_EMAIL": "邮箱格式错误",
@@ -1909,9 +2076,9 @@
     "ERR_HTTP_REFERRER_BLOCKED": "上游拒绝请求：该 Firebase API Key 限制请求来源，服务器的 referrer 不在白名单内。请检查登录代理 / 出口 IP，或在 Firebase 控制台放行。",
     "ERR_AUTH1_TOKEN_MISSING": "Auth1 回应缺少 token",
     "ERR_AUTH1_NOT_A_POOL_KEY": "这是登录过程中的中间凭证，不能直接当账号密钥。请先完成登录，或改贴登录成功后页面上的 Token。",
-    "ERR_REAUTH_TOKEN_UNCHANGED": "该账号的 token 已被上游注销。请重新登录换取新 token；若确认无误，可强制重新启用。",
+    "ERR_REAUTH_TOKEN_UNCHANGED": "当前凭据已失效，请替换为这条连接的新凭据。",
     "ERR_REAUTH_NOT_APPLICABLE": "该操作不适用于已停用或已封禁的账号。",
-    "ERR_REAUTH_TOKEN_INVALID": "这不是会话 token。请贴 devin-session-token / show-auth-token 的值，或改用邮箱验证码登录。",
+    "ERR_REAUTH_TOKEN_INVALID": "请粘贴网关管理员为此连接提供的替换会话凭据。",
     "ERR_NO_TOKEN_IN_INPUT": "这段粘贴里没有 token。请贴 session、API Key，或带 token= 的 show-auth-token 链接。",
     "ERR_IMPORT_TEXT_EMPTY": "粘贴内容为空。",
     "ERR_POSTAUTH_FAILED": "Windsurf 已接受登录，但换取会话失败。请用同一个验证码重试——2 分钟内仍然有效。",
@@ -1919,8 +2086,9 @@
     "ERR_FIREBASE_TOKEN_MISSING": "Firebase 回应缺少 idToken",
     "ERR_LOCAL_IMPORT_LOOPBACK_ONLY": "本地导入仅限 127.0.0.1 访问 — 请在部署服务器本机的浏览器里打开 dashboard，不要用公网域名",
     "ERR_LOCAL_IMPORT_FAILED": "扫描本地 Windsurf 凭证失败",
-    "ERR_INTERMEDIATE_CALLBACK": "这是中间回调页，它的登录 code 无法在这里兑换。请等浏览器跳转到 show-auth-token 页面后，粘贴那上面显示的 token。",
-    "ERR_OAUTH_UPSTREAM": "登录提供方返回了错误，请重新登录。",
+    "ERR_BROWSER_ENROLLMENT_UNAVAILABLE": "网关暂无法通过网页登录自动接入。请使用邮箱登录或已签发给此集成的凭证。",
+    "ERR_INTERMEDIATE_CALLBACK": "授权回调不能在这里导入。请粘贴已签发给此网关集成的凭证。",
+    "ERR_OAUTH_UPSTREAM": "服务商拒绝了这次登录。请使用可用的登录方式或已签发给此集成的凭证。",
     "rollbackFailed": "回滚失败",
     "ERR_NO_PASSWORD_OAUTH_ACCOUNT": "该账号没有密码（仅支持 OAuth 或邮箱验证码）。请使用邮箱验证码、Google/GitHub，或粘贴 Auth Token。",
     "ERR_EMAIL_LOCKED": "该邮箱因连续登录失败被临时锁定。请等待解锁，或在设置中调整阈值。",
@@ -1936,7 +2104,13 @@
     "ERR_EMAIL_FLOW_USED": "该验证码已被使用，请重新发送。",
     "ERR_EMAIL_FLOW_IN_USE": "该验证码正在校验中。",
     "ERR_EMAIL_FLOW_CODE_REQUIRED": "缺少验证流程或验证码",
-    "ERR_LOGIN_PROBE_FAILED": "无法检测登录方式，请重试。"
+    "ERR_LOGIN_PROBE_FAILED": "无法检测登录方式，请重试。",
+    "ERR_ACCOUNT_CHECK_STATUS_UNAVAILABLE": "此次无法取得上游账号状态。等语言服务就绪后重试。",
+    "ERR_FLEET_JOB_NOT_FOUND": "无法读取这次检查记录。需要时重新检查。",
+    "ERR_REAUTH_DEVIN_PORTAL_URL": "这是 Devin 门户地址。可在门户登录，再向网关管理员取得兼容的替换凭据。",
+    "ERR_REAUTH_DEVIN_API_CREDENTIAL": "Devin API 密钥用于 Devin API。恢复此网关需要受支持的 Connect 会话凭据。",
+    "ERR_REAUTH_REDIRECT_REJECTED": "上游拒绝了旧回调（Invalid redirect URI）。自动恢复需要登记回调。已有兼容替换凭据可在这里粘贴。",
+    "ERR_REAUTH_CALLBACK_FAILED": "上游没有完成回调。请向网关管理员取得兼容的替换凭据。"
   },
   "footer": {
     "version": "版本",
@@ -1957,7 +2131,7 @@
     "apiKeyGenerated": "API Key 已生成{{autoAdd}}",
     "fail": "✗ 登录失败",
     "batchComplete": "批量导入完成",
-    "batchDesc": "共 {{total}} 个账号，成功 {{success}} 个，失败 {{fail}} 个{{autoAdd}}",
+    "batchDesc": "共 {{total}} 项 · 成功 {{success}} · 跳过 {{skipped}} · 失败 {{fail}}",
     "tryOther": "换个方式试试",
     "oauthHint": "若你用 Google/GitHub 注册的 Windsurf 账号 此处密码登录不适用 请用页面顶部的 Google / GitHub 登录按钮 或访问 {{link}} 复制 Auth Token 后在「账号管理」页手动添加",
     "fields": {
@@ -1969,7 +2143,7 @@
       "accountId": "账号 ID"
     },
     "successTitle": "登录成功",
-    "addedToPool": "并加入账号池"
+    "addedToPool": "，并加入账号池"
   },
   "timeRange": {
     "minutesAgo": "{{count}}分钟前",
@@ -2000,15 +2174,15 @@
     "errorTitle": "概览暂不可用",
     "staleSince": "显示 {{time}} 的最后成功数据。刷新失败：{{error}}",
     "poolHealth": {
-      "healthy": "健康",
+      "healthy": "无本地告警",
       "throttled": "限流中",
       "error": "错误",
       "dead": "失效 token",
       "quotaPressure": "配额压力",
       "highRpm": "高 RPM",
-      "verdictAllHealthy": "所有账号健康",
+      "verdictAllHealthy": "账号池无本地告警",
       "verdictDegraded": "{{count}} 个账号需关注",
-      "verdictCritical": "号池降级 — {{count}} 个不可用",
+      "verdictCritical": "{{count}} 个账号有近期异常",
       "empty": "暂无号池遥测",
       "emptyHint": "添加账号并发起请求后，各账号健康信号会显示在这里。",
       "unavailable": "号池遥测暂不可用",
@@ -2121,7 +2295,7 @@
       "devinConnect": "DEVIN_CONNECT（云端直连 HTTP 后端）",
       "devinOnly": "DEVIN_ONLY（仅用 Devin CLI 后端）",
       "devinCliMode": "Devin CLI 模式（acp / print）",
-      "allowClientTools": "客户端工具 / 视觉（DEVIN_CLI_ALLOW_CLIENT_TOOLS）",
+      "allowClientTools": "客户端工具声明（DEVIN_CLI_ALLOW_CLIENT_TOOLS）",
       "loginHostFallback": "Devin 直登兜底（LOGIN_HOST_FALLBACK）",
       "autoRelogin": "会话失效自动重登（AUTO_RELOGIN）",
       "remoteCredStore": "允许公网存储密码（ALLOW_REMOTE_CRED_STORE）",
@@ -2167,8 +2341,8 @@
     "methodEmailCode": "该账号没有密码。请发送验证码并在下方输入。",
     "methodOAuth": "该账号没有密码，也不支持邮箱验证码。请使用 Google/GitHub 或粘贴 Token。",
     "methodUnknown": "无法确定登录方式，已保留密码登录表单。",
-    "oauthOnlyHint": "该账号没有密码，也不支持邮箱验证码。请用上面的 Google / GitHub 按钮登录，或粘贴 show-auth-token 页面的 Token。",
-    "useToken": "改用 Token 登录",
+    "oauthOnlyHint": "该账号需要通过 Devin 登录。添加到网关时请使用已签发给此集成的凭证。",
+    "useToken": "粘贴已有凭证",
     "sendingCode": "正在发送验证码…",
     "codeSent": "验证码已发送，请查收邮箱（10 分钟内有效）。",
     "resendIn": "验证码已发送，{{seconds}} 秒后可重新发送。",
@@ -2181,7 +2355,9 @@
     "probeFailedHint": "无法检测该账号的登录方式。若该账号没有密码（Google/GitHub 或验证码注册），请在下方获取验证码。",
     "tryDevinHost": "没收到邮件？改用 app.devin.ai 发送",
     "useCode": "改用邮箱验证码",
-    "methodNotFound": "该邮箱没有对应的 Windsurf 账号，请检查地址。"
+    "methodNotFound": "该邮箱没有对应的 Windsurf 账号，请检查地址。",
+    "resendWait": "请稍后再发送验证码，剩余时间见发送按钮。",
+    "resendReady": "现在可以重新请求验证码。"
   },
   "devin": {
     "unknown": "未知",
@@ -2190,7 +2366,7 @@
       "devinConnect": "Devin Connect 传输",
       "devinOnly": "仅 Devin",
       "devinCliMode": "Devin CLI 模式",
-      "allowClientTools": "允许客户端工具",
+      "allowClientTools": "接受客户端工具声明",
       "loginHostFallback": "登录主机回退",
       "autoRelogin": "自动重新登录"
     },
@@ -2245,6 +2421,7 @@
       "off": "关"
     },
     "runtime": {
+      "details": "进程、准入与续传明细",
       "running": "运行中",
       "stopped": "未运行",
       "langServer": "语言服务器",
@@ -2276,6 +2453,8 @@
       "note": "计数为进程生命周期，重启归零。凭证存储开关只由环境变量控制，此处只读。"
     },
     "sessions": {
+      "retentionHint": "当前进程 · 每账号最多保留 {{limit}} 条",
+      "pageError": "该页加载失败，仍显示上一份结果。",
       "available": "可用",
       "unavailable": "不可用",
       "scanned": "已扫描账号",
@@ -2297,7 +2476,33 @@
       "empty": "保留窗口内没有计费轮次。",
       "note": "数据来自各账号的计费环（每账号 100 条，进程内）。中断或被拒的请求不会出现在这里，所以空列表不等于没有流量。"
     },
+    "pagination": {
+      "perPage": "每页条数",
+      "range": "{{from}}–{{to}} / {{total}} 条 · 第 {{page}} / {{pages}} 页",
+      "first": "首页",
+      "last": "末页"
+    },
     "catalog": {
+      "noMatch": "没有符合筛选条件的模型。",
+      "filters": {
+        "search": "搜索模型",
+        "searchPlaceholder": "输入模型名、别名或 selector",
+        "allProviders": "全部供应商",
+        "all": "全部"
+      },
+      "tier": {
+        "free": "免费档",
+        "low": "低",
+        "medium": "中",
+        "high": "高"
+      },
+      "pricing": {
+        "rate": "{{rate}} credits / 轮",
+        "unreported": "金额未上报",
+        "cached": "上游目录缓存的费率",
+        "cachedAt": "上游目录费率缓存于 {{date}}",
+        "stale": "旧缓存"
+      },
       "reachable": "可达",
       "unreachable": "不可达",
       "yes": "是",

@@ -13,18 +13,21 @@
 
 | 项 | 值 |
 |---|---|
-| 扫描 | `docs/releases/*.md` 共 218 个文件 |
-| 命中 | 28 个文件 / 28 个小节 |
-| bullet | 120 条 |
-| 已复核 | 2 |
-| 仍缺 | 118 |
-| 已修 | 0 |
-| 无 marker | 55 |
+| 扫描 | `docs/releases/*.md` 共 226 个文件 |
+| 命中 | 32 个文件 / 32 个小节 |
+| bullet | 215 条 |
+| 已复核 | 22 |
+| 仍缺 | 185 |
+| 已修 | 8 |
+| 无 marker | 60 |
 
 ## 按 release
 
 | release | 小节 | bullet | 已复核 | 仍缺 | 已修 | 无 marker |
 |---|---:|---:|---:|---:|---:|---:|
+| [3.141.592661](releases/RELEASE_NOTES_3.141.592661.md) | 1 | 25 | 8 | 17 | 0 | 1 |
+| [3.141.592660](releases/RELEASE_NOTES_3.141.592660.md) | 1 | 34 | 6 | 24 | 4 | 1 |
+| [3.141.592659](releases/RELEASE_NOTES_3.141.592659.md) | 1 | 34 | 6 | 24 | 4 | 1 |
 | [3.141.592658](releases/RELEASE_NOTES_3.141.592658.md) | 1 | 7 | 0 | 7 | 0 | 7 |
 | [3.141.592657](releases/RELEASE_NOTES_3.141.592657.md) | 1 | 16 | 0 | 16 | 0 | 16 |
 | [3.141.592656](releases/RELEASE_NOTES_3.141.592656.md) | 1 | 16 | 0 | 16 | 0 | 16 |
@@ -53,6 +56,127 @@
 | [3.9.41](releases/RELEASE_NOTES_3.9.41.md) | 1 | 6 | 0 | 6 | 0 | 0 |
 | [3.9.40](releases/RELEASE_NOTES_3.9.40.md) | 1 | 3 | 0 | 3 | 0 | 0 |
 | [3.9.39](releases/RELEASE_NOTES_3.9.39.md) | 1 | 3 | 0 | 3 | 0 | 0 |
+| [3.2.11](releases/RELEASE_NOTES_3.2.11.md) | 1 | 2 | 0 | 2 | 0 | 2 |
+
+## 3.141.592661 — `docs/releases/RELEASE_NOTES_3.141.592661.md`
+
+1 个小节 · 25 条：已复核 8 · 仍缺 17 · 已修 0（无 marker 1）
+
+小节 `## 7. 已知 / 尚未验证`（`:206`）
+
+| # | 位置 | bullet | marker | 状态 |
+|---:|---|---|---|---|
+| 1 | `RELEASE_NOTES_3.141.592661.md:210` | 99 spec / 878 mutation 的全量 sweep（本树）**：`babafeef` 改了 `src/json-schema.js` 与 `src/handlers/chat.js`，两者都在 spec 覆盖范围内。 `spec-baseline-check` 只证明锚点与基线成立、不执行变异体；本版没有新增 `src/` 改动， 但也没有在本树复跑全量 sweep。闭合命令（POSIX，干净树）： `for s in test/mutations/*.json; do npm run mutate -- "$s"; done`。 | `[UNVERIFIED]` | 仍缺 |
+| 2 | `RELEASE_NOTES_3.141.592661.md:215` | `npm run test:release` 全量 shard（本树）**：本 checkout 的 `listTopLevelTestFiles()` 发现 **627** 个 `*.test.js`（比 660 的 626 多出 `test/changelog-counts.test.js`）；本版只跑了受影响集合（docs guard 47 + changelog-counts 5 + unverified-register 7 + JSON Schema 38）。Windows 上该 shard 预期 103 条 skip （平台/环境守卫），skip 声明不是绿。 | `[UNVERIFIED]` | 仍缺 |
+| 3 | `RELEASE_NOTES_3.141.592661.md:220` | wire 270/270（本树）**：默认路径对 `v3.141.592658` 的 270/270 逐字节 一致是在 `deeb2539` 上测的（距本树 87 个提交 / 34 个 `src/` 文件）；本树未复测，本机 wire 门 inert（`skipped:1`）。`src/` 与 660 相同，但「相同」不是本树的测量。 | `[UNVERIFIED]` | 仍缺 |
+| 4 | `RELEASE_NOTES_3.141.592661.md:223` | POSIX 全量门 `gate:release`**：本机只跑 Windows 受影响集合；POSIX 干净树 的 `npm run gate:release` 未跑。 | `[UNVERIFIED]` | 仍缺 |
+| 5 | `RELEASE_NOTES_3.141.592661.md:225` | 托管 CI**：本分支没有 upstream；本文件的所有计数都是本机测量。3.141.592660 的失败正是托管 CI 的 docs-guard；本版的两种 checkout 形状已在一次性 clone 里复现，但 GitHub Actions 上的真实运行要等 push。 | `[UNVERIFIED]` | 仍缺 |
+| 6 | `RELEASE_NOTES_3.141.592661.md:228` | HMC 部署与回滚演练**：本版没有部署；回滚命令见 §5 与 `ReleasePrep.md` §7，未执行。 | `[UNVERIFIED]` | 仍缺 |
+| 7 | `RELEASE_NOTES_3.141.592661.md:230` | live 上游 / 真实 Desktop/客户端**：WA-001/002/003/A4 的验证全部是隔离 函数与 hermetic 测试；没有把病态 payload 发给真实服务，也没有真实客户端复跑。HMC 的 旧模块计时用的是 `/tmp` 副本，生产 `:18999` 未被写入。 | `[UNVERIFIED]` | 仍缺 |
+| 8 | `RELEASE_NOTES_3.141.592661.md:233` | 发布产物**：资产、cosign 签名、`SHA256SUMS`、release attestation 都要在 tag 之后由 release workflow 生成；3.141.592660 的资产数是 **0**，本文件不代表 661 已经 有产物。 | `[UNVERIFIED]` | 仍缺 |
+| 9 | `RELEASE_NOTES_3.141.592661.md:236` | pkg 单文件二进制**：本版未构建/启动 `@yao-pkg/pkg` 的 Windows/macOS 产物； `release.yml` 的 `exe-boot-smoke` 只在 tag 之后运行。 | `[UNVERIFIED]` | 仍缺 |
+| 10 | `RELEASE_NOTES_3.141.592661.md:238` | Node 22 全量（本树）**：`engines >=22.13.0`；22.23.4 的 605 文件全量跑在 更早的树上，本树未跑。 | `[UNVERIFIED]` | 仍缺 |
+| 11 | `RELEASE_NOTES_3.141.592661.md:240` | GHSA 公告本身**：canonical 对象 D1 身份中和器 → `GHSA-fx5f-49jr-fw6r`、 D2 JSON Schema `pattern` → `GHSA-r7v2-3h32-f5g6`；两者的 `patched_versions` 都是 **`>= 3.141.592661`**。公告在 push + CI 绿之后才发布，写本文件时尚未发布——在此之前 不得对外声称公告已存在。`GHSA-xp93-vpw9-39wx` 与 `GHSA-h858-8xv9-257g` 是重复草稿， 应关闭，不发布。 | `[UNVERIFIED]` | 仍缺 |
+| 12 | `RELEASE_NOTES_3.141.592661.md:245` | **沿用 3.141.592660 §7 的其余边界**：CTX-01 live、`clear_thinking` 模型族边界、S03 真实 dashboard 客户端、IMG-01 真实 Cascade abort、TRN-01 上游角色语义、G01–G03/G06 真实客户端 抓包、Q1 G4、support-bundle 生产形态、HTTP socket 端到端、进程级并发准入残余、Q4 G12、 Q4 `messages.js` 日志、592658 的 M4/多段/`pr-gate` 边界——这些不因本版改变，逐条见 `RELEASE_NOTES_3.141.592660.md` §7 与登记册。 | — | 仍缺 |
+| 13 | `RELEASE_NOTES_3.141.592661.md:256` | 全量 shard（release run `42926473911` 的 `Test` job）**：2026-11-11 复核：该 run 的 `Test` job `conclusion=success`，在 tag checkout 上跑的就是 `npm run test:release` （`.github/workflows/release.yml:79`）；本波在一次性 clone 的 Path C 树（只删冻结 tag、保留 `.592661`，230 个 tag）上实测 **627** 文件 / **7,818** 测试 / 7,715 通过 / **0 失败** / 103 跳过。skip 声明仍然不是绿——Node 22 与 POSIX 全量门见下面两条。 | `[VERIFIED]` | 已复核 |
+| 14 | `RELEASE_NOTES_3.141.592661.md:261` | 托管 CI**：`CI` run `42925868761` = `completed` / `success`，`head_sha=fe98f0bc` （`gh api repos/dwgx/WindsurfAPI/actions/runs/42925868761`）；release run `42926473911` 的 `Test` job 同样 `success`。 | `[VERIFIED]` | 已复核 |
+| 15 | `RELEASE_NOTES_3.141.592661.md:264` | HMC 部署与回滚演练（§5 与 §7 #6 的「本版没有部署」作废）**：HMC `/health` 返回 `version=3.141.592661`、`status=ok`；`systemctl show … -p NRestarts` = **0**； `accounts.active` = **1**；切换前备份 `prev27-20261111T002607Z` 在位；R1/R2/R3 回滚演练 全部 exit 0。那两句是发布前的状态，已被本节取代（§5 另有 2026-11-11 的行内更正）。 | `[VERIFIED]` | 已复核 |
+| 16 | `RELEASE_NOTES_3.141.592661.md:268` | 发布产物**：release `441079956`（`v3.141.592661`）`draft=false`、`assets=14`、 `7` 个 `.sigstore.json`、每个资产都带 `digest`、`published_at=2026-11-11T00:18:15Z`， `/releases/latest` 指向同一 id；`SHA256SUMS` 4/4 与 REST `digest` 逐条一致。 | `[VERIFIED]` | 已复核 |
+| 17 | `RELEASE_NOTES_3.141.592661.md:271` | pkg 三目标构建 + boot-smoke（CI 侧）**：Windows / macOS arm64 / macOS x64 三个 构建 job 都在上传前调用 `scripts/exe-boot-smoke.mjs` （`release.yml:238`、`:277`、`:326`），run `42926473911` 里这三个 job 全 `success`。 | `[VERIFIED]` | 已复核 |
+| 18 | `RELEASE_NOTES_3.141.592661.md:274` | pkg 残余：本机启动**：上面证明的是 CI 构建出的二进制通过 smoke；本机没有 boot 过这三个产物，所以「本机启动」仍是未测项。 | `[UNVERIFIED]` | 仍缺 |
+| 19 | `RELEASE_NOTES_3.141.592661.md:276` | GHSA 公告**：`GHSA-r7v2-3h32-f5g6` 与 `GHSA-fx5f-49jr-fw6r` 均 `state=published`、`patched_versions >= 3.141.592661`、`credits=fishfish57`、CVSS 6.5； 重复草稿 `GHSA-xp93-vpw9-39wx` / `GHSA-h858-8xv9-257g` 已 `closed`。**`cve_id` 仍为 `null`**（GitHub CNA 异步分配）——这一项未闭合。 | `[VERIFIED]` | 已复核 |
+| 20 | `RELEASE_NOTES_3.141.592661.md:280` | wire 托管侧（部分闭合）**：CI 的 `Default-path request bytes` job 在 `fe98f0bc` 上 `success`，且设了 `WIRE_BASE_REQUIRED=1`；基线由 `scripts/wire-base.mjs` 选最新严格祖先 annotated tag，本版选到 `v3.141.592660`（不是 `.592658`）。**仍未闭合**：本机 wire 门 inert， 270/270 没有在本树复测——所以本条不写成「本机 270/270 已复测」。 | `[VERIFIED]` | 已复核 |
+| 21 | `RELEASE_NOTES_3.141.592661.md:284` | POSIX 全量门托管侧（部分闭合）**：`gate:release` 的 6 个步骤里 4 个已在托管 run 上 分别跑过（`spec-static-check`、`spec-baseline-check --all`、`secret-scan`、`test:release`）。 **仍未闭合**：`git diff --check` 与 `git diff --cached --check` 两步没有任何 workflow 运行 （`grep -n 'diff --check' .github/workflows/*.yml` 为空），单命令 `npm run gate:release` 从未跑过。 | `[VERIFIED]` | 已复核 |
+| 22 | `RELEASE_NOTES_3.141.592661.md:288` | 99 spec / 878 mutation 全量 sweep**：本机 0 次执行；托管侧 `spec-baseline-check.mjs --all` 只校验锚点与基线、不执行变异体。闭合命令不变。 | `[UNVERIFIED]` | 仍缺 |
+| 23 | `RELEASE_NOTES_3.141.592661.md:290` | live 上游 / 真实 Desktop 客户端抓包**：仍是隔离函数与 hermetic 测试， 没有把病态 payload 发给真实服务。 | `[UNVERIFIED]` | 仍缺 |
+| 24 | `RELEASE_NOTES_3.141.592661.md:292` | Node 22 全量**：便携 Node 22 只在隔离目录里解包，全量没有跑。 | `[UNVERIFIED]` | 仍缺 |
+| 25 | `RELEASE_NOTES_3.141.592661.md:293` | 沿用 3.141.592660 §7 的其余边界**：CTX-01 live、`clear_thinking` 族边界、 S03、IMG-01、TRN-01、G01–G03/G06、Q1 G4、support-bundle 生产形态、HTTP socket 端到端、 进程级并发准入残余、Q4 G12、Q4 `messages.js` 日志、592658 的 M4/多段/`pr-gate`——逐条见 `RELEASE_NOTES_3.141.592660.md` §7。 | `[UNVERIFIED]` | 仍缺 |
+
+## 3.141.592660 — `docs/releases/RELEASE_NOTES_3.141.592660.md`
+
+1 个小节 · 34 条：已复核 6 · 仍缺 24 · 已修 4（无 marker 1）
+
+小节 `## 7. 已知 / 尚未验证`（`:576`）
+
+| # | 位置 | bullet | marker | 状态 |
+|---:|---|---|---|---|
+| 1 | `RELEASE_NOTES_3.141.592660.md:580` | mutation 全量 sweep（HMC，`c4931c40`）**：POSIX `mutation-sweep.mjs` 在 HMC clone `c4931c40` 上跑完 **97/97 spec 按预期行为，0 unexpected survivors， 0 mismatch**（`.agent/HANDOFF.md` 记录，local evidence；日志 `/tmp/wsa-mutate2.log`， 99 个 `SPEC_EXIT` 中 2 个零突变 spec）。旧的「1800 s 上限前 56/97、剩 41」是中途 截断的中间态，已被该次完整 sweep 取代；`spec-baseline-check` 只证明锚点与基线 成立，不执行变异体。 | `[VERIFIED]` | 已复核 |
+| 2 | `RELEASE_NOTES_3.141.592660.md:586` | mutation 最终树复跑**：语料已扩到 **99 spec / 878 mutation**； `spec-baseline-check --all` 本地实测（`7c995f40` 树）**99 spec / 0 drift / 0 untrustworthy**——`d142d06e` 重钉 gemini 两份、`7c995f40` 重钉 `think-text-reroute` 并重锚 identity 两份。HMC 侧对合并树 `5a3ec2a9` 的 99/99 覆盖已测（其后 `5fb21e70`/`7c995f40` 又改 `src/`）。在 POSIX 上复跑 `node scripts/mutation-sweep.mjs --shard 0/1` 与 `--verify` 前，最终树的 变异体结论不作为证据。 | `[UNVERIFIED]` | 仍缺 |
+| 3 | `RELEASE_NOTES_3.141.592660.md:593` | mutation 全量基线（发布树）**：`spec-baseline-check.mjs --all`（97 spec）是 release workflow 的模式；发布树实测 **97 spec measured, 0 drift, 0 untrustworthy**，wall 202.5 s （`releasecommit-spec-baseline-all.log`，`sha256 da0d49db…`）。当前树的对应实测见 §4。 | `[VERIFIED]` | 已复核 |
+| 4 | `RELEASE_NOTES_3.141.592660.md:596` | Node 22 全量**：`test:release` 的分片（`scripts/run-test-shard.mjs 0 1`）由 Node 22.23.4 二进制直接运行，实测 **605 文件 / 7,455 测试 / 7,352 通过 / 0 失败 / 103 跳过 / 801.6 s**（`node22-release-2.log`； `TEST_SHARD_SUMMARY {"files":605,"tests":7455,"pass":7352,"fail":0,"skipped":103}`）。 `engines >=22.13.0` 的精确 floor（22.13.x）仍未单独跑矩阵，但 22.x 全量已不再是「未实测」。 | `[VERIFIED]` | 已复核 |
+| 5 | `RELEASE_NOTES_3.141.592660.md:601` | 托管 CI**：分支 `fix/audit-wave-20261109` 没有 upstream，本版所有 CI 结论 都是本机测量。 | `[UNVERIFIED]` | 仍缺 |
+| 6 | `RELEASE_NOTES_3.141.592660.md:603` | HMC 部署与回滚演练（592660）**：本版没有部署；回滚命令见 §5 与 `ReleasePrep.md` §7，未执行。 | `[UNVERIFIED]` | 仍缺 |
+| 7 | `RELEASE_NOTES_3.141.592660.md:605` | live 上游**：WA-001/002/003/A4 的验证全部是隔离函数与 hermetic 测试； 没有把病态 payload 发给真实服务，也没有真实客户端复跑。HMC 的旧模块计时用的是 `/tmp` 副本，生产 `:18999` 未被写入。 | `[UNVERIFIED]` | 仍缺 |
+| 8 | `RELEASE_NOTES_3.141.592660.md:608` | CTX-01 live**：没有在真实上游跑 replay + 有限 keep 的组合。 | `[UNVERIFIED]` | 仍缺 |
+| 9 | `RELEASE_NOTES_3.141.592660.md:609` | `clear_thinking` 缺省 keep 的模型族边界**：`29197941` 按上游文档把 缺省 `keep` 分为 keep-all 家族（Opus 4.5+/5、Sonnet 4.6+/5、Fable）与保守 keep-1， 边界来自上游文档而非本后端实测（`src/handlers/messages.js` 注释同样标 `[UNVERIFIED]`）；无法分类的模型名一律按 keep-1 校验，方向是多拒不少放。 | `[UNVERIFIED]` | 仍缺 |
+| 10 | `RELEASE_NOTES_3.141.592660.md:613` | S03 真实 dashboard 客户端**：只有隔离的排序测试（声明 10 MiB、不发 body）。 | `[UNVERIFIED]` | 仍缺 |
+| 11 | `RELEASE_NOTES_3.141.592660.md:614` | IMG-01 真实 Cascade abort**：取消语义由注入 signal 的测试覆盖；没有在 真实长轮次里按 Ctrl-C/断连。 | `[UNVERIFIED]` | 仍缺 |
+| 12 | `RELEASE_NOTES_3.141.592660.md:616` | TRN-01 上游角色语义**：只证明序列化可逆、闭合标签计数正确；不证明上游 会因未转义文本产生角色越权（本版不声称这是越权漏洞）。 | `[UNVERIFIED]` | 仍缺 |
+| 13 | `RELEASE_NOTES_3.141.592660.md:618` | 发布产物**：资产、cosign 签名、SHA256SUMS、release attestation 都要在 tag 之后由 release workflow 生成；本文件不代表它们已经存在。 | `[UNVERIFIED]` | 仍缺 |
+| 14 | `RELEASE_NOTES_3.141.592660.md:620` | G01（`reasoning.encrypted_content` 从不发出）**：`c4931c40` 在 `include:["reasoning.encrypted_content"]` 且上游提供值时发出该字段，并补了回放分支； 证据 `test/responses-include-verbosity-custom.test.js` 的 G01 专项用例（现 17 条， 全文件 30 条）。 | `[FIXED]` | 已修 |
+| 15 | `RELEASE_NOTES_3.141.592660.md:624` | G02（`text.verbosity` 未解析/未转发）**：`c4931c40` 解析 `text.verbosity` 并带入 adapter 边界（`completionOverrides.verbosity`）；chat-compatible 上游没有该字段，因此这是 有意记录的边界 no-op，不再是静默丢弃。证据同上测试文件。 | `[FIXED]` | 已修 |
+| 16 | `RELEASE_NOTES_3.141.592660.md:627` | G03（custom-tool 输入未流式）**：`c4931c40` 补了 `response.custom_tool_call_input.delta` / `.done` 与最终 `custom_tool_call` item 的 `input`/`id`； 证据同上测试文件。 | `[FIXED]` | 已修 |
+| 17 | `RELEASE_NOTES_3.141.592660.md:630` | G06（Gemini 静默丢弃 server-side tools）**：`c4931c40` 改为与其他协议面一致的 400 `unsupported_server_side_tool`，不再只写日志；`b65e0446` 补 falsy 键按存在性拒绝 与未列入工具的 warn。证据 `test/gemini.test.js`：2 个 `(G06)` 具名 `it`（translator 级 拒绝 + `handleGemini` 路由级 400）加 falsy-presence 断言面。 | `[FIXED]` | 已修 |
+| 18 | `RELEASE_NOTES_3.141.592660.md:634` | G01–G03/G06 的真实客户端抓包**：上述修复由 hermetic 测试覆盖；没有真实 Codex/Devin 客户端抓包确认 `reasoning.encrypted_content`、`text.verbosity`、custom-tool input delta 与 Gemini server-tool 400 在真实上游/客户端上的线上形状。 | `[UNVERIFIED]` | 仍缺 |
+| 19 | `RELEASE_NOTES_3.141.592660.md:637` | Q1 G4（`messagesRemaining:-1` 的语义）**：`CheckUserMessageRateLimit` 恒报 `-1`；dashboard 把成功探测的 `-1` 读作 `unlimited: true`（`src/dashboard/devin-cards.js:532`）， `test/dashboard-devin-cards.test.js` 有意固定该行为。审计要求常量落 `unknown`；本版把这一半 作为 deferred 残差记录（`test/dashboard-capacity-unknown.test.js` 头部），未改 dashboard 契约。 | `[UNVERIFIED]` | 仍缺 |
+| 20 | `RELEASE_NOTES_3.141.592660.md:641` | support-bundle 生产形态**：`test/support-bundle.test.js:227` 断言 `health.commit` 是 git sha，但 `src/version.js:40-47` 在非 git checkout 下回退为空串—— HMC 生产形态正是 `commit:""`（`SYNTHESIS.md` §2）。测试只在 git checkout 内通过，打包部署 形态未覆盖；本版只诊断，未改测试。 | `[UNVERIFIED]` | 仍缺 |
+| 21 | `RELEASE_NOTES_3.141.592660.md:645` | pkg 单文件二进制**：本版未构建/启动 `@yao-pkg/pkg` 的 Windows/macOS 产物； `release.yml` 的 `exe-boot-smoke` 只在 tag 之后运行。 | `[UNVERIFIED]` | 仍缺 |
+| 22 | `RELEASE_NOTES_3.141.592660.md:647` | Node 22 运行时（`babafeef` 树）**：本机 Node v24.19.0、HMC Node v24.21.0； 上文 Node 22.23.4 的 605 文件全量跑在更早的树上，`babafeef` 树上的 Node 22 全量未跑。 | `[UNVERIFIED]` | 仍缺 |
+| 23 | `RELEASE_NOTES_3.141.592660.md:649` | 全量 release shard（`babafeef` 树）**：当前 checkout 由 `listTopLevelTestFiles()` 发现 626 个 `*.test.js`；最后一次全量是 `d5519da3` 的 605 文件 / 7,455 测试。`babafeef` 树上只跑了受影响集合（JSON Schema 38 + docs guard 47），全量未跑。 | `[UNVERIFIED]` | 仍缺 |
+| 24 | `RELEASE_NOTES_3.141.592660.md:652` | HTTP socket 端到端**：JSON Schema 预算的 50 ms 是模块级实测；没有在真实 `http.Server` 请求上复测 wall-clock 与并发下的表现。 | `[UNVERIFIED]` | 仍缺 |
+| 25 | `RELEASE_NOTES_3.141.592660.md:654` | 进程级请求并发/连续滥用准入控制（VM 预算，外部任务书 TASK.md §C 方案2）**： `src/json-schema.js:271` 每次顶层 `validateJsonSchema` 调用新建一个 50 ms 截止时间， 子 schema 共享同一请求窗口；`src/` 与四个 sink（`chat.js:4999,5266,6910,8831`） 没有进程级 in-flight/并发计数、队列字节上限或过载拒绝。父级实测 （`VM-BUDGET-BOUNDARY.md:5-8`，Node v24.19.0，blob `b8cdd3fb…` / HEAD `babafeef`）： 连续 50 个病态请求 ≈ 3.1 s 主 event-loop（~62 ms/次），全部 `unable`、无 kill。 这是**有界、线性**的可用性残余，不是单请求绕过、不是回归；本版按 P2 接受并延后。 未测：真实 `http.Server` 并发下健康请求的延迟界限（见上一条 HTTP socket 端到端）、 多租户并发滥用形状。闭合 = 新 src 改动 + 新测试 + 新候选 SHA，须 Owner 明示决策， 不得静默追加；正常请求延迟界限与准入阈值尚未由 Owner 批准为生产 SLO （同一外部任务书 `C:/Users/dwgx1/OneDrive/Desktop/Setukou-Dispatch-20261111/02-WindsurfAPI/TASK.md:109` 「50ms 是研究起点，不是已经由 Owner 批准的生产 SLO」）。 | `[UNVERIFIED]` | 仍缺 |
+| 26 | `RELEASE_NOTES_3.141.592660.md:666` | 真实上游 provider**：模型输出触发 `pattern` 的实际形状未在真实上游观察； 病态 payload 未发给真实服务。 | `[UNVERIFIED]` | 仍缺 |
+| 27 | `RELEASE_NOTES_3.141.592660.md:668` | GHSA 公告本身**：canonical 对象 D1 身份中和器 → `GHSA-fx5f-49jr-fw6r`、 D2 JSON Schema `pattern` → `GHSA-r7v2-3h32-f5g6`；两者的 `patched_versions` 都是 **`>= 3.141.592660`**。公告在 push + CI 绿之后才发布（顺序见 §6），写本文件时尚未发布—— 在此之前不得对外声称公告已存在。`GHSA-xp93-vpw9-39wx` 与 `GHSA-h858-8xv9-257g` 是重复 草稿，应关闭，不发布。 | `[UNVERIFIED]` | 仍缺 |
+| 28 | `RELEASE_NOTES_3.141.592660.md:673` | POSIX mutation sweep（`babafeef` 树）**：`src/json-schema.js` 与 `src/handlers/chat.js` 改动后，最终树的 99 spec / 878 mutation 复跑仍未做。 | `[UNVERIFIED]` | 仍缺 |
+| 29 | `RELEASE_NOTES_3.141.592660.md:675` | Q4 G08（当前轮图片预算）——在 HEAD 已修，不是残留**： `capCascadeImageBudget`（`src/client.js:352`）是整条 field-6 列表共享的计数/字节预算， 当前轮先花（`:483`），单轮路径同样过它（`:1338`），超出部分记 `cascade_image_current_dropped`（`:371-380`）。Q4 的「当前轮绕过帽」来自修前快照。 | `[VERIFIED]` | 已复核 |
+| 30 | `RELEASE_NOTES_3.141.592660.md:679` | Q4 G14（被吞掉的清理失败）——在 HEAD 已修**：`accountCleanup` 改走 `reportAccountCleanupFailure`（`src/auth.js:2661-2690`），失败计 `account_cleanup_failed` 并 warn，不再是 `.catch(()=>{})`。 | `[VERIFIED]` | 已复核 |
+| 31 | `RELEASE_NOTES_3.141.592660.md:682` | Q4 P3 catalogue ID 边界——2026-11-11 在 `babafeef` 上复核为已修**：Q4 曾记录 `claude-3-example.com` 仍被当作 ID 形状、`a4-catalogue-line` 会剥掉调用方 RULE 正文。 2026-11-11 重测（隔离精确字符串夹具 + 三文件套件）：`node d03-fixture.mjs` （`perf-20261111/research/DeferredTriage/d03-fixture.mjs`，只 import `src/handlers/identity-neutralize.js`）→ **4/4 caller RULE survived**，含 `…documented at claude-3-example.com; RULE: keep me` 原样保留（无 EOL 剥离）； `node --import ./test/setup-env.mjs --test test/identity-neutralize-integrity.test.js test/identity-neutralize-paragraph-bound.test.js test/identity-neutralize-complexity.test.js` → **110 pass / 0 fail**。根因由更早提交修复，无需新改动：`catalogueIdBoundary` （`src/handlers/identity-neutralize.js:399-416`）把「`.` 后接字母/数字」判为散文，故 `example.com` 不是 ID；`catalogueIdFollows`（`:443-488`）要求 ≥2 个 ID 形状组件； `a4-catalogue-line`（`:556-576`）只在没有 ID 正文跟随时改写锚点短语，调用方 RULE 正文 因此保留。Q4 的「未复现」结论作废（历史记录保留，不静默删除）。 | `[VERIFIED]` | 已复核 |
+| 32 | `RELEASE_NOTES_3.141.592660.md:695` | Q4 G12 残留 fire-and-forget catches**：本波只逐行复核了 G08/G14 两处， G12 的其余残留未重审。 | `[UNVERIFIED]` | 仍缺 |
+| 33 | `RELEASE_NOTES_3.141.592660.md:697` | Q4 `messages.js` 的「remote fetch is not implemented」日志**：HEAD 位于 `src/handlers/messages.js:799`（Q4 记作 `:750`）；Q4 认为该句已过时，本波未复现其依据， 未改代码。 | `[UNVERIFIED]` | 仍缺 |
+| 34 | `RELEASE_NOTES_3.141.592660.md:700` | **沿用 592658 的边界**：M4 rescue 未在真实上游触发、多段 `#10`/`#21` 未线上观测、 官方 `pr-gate` 仍 `INCOMPLETE`（relogin 真实密码缺口）。这些不因本版改变。 | — | 仍缺 |
+
+## 3.141.592659 — `docs/releases/RELEASE_NOTES_3.141.592659.md`
+
+1 个小节 · 34 条：已复核 6 · 仍缺 24 · 已修 4（无 marker 1）
+
+小节 `## 7. 已知 / 尚未验证`（`:555`）
+
+| # | 位置 | bullet | marker | 状态 |
+|---:|---|---|---|---|
+| 1 | `RELEASE_NOTES_3.141.592659.md:559` | mutation 全量 sweep（HMC，`c4931c40`）**：POSIX `mutation-sweep.mjs` 在 HMC clone `c4931c40` 上跑完 **97/97 spec 按预期行为，0 unexpected survivors， 0 mismatch**（`.agent/HANDOFF.md` 记录，local evidence；日志 `/tmp/wsa-mutate2.log`， 99 个 `SPEC_EXIT` 中 2 个零突变 spec）。旧的「1800 s 上限前 56/97、剩 41」是中途 截断的中间态，已被该次完整 sweep 取代；`spec-baseline-check` 只证明锚点与基线 成立，不执行变异体。 | `[VERIFIED]` | 已复核 |
+| 2 | `RELEASE_NOTES_3.141.592659.md:565` | mutation 最终树复跑**：语料已扩到 **99 spec / 878 mutation**； `spec-baseline-check --all` 本地实测（`7c995f40` 树）**99 spec / 0 drift / 0 untrustworthy**——`d142d06e` 重钉 gemini 两份、`7c995f40` 重钉 `think-text-reroute` 并重锚 identity 两份。HMC 侧对合并树 `5a3ec2a9` 的 99/99 覆盖已测（其后 `5fb21e70`/`7c995f40` 又改 `src/`）。在 POSIX 上复跑 `node scripts/mutation-sweep.mjs --shard 0/1` 与 `--verify` 前，最终树的 变异体结论不作为证据。 | `[UNVERIFIED]` | 仍缺 |
+| 3 | `RELEASE_NOTES_3.141.592659.md:572` | mutation 全量基线（发布树）**：`spec-baseline-check.mjs --all`（97 spec）是 release workflow 的模式；发布树实测 **97 spec measured, 0 drift, 0 untrustworthy**，wall 202.5 s （`releasecommit-spec-baseline-all.log`，`sha256 da0d49db…`）。当前树的对应实测见 §4。 | `[VERIFIED]` | 已复核 |
+| 4 | `RELEASE_NOTES_3.141.592659.md:575` | Node 22 全量**：`test:release` 的分片（`scripts/run-test-shard.mjs 0 1`）由 Node 22.23.4 二进制直接运行，实测 **605 文件 / 7,455 测试 / 7,352 通过 / 0 失败 / 103 跳过 / 801.6 s**（`node22-release-2.log`； `TEST_SHARD_SUMMARY {"files":605,"tests":7455,"pass":7352,"fail":0,"skipped":103}`）。 `engines >=22.13.0` 的精确 floor（22.13.x）仍未单独跑矩阵，但 22.x 全量已不再是「未实测」。 | `[VERIFIED]` | 已复核 |
+| 5 | `RELEASE_NOTES_3.141.592659.md:580` | 托管 CI**：分支 `fix/audit-wave-20261109` 没有 upstream，本版所有 CI 结论 都是本机测量。 | `[UNVERIFIED]` | 仍缺 |
+| 6 | `RELEASE_NOTES_3.141.592659.md:582` | HMC 部署与回滚演练（592659）**：本版没有部署；回滚命令见 §5 与 `ReleasePrep.md` §7，未执行。 | `[UNVERIFIED]` | 仍缺 |
+| 7 | `RELEASE_NOTES_3.141.592659.md:584` | live 上游**：WA-001/002/003/A4 的验证全部是隔离函数与 hermetic 测试； 没有把病态 payload 发给真实服务，也没有真实客户端复跑。HMC 的旧模块计时用的是 `/tmp` 副本，生产 `:18999` 未被写入。 | `[UNVERIFIED]` | 仍缺 |
+| 8 | `RELEASE_NOTES_3.141.592659.md:587` | CTX-01 live**：没有在真实上游跑 replay + 有限 keep 的组合。 | `[UNVERIFIED]` | 仍缺 |
+| 9 | `RELEASE_NOTES_3.141.592659.md:588` | `clear_thinking` 缺省 keep 的模型族边界**：`29197941` 按上游文档把 缺省 `keep` 分为 keep-all 家族（Opus 4.5+/5、Sonnet 4.6+/5、Fable）与保守 keep-1， 边界来自上游文档而非本后端实测（`src/handlers/messages.js` 注释同样标 `[UNVERIFIED]`）；无法分类的模型名一律按 keep-1 校验，方向是多拒不少放。 | `[UNVERIFIED]` | 仍缺 |
+| 10 | `RELEASE_NOTES_3.141.592659.md:592` | S03 真实 dashboard 客户端**：只有隔离的排序测试（声明 10 MiB、不发 body）。 | `[UNVERIFIED]` | 仍缺 |
+| 11 | `RELEASE_NOTES_3.141.592659.md:593` | IMG-01 真实 Cascade abort**：取消语义由注入 signal 的测试覆盖；没有在 真实长轮次里按 Ctrl-C/断连。 | `[UNVERIFIED]` | 仍缺 |
+| 12 | `RELEASE_NOTES_3.141.592659.md:595` | TRN-01 上游角色语义**：只证明序列化可逆、闭合标签计数正确；不证明上游 会因未转义文本产生角色越权（本版不声称这是越权漏洞）。 | `[UNVERIFIED]` | 仍缺 |
+| 13 | `RELEASE_NOTES_3.141.592659.md:597` | 发布产物**：资产、cosign 签名、SHA256SUMS、release attestation 都要在 tag 之后由 release workflow 生成；本文件不代表它们已经存在。 | `[UNVERIFIED]` | 仍缺 |
+| 14 | `RELEASE_NOTES_3.141.592659.md:599` | G01（`reasoning.encrypted_content` 从不发出）**：`c4931c40` 在 `include:["reasoning.encrypted_content"]` 且上游提供值时发出该字段，并补了回放分支； 证据 `test/responses-include-verbosity-custom.test.js` 的 G01 专项用例（现 17 条， 全文件 30 条）。 | `[FIXED]` | 已修 |
+| 15 | `RELEASE_NOTES_3.141.592659.md:603` | G02（`text.verbosity` 未解析/未转发）**：`c4931c40` 解析 `text.verbosity` 并带入 adapter 边界（`completionOverrides.verbosity`）；chat-compatible 上游没有该字段，因此这是 有意记录的边界 no-op，不再是静默丢弃。证据同上测试文件。 | `[FIXED]` | 已修 |
+| 16 | `RELEASE_NOTES_3.141.592659.md:606` | G03（custom-tool 输入未流式）**：`c4931c40` 补了 `response.custom_tool_call_input.delta` / `.done` 与最终 `custom_tool_call` item 的 `input`/`id`； 证据同上测试文件。 | `[FIXED]` | 已修 |
+| 17 | `RELEASE_NOTES_3.141.592659.md:609` | G06（Gemini 静默丢弃 server-side tools）**：`c4931c40` 改为与其他协议面一致的 400 `unsupported_server_side_tool`，不再只写日志；`b65e0446` 补 falsy 键按存在性拒绝 与未列入工具的 warn。证据 `test/gemini.test.js`：2 个 `(G06)` 具名 `it`（translator 级 拒绝 + `handleGemini` 路由级 400）加 falsy-presence 断言面。 | `[FIXED]` | 已修 |
+| 18 | `RELEASE_NOTES_3.141.592659.md:613` | G01–G03/G06 的真实客户端抓包**：上述修复由 hermetic 测试覆盖；没有真实 Codex/Devin 客户端抓包确认 `reasoning.encrypted_content`、`text.verbosity`、custom-tool input delta 与 Gemini server-tool 400 在真实上游/客户端上的线上形状。 | `[UNVERIFIED]` | 仍缺 |
+| 19 | `RELEASE_NOTES_3.141.592659.md:616` | Q1 G4（`messagesRemaining:-1` 的语义）**：`CheckUserMessageRateLimit` 恒报 `-1`；dashboard 把成功探测的 `-1` 读作 `unlimited: true`（`src/dashboard/devin-cards.js:532`）， `test/dashboard-devin-cards.test.js` 有意固定该行为。审计要求常量落 `unknown`；本版把这一半 作为 deferred 残差记录（`test/dashboard-capacity-unknown.test.js` 头部），未改 dashboard 契约。 | `[UNVERIFIED]` | 仍缺 |
+| 20 | `RELEASE_NOTES_3.141.592659.md:620` | support-bundle 生产形态**：`test/support-bundle.test.js:227` 断言 `health.commit` 是 git sha，但 `src/version.js:40-47` 在非 git checkout 下回退为空串—— HMC 生产形态正是 `commit:""`（`SYNTHESIS.md` §2）。测试只在 git checkout 内通过，打包部署 形态未覆盖；本版只诊断，未改测试。 | `[UNVERIFIED]` | 仍缺 |
+| 21 | `RELEASE_NOTES_3.141.592659.md:624` | pkg 单文件二进制**：本版未构建/启动 `@yao-pkg/pkg` 的 Windows/macOS 产物； `release.yml` 的 `exe-boot-smoke` 只在 tag 之后运行。 | `[UNVERIFIED]` | 仍缺 |
+| 22 | `RELEASE_NOTES_3.141.592659.md:626` | Node 22 运行时（`babafeef` 树）**：本机 Node v24.19.0、HMC Node v24.21.0； 上文 Node 22.23.4 的 605 文件全量跑在更早的树上，`babafeef` 树上的 Node 22 全量未跑。 | `[UNVERIFIED]` | 仍缺 |
+| 23 | `RELEASE_NOTES_3.141.592659.md:628` | 全量 release shard（`babafeef` 树）**：当前 checkout 由 `listTopLevelTestFiles()` 发现 626 个 `*.test.js`；最后一次全量是 `d5519da3` 的 605 文件 / 7,455 测试。`babafeef` 树上只跑了受影响集合（JSON Schema 38 + docs guard 47），全量未跑。 | `[UNVERIFIED]` | 仍缺 |
+| 24 | `RELEASE_NOTES_3.141.592659.md:631` | HTTP socket 端到端**：JSON Schema 预算的 50 ms 是模块级实测；没有在真实 `http.Server` 请求上复测 wall-clock 与并发下的表现。 | `[UNVERIFIED]` | 仍缺 |
+| 25 | `RELEASE_NOTES_3.141.592659.md:633` | 进程级请求并发/连续滥用准入控制（VM 预算，外部任务书 TASK.md §C 方案2）**： `src/json-schema.js:271` 每次顶层 `validateJsonSchema` 调用新建一个 50 ms 截止时间， 子 schema 共享同一请求窗口；`src/` 与四个 sink（`chat.js:4999,5266,6910,8831`） 没有进程级 in-flight/并发计数、队列字节上限或过载拒绝。父级实测 （`VM-BUDGET-BOUNDARY.md:5-8`，Node v24.19.0，blob `b8cdd3fb…` / HEAD `babafeef`）： 连续 50 个病态请求 ≈ 3.1 s 主 event-loop（~62 ms/次），全部 `unable`、无 kill。 这是**有界、线性**的可用性残余，不是单请求绕过、不是回归；本版按 P2 接受并延后。 未测：真实 `http.Server` 并发下健康请求的延迟界限（见上一条 HTTP socket 端到端）、 多租户并发滥用形状。闭合 = 新 src 改动 + 新测试 + 新候选 SHA，须 Owner 明示决策， 不得静默追加；正常请求延迟界限与准入阈值尚未由 Owner 批准为生产 SLO （同一外部任务书 `C:/Users/dwgx1/OneDrive/Desktop/Setukou-Dispatch-20261111/02-WindsurfAPI/TASK.md:109` 「50ms 是研究起点，不是已经由 Owner 批准的生产 SLO」）。 | `[UNVERIFIED]` | 仍缺 |
+| 26 | `RELEASE_NOTES_3.141.592659.md:645` | 真实上游 provider**：模型输出触发 `pattern` 的实际形状未在真实上游观察； 病态 payload 未发给真实服务。 | `[UNVERIFIED]` | 仍缺 |
+| 27 | `RELEASE_NOTES_3.141.592659.md:647` | GHSA-r7v2-3h32-f5g6 的 `patched_versions`**：修复版本尚未发布；发布前不得写 `patched_versions`。canonical 对象：D1 身份中和器 → `GHSA-fx5f-49jr-fw6r`，D2 JSON Schema `pattern` → `GHSA-r7v2-3h32-f5g6`；`GHSA-xp93-vpw9-39wx` 与 `GHSA-h858-8xv9-257g` 是重复草稿， 应关闭，不发布。 | `[UNVERIFIED]` | 仍缺 |
+| 28 | `RELEASE_NOTES_3.141.592659.md:651` | POSIX mutation sweep（`babafeef` 树）**：`src/json-schema.js` 与 `src/handlers/chat.js` 改动后，最终树的 99 spec / 878 mutation 复跑仍未做。 | `[UNVERIFIED]` | 仍缺 |
+| 29 | `RELEASE_NOTES_3.141.592659.md:653` | Q4 G08（当前轮图片预算）——在 HEAD 已修，不是残留**： `capCascadeImageBudget`（`src/client.js:352`）是整条 field-6 列表共享的计数/字节预算， 当前轮先花（`:483`），单轮路径同样过它（`:1338`），超出部分记 `cascade_image_current_dropped`（`:371-380`）。Q4 的「当前轮绕过帽」来自修前快照。 | `[VERIFIED]` | 已复核 |
+| 30 | `RELEASE_NOTES_3.141.592659.md:657` | Q4 G14（被吞掉的清理失败）——在 HEAD 已修**：`accountCleanup` 改走 `reportAccountCleanupFailure`（`src/auth.js:2661-2690`），失败计 `account_cleanup_failed` 并 warn，不再是 `.catch(()=>{})`。 | `[VERIFIED]` | 已复核 |
+| 31 | `RELEASE_NOTES_3.141.592659.md:660` | Q4 P3 catalogue ID 边界——2026-11-11 在 `babafeef` 上复核为已修**：Q4 曾记录 `claude-3-example.com` 仍被当作 ID 形状、`a4-catalogue-line` 会剥掉调用方 RULE 正文。 2026-11-11 重测（隔离精确字符串夹具 + 三文件套件）：`node d03-fixture.mjs` （`perf-20261111/research/DeferredTriage/d03-fixture.mjs`，只 import `src/handlers/identity-neutralize.js`）→ **4/4 caller RULE survived**，含 `…documented at claude-3-example.com; RULE: keep me` 原样保留（无 EOL 剥离）； `node --import ./test/setup-env.mjs --test test/identity-neutralize-integrity.test.js test/identity-neutralize-paragraph-bound.test.js test/identity-neutralize-complexity.test.js` → **110 pass / 0 fail**。根因由更早提交修复，无需新改动：`catalogueIdBoundary` （`src/handlers/identity-neutralize.js:399-416`）把「`.` 后接字母/数字」判为散文，故 `example.com` 不是 ID；`catalogueIdFollows`（`:443-488`）要求 ≥2 个 ID 形状组件； `a4-catalogue-line`（`:556-576`）只在没有 ID 正文跟随时改写锚点短语，调用方 RULE 正文 因此保留。Q4 的「未复现」结论作废（历史记录保留，不静默删除）。 | `[VERIFIED]` | 已复核 |
+| 32 | `RELEASE_NOTES_3.141.592659.md:673` | Q4 G12 残留 fire-and-forget catches**：本波只逐行复核了 G08/G14 两处， G12 的其余残留未重审。 | `[UNVERIFIED]` | 仍缺 |
+| 33 | `RELEASE_NOTES_3.141.592659.md:675` | Q4 `messages.js` 的「remote fetch is not implemented」日志**：HEAD 位于 `src/handlers/messages.js:799`（Q4 记作 `:750`）；Q4 认为该句已过时，本波未复现其依据， 未改代码。 | `[UNVERIFIED]` | 仍缺 |
+| 34 | `RELEASE_NOTES_3.141.592659.md:678` | **沿用 592658 的边界**：M4 rescue 未在真实上游触发、多段 `#10`/`#21` 未线上观测、 官方 `pr-gate` 仍 `INCOMPLETE`（relogin 真实密码缺口）。这些不因本版改变。 | — | 仍缺 |
 
 ## 3.141.592658 — `docs/releases/RELEASE_NOTES_3.141.592658.md`
 
@@ -425,3 +549,14 @@
 | 1 | `RELEASE_NOTES_3.9.39.md:76` | **无 live-account 验收**：本轮每个宿主上 `accounts.json` 都是 2 字节的空池。 | `[UNVERIFIED]` | 仍缺 |
 | 2 | `RELEASE_NOTES_3.9.39.md:77` | **四个仪器仍未运行**：`WINDSURFAPI_LEAK_TRACE=1`、`DEVIN_CONNECT_DEBUG_META=1`、 `calibrate:devin`、`cascade-survival-probe.mjs`。 | `[UNVERIFIED]` | 仍缺 |
 | 3 | `RELEASE_NOTES_3.9.39.md:79` | **`s2-b-frame-assembly` 的突变裁决仍然缺失**：它的突变本身破坏模块加载，harness 按设计拒绝 把这种运行当作证据（拒绝 ≠ 判绿）。 | `[UNVERIFIED]` | 仍缺 |
+
+## 3.2.11 — `docs/releases/RELEASE_NOTES_3.2.11.md`
+
+1 个小节 · 2 条：已复核 0 · 仍缺 2 · 已修 0（无 marker 2）
+
+小节 `## Open verification / 尚未验证`（`:93`）
+
+| # | 位置 | bullet | marker | 状态 |
+|---:|---|---|---|---|
+| 1 | `RELEASE_NOTES_3.2.11.md:95` | Enterprise Cascade behavior in [issue #245](https://github.com/dwgx/WindsurfAPI/issues/245) remains open pending a confirmed result on the reported client and account type. | — | 仍缺 |
+| 2 | `RELEASE_NOTES_3.2.11.md:97` | Fixture tests exercise admission, response-cache behavior and retry boundaries. Any claim about upstream billing needs a provider-side receipt from an authorized run. | — | 仍缺 |

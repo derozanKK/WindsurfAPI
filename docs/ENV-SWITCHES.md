@@ -1,12 +1,13 @@
 # 环境变量参考（补 .env.example 未收录的部分）
 
 README 的表格列常用变量，[.env.example](../.env.example) 是完整清单 —— 两者合计覆盖
-**93** 个。本文补齐**剩下 90 个只存在于源码里**的开关：注释很全，但运营翻不到。
-（2026-10-26 按 master `f6b843fe` 用下面的全形式脚本重测：三前缀开关 **183**。
-`.env.example` + README 覆盖 93，本文覆盖 90 —— 其中 5 个此前只写了缩写
+**95** 个。本文补齐**剩下 90 个只存在于源码里**的开关：注释很全，但运营翻不到。
+（2026-11-10 按 `5fb21e70` 用下面的全形式脚本重测：三前缀开关 **185**。
+`.env.example` + README 覆盖 95，本文覆盖 90。上一轮 2026-10-26 按 master
+`f6b843fe` 测得 183 / 93 / 90 —— 当时 5 个开关只写了缩写
 （`..._PROVIDERS` / `..._ROUTES` / `..._CALLERS` / `..._ACCOUNTS` /
 `..._WEBFETCH_AUTO_APPROVE_ORIGINS`），现已补成完整名字。旧口径是 5 种读取形式，
-本树只数到 172，漏掉的 9 个见下。
+那棵树只数到 172，漏掉的 9 个见下。
 2026-10-16 按 `d3f0490` 重测：全量 **157**。旧值 158 / 74 / 84 是 `ab4e66f` 树的口径：
 `9031b9b` 把 `CASCADE_MAX_WAIT_MS` 写进 README（覆盖 +1），`054806a` 删掉一个开关的读取点
 （全量 −1）。重测命令就是下面那段脚本。
@@ -30,12 +31,15 @@ README 的表格列常用变量，[.env.example](../.env.example) 是完整清�
 `WINDSURFAPI_REQUEST_BUDGET_STREAM_MS`，`src/request-budget.js:46,48`）。下面的脚本已补上
 这两种形式；守卫仍只扫 5 种形式（`test/docs-consistency-guard.test.js:513-524`），所以它对
 这 9 个是盲的 —— 本文把这 9 个全名都写出来，可用 `grep -F` 直接核对。
+2026-11-09 随 `c4931c40` 增补 `WINDSURFAPI_MIN_CLIENT_RATE_BPS`
+（`src/stream-writer.js`，bounded writer 的最短客户端吞吐假设，默认 8192 B/s）；
+读取点与本文条目同提交落地。
 
 数开关**别用裸 `grep 'env\.'`**，有两个坑：一是 `WINDSURFAPI_TRACE` 这类名字是
 `WINDSURFAPI_TRACE_DIR` 的前缀，正则不加边界会重复计数；二是**相当一部分读取点
 不长得像 `env.FOO`** —— `positiveIntEnv('FOO', 默认)`（`client.js`/`proto-trace.js`/
 `conversation-pool.js`）和 `runtime-config.js` 里 `{env: 'FOO', def: …}` 的表驱动写法
-都是真读取点。只匹配 `env.FOO` 会漏掉 **59** 个（2026-10-26 按当前树重测：全量 183、裸 `env.` 124；2026-10-16 @d3f0490 时点为 157 / 112，差值 45）。正确数法：
+都是真读取点。只匹配 `env.FOO` 会漏掉 **58** 个（2026-11-10 按 `5fb21e70` 重测：全量 185、裸 `env.` 127；2026-10-26 @`f6b843fe` 时点为 183 / 124、差值 59；2026-10-16 @`d3f0490` 时点为 157 / 112，差值 45）。正确数法：
 
 ```bash
 python3 - <<'PY'
@@ -70,7 +74,7 @@ for f in files:
     for m in PAT.finditer(strip(pathlib.Path(f).read_text(errors='replace'))):
         n=next(g for g in m.groups() if g)
         if n.startswith(('DEVIN_CONNECT_','WINDSURFAPI_','CASCADE_')): names.add(n)
-print(len(names))   # 183（2026-10-26 按 f6b843fe 重测）
+print(len(names))   # 185（2026-11-10 按 5fb21e70 重测）
 PY
 ```
 
@@ -182,17 +186,18 @@ checkout 账号（`acct === null`），成功尾必须把 usage 记到条目 own
 
 ## 默认开的功能开关
 
-这五个默认**开**，其中四个只能往「关」的方向调。它们都是「设 `0` 才关闭」的写法 ——
+这四个默认**开**，只能往「关」的方向调。它们都是「设 `0` 才关闭」的写法 ——
 写成别的值（`false` / `off`）不生效，除 `RESPONSE_CACHE` 外都只认精确的 `'0'`。
 `LS_PER_PROXY_USER` 是例外：未设置时按 sticky 用户名自动判定；`=1` 强制每个不同
 username 分池，`=0` 关闭。
+`VARIANT_FALLBACK_ON_RATE_LIMIT` 不属于这组：默认**关**，显式 `=1` 才启用。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `WINDSURFAPI_ENV_LIFT` | **开** | 把调用方的环境上下文提升进 prompt（`handlers/chat.js`，`?? '1'` 后 `=== '0'` 关闭）。注意这个用 `?? '1'` 而不是 `\|\| '1'`，且会 trim + 转小写。 |
 | `WINDSURFAPI_LS_PER_PROXY_USER` | **按 sticky 用户名自动开** | 默认不是无条件按用户分池：只有 proxy username 命中 `STICKY_USER_RE` 才独立一个 LS 实例（`langserver.js:222` 的 `_sid` / `-session-` / `-sticky` / `+ws_` / `^user-` / `-cc-xx` / `-country-` / `-zone-` 等标记；判定在 `:248-255`）。普通静态用户名（如 `alice`）默认共享 LS；`=1` 强制每个不同 username 一个实例；`=0` 完全关闭分池。 |
 | `WINDSURFAPI_NLU_RECOVERY` | **开** | 意图抽取失败时走恢复路径（`handlers/intent-extractor.js`，`=== '0'` 时直接返回空数组）。 |
-| `WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT` | **开** | 撞限流时自动回落到同族其它变体（`handlers/chat.js`，`=== '0'` 关闭）。关掉后限流直接报错给客户端。 |
+| `WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT` | **关** | 撞限流时自动回落到同族其它变体（`handlers/chat.js`）。默认关：限流直接报错给客户端；显式设 `=1` 才启用回落。 |
 | `WINDSURFAPI_RESPONSE_CACHE` | **开** | 响应缓存（`cache.js`）。链式兜底：`RESPONSE_CACHE_ENABLED ?? WINDSURFAPI_RESPONSE_CACHE ?? '1'`，所以前者优先。这个认多种关闭写法（`0`/`false`/`off`/`no`）。 |
 
 ## 源码 OTA 来源证明（D9）
@@ -280,12 +285,13 @@ tag peel 出来的 commit；不一致或签名无效时**两种模式都拒绝**
 | `CASCADE_MAX_HISTORY_BYTES` | `600000` | 非 1M 模型的历史字节预算（`client.js`，`positiveIntEnv`）。源码注释记着这个默认值的来历：早先是 400KB，**200KB 曾导致 30+ 轮工具调用的会话静默丢上下文**，所以调到 600KB 留出余量。调小之前先想清楚这一点。此前只作为上一行的说明文字出现，没有自己的条目。 |
 | `CASCADE_MAX_HISTORY_IMAGES` | `4` | 重放历史里最多附带几张历史图片（`client.js`，非负整数；`0` = 一张都不附带，非法值回落 4）。`SendUserCascadeMessage` 的历史是一个文本块（field 2），图片只能是消息级扁平 `repeated ImageData`（field 6），所以旧轮次的图片只能整体挂在同一条消息上、靠文本里的编号标记对应。按轮次从新到旧取，超出的会打一条 `cascade_image_history_dropped` WARN 并计数（dashboard `/connect-metrics` 的 `cascadeImages`），不再静默变成 `[Image omitted from text history]`。NO_TOOL 模式（有 `toolPreamble` 且未开 native bridge）不渲染 field 6，此时历史图按 `no_vision` 丢弃并计数。 |
 | `CASCADE_MAX_HISTORY_IMAGE_BYTES` | `1600000` | 历史图片的 base64 字节上限（`client.js`，非负整数；`0` = 等同于不允许历史图，非法值回落 1600000）。与上一行的数量上限任一先到即停止附带，同样从新到旧取舍；`image.js` 的 400 KB 重编码目标决定了 4 张 ≈ 1.6 MB，所以两个默认值是一套。 |
-| `WINDSURFAPI_HISTORY_BUDGET_TURNS` | `100` | **出站**历史预算的轮数上限（`history-budget.js`，非负整数；`0` = 关闭该维度，非法值回落 100）。在共享 chat 层、任何上游调用之前检查：超过即打一条带实测数字的 `WARN`，并返回 `413 payload_too_large`（`code: history_budget_exceeded`）。默认值取在实测死亡线之下 —— #136/#191 的 113 轮 / 128 KB 会话会在流中途被上游 `context deadline exceeded` 掐断，客户端已经收到半截字节且无法干净重试。注意它与 `CASCADE_MAX_HISTORY_BYTES` 是两层：后者只裁剪 Cascade 历史后缀（并且永远保留最新一轮），DEVIN_CONNECT 路径没有对应物，两者都不是准入检查。 |
-| `WINDSURFAPI_HISTORY_BUDGET_BYTES` | `8000000`（8 MB） | 同一预算的字节上限（`history-budget.js`，非负整数；`0` = 关闭，非法值回落 8 MB）。统计的是编码器会写出的载荷字段（content 文本/非文本部件、tool_calls 的 id/name/arguments、reasoning_content、name、tool_call_id）的 UTF-8 字节，不含传输框架 —— 是线上体积的**下界**，不是估计值。默认值压在入口 10 MB 上限之下、又高于 1M 模型的 900 KB 历史预算，所以它拦的是病态载荷（例如单条 10 MB 粘贴），不会拦正常会被裁剪的大转录。任一维度超限即拒绝。 |
+| `WINDSURFAPI_HISTORY_BUDGET_TURNS` | `100` | **出站**历史预算的轮数上限（`history-budget.js`，非负整数；`0` = 关闭该维度，非法值回落 100）。`turns` 是 `messages.length`：`messages` 里的 system 轮次照常计入，顶层 `system` 字段不单独计一轮。在共享 chat 层、任何上游调用之前检查：超过即打一条带实测数字的 `WARN`，并返回 `413 payload_too_large`（`code: history_budget_exceeded`）。默认值取在实测死亡线之下 —— #136/#191 的 113 轮 / 128 KB 会话会在流中途被上游 `context deadline exceeded` 掐断，客户端已经收到半截字节且无法干净重试。注意它与 `CASCADE_MAX_HISTORY_BYTES` 是两层：后者只裁剪 Cascade 历史后缀（并且永远保留最新一轮），DEVIN_CONNECT 路径没有对应物，两者都不是准入检查。 |
+| `WINDSURFAPI_HISTORY_BUDGET_BYTES` | `8000000`（8 MB） | 同一预算的字节上限（`history-budget.js`，非负整数；`0` = 关闭，非法值回落 8 MB）。统计 `messages` 里编码器会写出的载荷字段（content 文本/非文本部件、tool_calls 的 id/name/arguments、reasoning_content、name、tool_call_id）与 `tools[]` 的 JSON schema 的 UTF-8 字节；**顶层 `system` 字段不计入**（`messages` 里的 system 轮次按普通消息计入），不含传输框架 —— 是线上体积的**下界**，不是估计值。默认值压在入口 10 MB 上限之下、又高于 1M 模型的 900 KB 历史预算，所以它拦的是病态载荷（例如单条 10 MB 粘贴），不会拦正常会被裁剪的大转录。任一维度超限即拒绝。 |
 | `CASCADE_MAX_WAIT_MS` | `600000` | Cascade 单次等待上限（`client.js`）。曾只出现在 2.0.74 的 release notes 里；`9031b9b` 起 README 两语的 FAQ 也点名了它（`README.md:745` / `README.en.md:630`，cold stall 的封顶值）—— 本文不再是它唯一的落点。 |
 | `CASCADE_IDLE_GRACE_MS` | `8000` | 空闲宽限（`client.js`）。 |
 | `CASCADE_COLD_STALL_BASE_MS` | `30000` | 冷启动停顿基数（`client.js`）。 |
-| `WINDSURFAPI_MAX_DRAIN_MS` | `120000`（2 分钟） | SSE 写端背压的最长等待（解析点 `src/stream-writer.js:32` 的 `resolveMaxDrainWaitMs`，chat/connect 的 bounded writer 共用）。`res.write` 返回 `false` 后生产者被挂起等 `drain`；半开客户端（不再读、TCP 还开着）永远不发 `drain`，超过这个值就尽力写一帧 `DRAIN_TIMEOUT` 错误、中止该流并归还账号租约。要求正整数，否则回落 120000。 |
+| `WINDSURFAPI_MAX_DRAIN_MS` | `30000`（30 秒，固定部分） | SSE 写端背压的**固定**等待部分（解析点 `src/stream-writer.js` 的 `MAX_DRAIN_WAIT_DEFAULT_MS` / `resolveMaxDrainWaitMs`，chat/connect 的 bounded writer 共用）。一次 drain 等待的总预算是 `固定值 + 待排空字节 / WINDSURFAPI_MIN_CLIENT_RATE_BPS`，其中只有 `res.write()` 返回 `false` 的未确认字节才计费；收到 `drain` 后待排空字节清零、计时器撤销。半开客户端（不再读、TCP 还开着）永远不发 `drain`，预算耗尽就尽力写一帧 `DRAIN_TIMEOUT` 错误、中止该流并归还账号租约。要求正整数，否则回落 30000；计时器延迟钳到 Node 的 `2^31-1` ms 上限，避免大字节数/极小速率把延迟溢出成 1 ms。 |
+| `WINDSURFAPI_MIN_CLIENT_RATE_BPS` | `8192`（8 KiB/s） | SSE 写端背压预算的最短客户端吞吐假设（解析点 `src/stream-writer.js` 的 `MIN_CLIENT_RATE_ENV` / `resolveMinClientRateBps`，chat/connect 的 bounded writer 共用）。每次背压按**待排空字节**计费：`预算 = WINDSURFAPI_MAX_DRAIN_MS 固定值 + pendingBytes / rate`，`drain` 到达后清零；5 MB 的慢读帧因此拿到约 640 s 的按字节预算，而停住的 4 KB 帧只在固定 30 s 附近中止。要求正整数，否则回落 8192。 |
 | `WINDSURFAPI_REQUEST_BUDGET_MS` | `600000`（10 分钟） | 单请求绝对截止时间（`request-budget.js`，由 `server.js` 的路由在进入 handler 前创建为 `context.budget`）。账号队列等待、Cascade 轮询窗口（`maxWaitMs`）、connect 流 `deadlineMs` 与各层退避都只能缩短到剩余时间；到期后不再发起新的上游轮次，返回 504。每请求上游轮次硬上限 6（`DEFAULT_UPSTREAM_TURN_CAP`，暂不开放环境变量）。要求正数，否则回落 600000。 |
 | `WINDSURFAPI_REQUEST_BUDGET_STREAM_MS` | `300000`（5 分钟） | 流式请求在上一行基础上额外允许的时间，两者相加即流式预算（默认 15 分钟）。要求非负数；`0` = 与基础预算相同，非法值回落 300000。 |
 
@@ -371,11 +377,38 @@ tag peel 出来的 commit；不一致或签名无效时**两种模式都拒绝**
 | `WINDSURFAPI_QUOTA_COOLDOWN` | **开**（`true`） | `bool` | 配额冷却。 |
 | `WINDSURFAPI_ON_DEMAND_RESERVE_USD` | `0` | 0–100000 | 按需消费的预留额度（`float`，美元）。**涉及真实花钱，改前想清楚。** |
 
-至此三前缀开关 **183** 个全部有据可查（2026-10-26 按 master `f6b843fe` 用上面的全形式脚本
-重测；旧的 5 形式脚本在同树只数到 172，漏掉的 9 个见文首）：`.env.example` + README 覆盖
-93 个（含 PR #249 的 `WINDSURFAPI_LEAK_TRACE` 与 D9 的两个 attestation 开关），本文覆盖其余 90 个。这个不变式由
+至此三前缀开关 **185** 个全部有据可查（2026-11-10 按 `5fb21e70` 用上面的全形式脚本
+重测；上一轮 2026-10-26 按 master `f6b843fe` 测得 183，旧的 5 形式脚本在同树只数到
+172，漏掉的 9 个见文首）：`.env.example` + README 覆盖 95 个（含 PR #249 的
+`WINDSURFAPI_LEAK_TRACE` 与 D9 的两个 attestation 开关），本文覆盖其余 90 个。这个不变式由
 [`test/docs-consistency-guard.test.js`](../test/docs-consistency-guard.test.js) 的
 「every switch read in src/ is findable in some reader-facing doc」守着 ——
 **加新开关不写文档会直接让测试变红**。注意守卫只认 5 种读取形式
 （`test/docs-consistency-guard.test.js:513-524`），对 `csvListEnv`/`csvSetEnv`、`envGateAllows`
 和 `env?.NAME` 是盲的；这 9 个名字本文已写全，但不能把守卫的绿色当成它们的证明。
+
+## Connect prompt-cache outcomes
+
+With `STICKY_SESSION_ENABLED=1`, the authenticated dashboard request
+`GET /dashboard/api/connect-metrics?cacheBindings=1&offset=0` returns up to
+50 active bindings under `sticky.cacheOutcomes`. Use `nextOffset` for the next
+page. IDs identify in-memory binding lifetimes and are retired on eviction,
+expiry or a change of account. The user-only affinity experiment combines
+selectors; ordinary Connect affinity uses a separate binding for each selector.
+
+A positive provider cache-read count is a hit, an explicit zero is a miss,
+and a missing breakdown is unknown. Token counts describe delivered upstream
+turns. A gateway response-cache hit incurs no upstream turn and adds no sample.
+
+## Connect apply_patch diagnostics
+
+The authenticated dashboard route `GET /dashboard/api/connect-metrics?applyPatch=1`
+shows the latest 16 native or emulated client-owned `apply_patch` calls. It
+reports argument and error lengths in UTF-16 code units and fixed shape names.
+Each argument or invalid JSON string is inspected only up to 16,384 code units.
+An oversized value receives the `over_limit` shape. The `bare_patch` shape in
+the invalid field indicates that patch delimiters survived upstream parsing.
+
+Patch text, file names, tool-call IDs and error contents are excluded. Reading
+this diagnostic does not alter tool arguments or apply a patch. Resetting
+Connect metrics also clears these samples.

@@ -12,10 +12,11 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { handleChatCompletions, connectErrorToHttp } from './chat.js';
+import { handleChatCompletions, clientResetFields, connectErrorToHttp } from './chat.js';
 import { log } from '../config.js';
 import { createBoundedWriter, resolveMaxDrainWaitMs } from '../stream-writer.js';
 import { SseFramer } from '../sse-framer.js';
+import { ToolNamePrefixBuffer } from '../stream-tool-names.js';
 import { buildToolNameMap, restoreToolName } from '../tool-names.js';
 import { createToolIdAllocator, normalizeToolIdsInMessages, toolHygieneEnabled } from '../tool-ids.js';
 import { normalizeHistoryTail } from '../history-normalize.js';
@@ -42,6 +43,29 @@ const STOP_REASON_MAP = {
 };
 function mapStopReason(finishReason) {
   return STOP_REASON_MAP[finishReason] || 'end_turn';
+}
+
+// G3: the connect layer's truncation terminal. A payload that arrived with no
+// upstream stopReason is reported as finish_reason:'error' (with
+// `unterminated:true` on the connect event), and `resolveFinishReason` never
+// produces that value for any other shape. Anthropic's stop_reason enum has no
+// error member, so the Messages surface must refuse the turn instead of rendering
+// it as a normal end_turn.
+function isUnterminatedFinish(body) {
+  return body?.choices?.[0]?.finish_reason === 'error';
+}
+
+// A06 (P1): the Cascade poll loop's max_wait/stall_warm exit DELIVERED partial
+// text but never finished the turn. The producer types that as a fabricated
+// finish_reason:'length' plus a private carrier (chat.js nonStreamResponse, from
+// client.js classifyCascadeEnd) — so isUnterminatedFinish never fires and this
+// body used to render as a normal max_tokens completion, letting a caller act on
+// text the upstream did not finish. A caller-imposed output cap also reports
+// 'length'; only the carrier distinguishes an interruption from a real cap.
+function isCascadeInterrupted(body) {
+  return body?.__windsurf_incomplete === true
+    || body?.choices?.[0]?._windsurf_truncated === true
+    || body?.choices?.[0]?._windsurf_end_reason === 'upstream_truncated';
 }
 
 // Item 1 (loop break) classifier moved to the connect layer: leading think-tagged
@@ -493,16 +517,20 @@ function unsupportedParameter(param, message) {
   };
 }
 
-// `keep` for clear_thinking_20251015: "all" | "none" | {type:"thinking_turns",
-// value:<positive integer>}. Anything else is a malformed request, not an
+// `keep` for clear_thinking_20251015: "all" | "none" | {type:"all"} |
+// {type:"thinking_turns", value:<positive integer>}. {type:"all"} is the
+// spec-legal object spelling of keep:"all" (documented beside the string and
+// the thinking_turns form). Anything else is a malformed request, not an
 // unsupported feature, so it gets invalid_request_error.
 function validateThinkingKeep(keep, where) {
   if (keep == null || keep === 'all' || keep === 'none') return null;
   if (typeof keep !== 'object' || Array.isArray(keep)) {
-    return invalidRequest(`${where}.keep must be 'all', 'none', or { type: 'thinking_turns', value: <positive integer> }`);
+    return invalidRequest(`${where}.keep must be 'all', 'none', { type: 'all' }, or { type: 'thinking_turns', value: <positive integer> }`);
   }
-  if (keep.type !== 'thinking_turns') return invalidRequest(`${where}.keep.type must be 'thinking_turns'`);
-  if (!Number.isInteger(keep.value) || keep.value < 1) {
+  if (keep.type !== 'thinking_turns' && keep.type !== 'all') {
+    return invalidRequest(`${where}.keep.type must be 'thinking_turns' or 'all'`);
+  }
+  if (keep.type === 'thinking_turns' && (!Number.isInteger(keep.value) || keep.value < 1)) {
     return invalidRequest(`${where}.keep.value must be a positive integer`);
   }
   return null;
@@ -530,6 +558,138 @@ function validateContextManagement(cm) {
   return null;
 }
 
+// CTX-01: signed replay re-attaches a turn's signed thinking upstream (the
+// signedReplay attach in anthropicToOpenAI). Mirrors that attach condition —
+// an assistant turn whose thinking blocks are ALL signed and number exactly
+// one (the wire has one #11/#12 slot per message) — and returns the message
+// indexes of such turns, so the finite-keep refusal can tell whether the edit
+// retains every turn the translator would re-attach. A mixed or multi-block
+// turn is dropped on translation and satisfies any `keep`.
+function replayableSignedIndexes(messages) {
+  const indexes = [];
+  if (!Array.isArray(messages)) return indexes;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    let signed = 0;
+    let unsigned = false;
+    for (const block of message.content) {
+      if (!block || typeof block !== 'object' || block.type !== 'thinking') continue;
+      if (typeof block.thinking === 'string' && block.thinking
+          && typeof block.signature === 'string' && block.signature) signed++;
+      else unsigned = true;
+    }
+    if (signed === 1 && !unsigned) indexes.push(i);
+  }
+  return indexes;
+}
+
+// CTX-01: message indexes of every assistant turn carrying a thinking block,
+// signed or not. `clear_thinking_20251015` clears a PREFIX of these turns, so
+// the keep decision must compare against their positions rather than against
+// the replayable subset's count: a keep can drop the oldest turns and with
+// them a signed turn while still keeping as many turns as happen to be signed.
+//
+// M2: `redacted_thinking` counts as a thinking block here — upstream's
+// preservation rules treat it as one, so a turn carrying ONLY redacted
+// thinking still occupies a slot in the keep window. [UNVERIFIED] against this
+// backend (the upstream counting rule is from Anthropic's docs, not measured);
+// counting it is the safe direction — an under-counted window computes a
+// shorter dropped prefix and can accept a keep that clears a replayable turn.
+// The replayable mirror (replayableSignedIndexes) is unchanged: the
+// translator only re-attaches `type:'thinking'` blocks, and a redacted block
+// never affects its signed/unsigned tally.
+function thinkingTurnIndexes(messages) {
+  const indexes = [];
+  if (!Array.isArray(messages)) return indexes;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    if (message.content.some(block => block && typeof block === 'object'
+        && (block.type === 'thinking' || block.type === 'redacted_thinking'))) {
+      indexes.push(i);
+    }
+  }
+  return indexes;
+}
+
+// CTX-01/M1: which models treat an ABSENT `keep` on clear_thinking_20251015
+// as keep-all. [UNVERIFIED] — the class boundary is from upstream docs
+// (AWS Bedrock documents keep's default as one thinking turn; Anthropic's
+// docs make the default model-dependent: keep-all on Opus 4.5+ / Sonnet 4.6+
+// / Fable, last-turn-only on Haiku ≤4.5 / Opus ≤4.1 / Sonnet ≤4.5). It is NOT
+// measured against this backend, so the table only whitelists the documented
+// keep-all families and EVERYTHING else — including names the resolver cannot
+// classify — resolves to the keep-1 default. That is the safe direction: the
+// validator may over-reject a keep-all model, never under-reject a keep-1 one.
+// Matched against the resolved catalogue name AND raw official spellings, so
+// both `claude-4.5-opus` and `claude-opus-4-5` forms classify.
+const CLEAR_THINKING_KEEP_ALL_MODEL =
+  /^claude-(?:4[.-]5-opus|opus-4[.-][5-9]|opus-5|sonnet-4[.-]6|sonnet-5|5-fable|fable-5)/;
+
+function clearThinkingAbsentKeepKeepsAll(model) {
+  const name = String(resolveModel(String(model ?? '').trim()) ?? model ?? '').toLowerCase();
+  return CLEAR_THINKING_KEEP_ALL_MODEL.test(name);
+}
+
+// CTX-01: a finite `keep` ("none" or {type:"thinking_turns"}) asks this bridge
+// to drop the OLDEST thinking turns, but signed replay would re-attach that very
+// thinking to the upstream request. The upstream verifies each signature
+// against its own text, so a keep that clears a replayable signed turn cannot
+// be honoured — refuse instead of logging "edit satisfied" while contradicting
+// the edit. The comparison is order-aware: {thinking_turns,N} clears the prefix
+// `thinkingTurnIndexes().slice(0, turns - N)`, so it is accepted when N covers
+// every thinking turn (N >= turns) or when no dropped turn is replayable — not
+// merely when N reaches the replayable count. keep:"none" keeps no turn, so it
+// is refused whenever a replayable signed turn exists. Other keep shapes are
+// already rejected by validateThinkingKeep.
+//
+// EVERY matching edit is checked, not just the first. `edits.findIndex(...)` used
+// to stop at the first finite keep, so `edits: [keep 2, keep 1]` over two signed
+// turns accepted the satisfiable first edit and never looked at the second one,
+// which drops a signed turn — the request then reached the upstream with an edit
+// this bridge cannot honour. Each edit is a directive of its own, so the first one
+// that cannot be honoured refuses the whole request (at its own index).
+function validateSignedReplayClearThinking(cm, messages, model) {
+  if (!signedThinkingReplayEnabled(process.env, model)) return null;
+  const edits = Array.isArray(cm?.edits) ? cm.edits : [];
+  const signedIndexes = replayableSignedIndexes(messages);
+  if (signedIndexes.length === 0) return null;
+  // Computed lazily: a request whose edits are all keep:"all" never pays for the
+  // second message walk.
+  let turns = null;
+  for (let index = 0; index < edits.length; index++) {
+    const edit = edits[index];
+    if (edit?.type !== 'clear_thinking_20251015') continue;
+    let keep = edit.keep;
+    // {type:"all"} is the spec-legal object spelling of keep:"all" — it retains
+    // every thinking turn, so nothing this edit asks to clear can be replayed.
+    if (keep != null && typeof keep === 'object' && keep.type === 'all') continue;
+    // M1: an ABSENT keep is not keep-all — upstream resolves the default per
+    // model class (see clearThinkingAbsentKeepKeepsAll). Only the keep-all
+    // class accepts outright here; every other model — including names the
+    // resolver cannot classify — is rewritten to the explicit {thinking_turns:1}
+    // the keep-1 default means, so it runs the same dropped-prefix check below.
+    if (keep == null) {
+      keep = clearThinkingAbsentKeepKeepsAll(model) ? 'all' : { type: 'thinking_turns', value: 1 };
+    }
+    if (keep !== 'none' && (keep == null || typeof keep !== 'object')) continue;
+    if (keep !== 'none' && keep.type === 'thinking_turns') {
+      if (turns === null) turns = thinkingTurnIndexes(messages);
+      if (keep.value >= turns.length) continue;
+      const dropped = new Set(turns.slice(0, turns.length - keep.value));
+      if (!signedIndexes.some(turn => dropped.has(turn))) continue;
+    }
+    // keep:"none" keeps no turn, so it drops every replayable signed turn; any
+    // object keep that is not a satisfiable thinking_turns lands here too.
+    return unsupportedParameter(
+      `context_management.edits[${index}].keep`,
+      `context_management.edits[${index}].keep cannot be honoured while signed thinking replay is enabled (DEVIN_CONNECT_REPLAY_SIGNED_THINKING=1): the proxy would re-attach the signed thinking this edit asks to clear, and the upstream verifies each signature so a partial keep cannot be replayed. Use keep:"all", disable signed thinking replay, or remove the signed thinking history from the request.`,
+    );
+  }
+  return null;
+}
+
 // C4: a cache_control breakpoint must be { type: 'ephemeral', ttl?: '5m'|'1h' }.
 // Non-ephemeral types and unknown ttl values were silently accepted (ttl fell
 // back to 5m); official behavior is a 400. Returns an error {status,body} or null.
@@ -552,6 +712,10 @@ export function validateMessagesRequest(body) {
   // points asymmetric — a missing model would fall through to a downstream default
   // instead of a clean 400. Same wording as count_tokens for consistency.
   if (body.model == null || body.model === '') return invalidRequest('model: field required');
+  // A non-string model (e.g. {"model":123}) used to slip past the presence
+  // check and throw a TypeError inside resolveModel's `.toLowerCase()` — a 500
+  // for what is a client shape error. Refuse it as the same invalid_request.
+  if (typeof body.model !== 'string') return invalidRequest('model must be a string');
   // C1: max_tokens is required and must be a positive integer. The old
   // `max_tokens || 8192` fallback silently accepted a missing value or 0.
   const mt = body.max_tokens;
@@ -563,6 +727,10 @@ export function validateMessagesRequest(body) {
   // never silently dropped (Claude Code 2.1.306 sends one on every turn).
   const cmErr = validateContextManagement(body.context_management);
   if (cmErr) return cmErr;
+  // CTX-01: a finite clear_thinking keep cannot be honoured while signed
+  // replay re-attaches that thinking upstream; keep shape errors above win.
+  const replayErr = validateSignedReplayClearThinking(body.context_management, body.messages, body.model);
+  if (replayErr) return replayErr;
   // C3/C4: walk every block that can carry a cache_control breakpoint in the
   // same tools → system → messages prefix order extractCachePolicy uses.
   let breakpointCount = 0;
@@ -1402,7 +1570,7 @@ function buildAnthropicUsage(usage, cachePolicy = null) {
 // ─── Streaming translator: intercepts OpenAI SSE, emits Anthropic SSE ──
 
 class AnthropicStreamTranslator {
-  constructor(res, msgId, model, cachePolicy = null, inputEstimate = 0, stopSequences = null, reqId = null, conversationId = null, toolNameMap = null) {
+  constructor(res, msgId, model, cachePolicy = null, inputEstimate = 0, stopSequences = null, reqId = null, conversationId = null, toolNameMap = null, requestedTools = []) {
     this.res = res;
     this.msgId = msgId;
     this.model = model;
@@ -1411,6 +1579,10 @@ class AnthropicStreamTranslator {
     this.reqId = reqId;
     this.conversationId = conversationId;
     this.toolNameMap = toolNameMap;
+    this.prefixBuffer = new ToolNamePrefixBuffer([
+      ...(toolNameMap?.toClient.keys() || []),
+      ...requestedTools.map(t => t?.function?.name).filter(Boolean),
+    ], chunk => this.processChunk(chunk));
     // Local cache-prefix estimate from extractCachePolicy; used by finish() to
     // fill cache_creation_input_tokens when upstream reports none (see
     // buildAnthropicUsage). null when the request had no cache_control markers.
@@ -1460,6 +1632,12 @@ class AnthropicStreamTranslator {
     // frame. finish() uses this to tell a clean completion apart from an
     // abnormal cutoff (network drop / upstream abort / deadline) — see BUG1.
     this.sawTerminalSignal = false;
+    // G3: the connect layer reports a payload that arrived with NO upstream
+    // stopReason as finish_reason:'error' (its `unterminated` terminal). That is a
+    // TRUNCATED turn, and Anthropic's stop_reason enum has no error value — a
+    // normal message_delta would report end_turn and the client would accept half
+    // an answer as final. finish() turns this into an `error` event instead.
+    this.upstreamError = false;
     // True when the ONLY finish frame seen was one chat.js fabricated to close a
     // stream that died mid-answer. It suppresses the `[DONE]` shortcut below, since
     // chat.js emits `[DONE]` on that path too — so both signals must be discounted
@@ -1775,7 +1953,7 @@ class AnthropicStreamTranslator {
     // first fragment: wait for a chunk that carries arguments, a name-less
     // follow-up (the name is settled), a mapped name, or finish(). Opening early
     // publishes a truncated name that cannot be corrected in Anthropic's stream.
-    const nameSettled = nameKnown && (
+    const nameSettled = this.prefixBuffer.resolved.has(toolCall) || nameKnown && (
       !!(this.toolNameMap && this.toolNameMap.toClient.has(buf.wireName))
       || !rawName
     );
@@ -1895,6 +2073,10 @@ class AnthropicStreamTranslator {
         // truncated answer was complete.
         if (chunk.__synthetic_finish || chunk.__windsurf_end_reason === 'upstream_truncated') this.sawSyntheticFinish = true;
         else this.sawTerminalSignal = true;
+        // G3: 'error' is the connect layer's truncation terminal (a payload with no
+        // stopReason). It must never be folded into the normal stop_reason map —
+        // finish() refuses the turn before message_delta when this is set.
+        if (choice.finish_reason === 'error') this.upstreamError = true;
         // SEED-C3a: the generation layer reports WHICH stop sequence truncated
         // the answer on this terminal choice (only the internal Messages route
         // opts into the carrier, so a direct OpenAI client never sends one).
@@ -1913,6 +2095,7 @@ class AnthropicStreamTranslator {
   finish() {
     if (this.messageStopped) return;
     this.sseFramer.end();
+    this.prefixBuffer.finish();
     if (this.messageStopped) return;
     // BUG1: An abnormally cut-off stream (network drop, upstream abort, hung-
     // stream deadline) reaches finish() with NO terminal signal — no
@@ -1944,6 +2127,19 @@ class AnthropicStreamTranslator {
     // is the sequence a pre-content upstream error chunk already produces today
     // (processChunk returns on chunk.error before startMessage), so a lone `error`
     // event is a shape Anthropic clients already handle.
+    if (this.upstreamError) {
+      // G3: finish_reason:'error' is the connect layer's truncation terminal — a
+      // payload arrived with no upstream stopReason, so the turn is incomplete.
+      // Anthropic's stop_reason enum has no error value; reporting end_turn would
+      // certify a half answer as final, so fail the stream with the same retryable
+      // shape as the BUG1 guard below (502 → 529 overloaded_error).
+      this.error({
+        status: 502,
+        type: 'upstream_error',
+        message: 'Upstream ended the turn without a stop reason (truncated response)',
+      });
+      return;
+    }
     if (!this.sawTerminalSignal) {
       this.error({
         status: 502,
@@ -2066,7 +2262,7 @@ class AnthropicStreamTranslator {
       error: {
         ...mapped.body.error,
         ...(err?.code ? { code: err.code } : {}),
-        ...(Number.isFinite(Number(err?.retry_after_ms)) ? { retry_after_ms: Number(err.retry_after_ms) } : {}),
+        ...clientResetFields(err?.retry_after_ms),
       },
     });
   }
@@ -2094,7 +2290,7 @@ class AnthropicStreamTranslator {
       return;
     }
     try {
-      this.processChunk(JSON.parse(data));
+      this.prefixBuffer.write(JSON.parse(data), Buffer.byteLength(data));
     } catch (e) {
       log.warn(`Messages SSE parse error: ${e.message}`);
     }
@@ -2141,7 +2337,9 @@ function createCaptureRes(translator, realRes) {
       // CDN/proxy/client decides the connection is dead and bails. Pass
       // heartbeat comments straight through so Claude Code stays happy.
       const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      if (str.startsWith(':') && realRes && !realRes.writableEnded) {
+      // S3-F3: forward only a SINGLE complete comment frame — anything carrying
+      // a second line could smuggle `event:`/`data:` onto the client wire.
+      if (realRes && !realRes.writableEnded && /^:[^\r\n]*\r?\n\r?\n?$/.test(str)) {
         // Keep forwarding the raw comment heartbeat for maximum client compat,
         // AND (F6) emit a typed `event: ping` so strict clients/proxies that only
         // recognize the canonical Anthropic ping event also see liveness.
@@ -2171,6 +2369,10 @@ function createCaptureRes(translator, realRes) {
       // further byte — a terminal frame must not be written into a socket that is
       // already gone. (The chat writer's own wait settles through fire('close').)
       translator.writer.dispose();
+      // Release whatever the SSE framer still retains (a partial line, queued
+      // data bytes): after teardown no push may reach it, and its "flood bytes
+      // unreachable" contract is only enforced if dispose actually runs here.
+      translator.sseFramer?.dispose();
       fire('close');
     },
     on(event, cb) {
@@ -2220,6 +2422,11 @@ export async function handleMessages(body, context = {}) {
     return {
       status: 400,
       body: {
+        // Same envelope as invalidRequest(): every other 400 on this surface
+        // carries the top-level `type:'error'` discriminator Anthropic SDKs
+        // branch on — the signed-replay and tool_choice rejects that ride this
+        // catch must not be the one shape missing it.
+        type: 'error',
         error: {
           message: err.message,
           type: 'invalid_request_error',
@@ -2283,6 +2490,24 @@ export async function handleMessages(body, context = {}) {
       // "so the SDK applies correct retry/backoff" — which is precisely the header.
       return toAnthropicChatError(result);
     }
+    // G3: a truncated turn (payload arrived, upstream named no stopReason) must
+    // not be rendered as a 200 end_turn. `toAnthropicError` maps the 502 to a
+    // retryable 529 overloaded_error, so the SDK backs off instead of accepting a
+    // half answer as final.
+    if (isUnterminatedFinish(result.body)) {
+      return toAnthropicError(502, 'upstream_error',
+        'Upstream ended the turn without a stop reason (truncated response)');
+    }
+    // A06: a Cascade max_wait/stall_warm exit with partial text is the SAME
+    // fault in a different costume — the producer fabricates finish_reason:
+    // 'length' and rides the truncation carrier, so the guard above passes it.
+    // Anthropic's stop_reason enum has no error value; refuse the turn through
+    // the same retryable envelope (502 upstream_error → 529 overloaded_error)
+    // instead of certifying an interrupted answer as a max_tokens cap.
+    if (isCascadeInterrupted(result.body)) {
+      return toAnthropicError(502, 'upstream_error',
+        'Upstream interrupted the turn before completion (partial response)');
+    }
     return { status: 200, body: openAIToAnthropic(result.body, requestedModel, msgId, cachePolicy, body.stop_sequences, toolNameMap) };
   }
 
@@ -2318,7 +2543,7 @@ export async function handleMessages(body, context = {}) {
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel, cachePolicy, inputEstimate, body.stop_sequences, context.reqId, context.conversation_id, toolNameMap);
+      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel, cachePolicy, inputEstimate, body.stop_sequences, context.reqId, context.conversation_id, toolNameMap, openaiBody.tools);
       const captureRes = createCaptureRes(translator, realRes);
 
       // Forward client disconnect so the upstream cascade is cancelled.

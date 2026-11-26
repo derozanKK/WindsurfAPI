@@ -89,7 +89,9 @@ const LEDGER = {
   WINDSURFAPI_LS_PER_PROXY_USER: { tested: true },
   WINDSURFAPI_TOOL_HYGIENE: { tested: true },
   WINDSURFAPI_NLU_RECOVERY: { tested: true },
-  WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT: { tested: true },
+  // WINDSURFAPI_VARIANT_FALLBACK_ON_RATE_LIMIT is default-OFF (release-candidate
+  // owner decision: no silent variant swap), so it leaves the ledger. Its '1'
+  // opt-in path stays tested in test/v2085-auto-fallback.test.js.
   // Both found only after this file's discovery patterns were widened to accept `??`.
   RESPONSE_CACHE_ENABLED: {
     waived: 'off means "do not serve a cached response". No test drives it — the switch '
@@ -140,7 +142,8 @@ const LEDGER = {
       + 'by nlu-negation-and-arg-slot.json but not via the switch. Known gap.',
   },
   WINDSURFAPI_REASONING_DEDUP: { tested: true },
-  WINDSURFAPI_STRICT_MODEL: { tested: true },
+  // WINDSURFAPI_STRICT_MODEL was deleted (release-candidate owner decision):
+  // strict is the only behaviour — no switch left to register.
   // The six below are the runtime-config.js table-driven batch, invisible to the first four
   // discovery patterns because the switch name appears as a STRING in a declaration rather
   // than an `env.NAME` access. All six shipped default-on and unregistered.

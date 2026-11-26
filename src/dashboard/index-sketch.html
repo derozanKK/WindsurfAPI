@@ -1406,28 +1406,6 @@ tbody tr:hover td { background: var(--paper-3); }
   color: currentColor;
 }
 </style>
-<script type="module">
-import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js';
-import { getAuth, signInWithPopup, GoogleAuthProvider, GithubAuthProvider } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-auth.js';
-const _fbApp = initializeApp({
-  apiKey: 'AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY',
-  authDomain: 'exa2-fb170.firebaseapp.com',
-  projectId: 'exa2-fb170',
-});
-const _fbAuth = getAuth(_fbApp);
-window._firebaseOAuth = async function(provider) {
-  const p = provider === 'github' ? new GithubAuthProvider() : new GoogleAuthProvider();
-  if (provider === 'google') p.addScope('email');
-  const result = await signInWithPopup(_fbAuth, p);
-  const idToken = await result.user.getIdToken();
-  return {
-    idToken,
-    refreshToken: result.user.stsTokenManager?.refreshToken || '',
-    email: result.user.email || '',
-    provider,
-  };
-};
-</script>
 </head>
 <body>
 
@@ -1630,22 +1608,12 @@ window._firebaseOAuth = async function(provider) {
     <div class="section">
       <div class="section-head">
         <div>
-          <div class="section-title"><span class="num">1</span><span data-zh="快捷登录（推荐）" data-en="OAuth (recommended)">快捷登录（推荐）</span></div>
-          <div class="section-desc" data-zh="Google / GitHub 直接登录 Windsurf，无需密码" data-en="Sign in with Google or GitHub — no password.">Google / GitHub 直接登录 Windsurf，无需密码</div>
+          <div class="section-title"><span class="num">1</span><span data-zh="Devin 官网" data-en="Devin website">Devin 官网</span></div>
+          <div class="section-desc" data-zh="官网登录用于 Devin。添加到网关需已签发给此集成的凭证。" data-en="Website sign-in is for Devin. To add an account here, use a credential issued for this integration.">官网登录用于 Devin。添加到网关需已签发给此集成的凭证。</div>
         </div>
       </div>
       <div class="frame">
-        <div style="display:flex;gap:14px;flex-wrap:wrap">
-          <button class="btn" onclick="App.oauthLogin('google')" id="oauth-google-btn" style="padding:10px 22px;font-weight:600;gap:10px">
-            <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.9 33.1 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 8 3l5.7-5.7C34 6 29.3 4 24 4 13 4 4 13 4 24s9 20 20 20 20-9 20-20c0-1.3-.2-2.7-.4-3.9z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.5 15.5 18.8 12 24 12c3.1 0 5.8 1.2 8 3l5.7-5.7C34 6 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.6-11.2-8.5l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3c-.8 2.2-2.2 4.1-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.2-2.7-.4-3.9z"/></svg>
-            Google
-          </button>
-          <button class="btn" onclick="App.oauthLogin('github')" id="oauth-github-btn" style="padding:10px 22px;font-weight:600;gap:10px">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.2 11.38.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.08-.73.08-.73 1.2.08 1.84 1.23 1.84 1.23 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.12-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 016.02 0c2.28-1.55 3.29-1.23 3.29-1.23.66 1.66.25 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.8 5.63-5.48 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.21.7.82.58A11.99 11.99 0 0024 12C24 5.37 18.63 0 12 0z"/></svg>
-            GitHub
-          </button>
-        </div>
-        <div id="oauth-status" style="margin-top:14px;font-family:'Caveat',cursive;font-size:18px;color:var(--ink-mute)"></div>
+        <a class="btn" href="https://app.devin.ai/" target="_blank" rel="noopener noreferrer" data-zh="打开 Devin 官网" data-en="Open Devin">打开 Devin 官网</a>
       </div>
     </div>
 
@@ -1653,7 +1621,7 @@ window._firebaseOAuth = async function(provider) {
       <div class="section-head">
         <div>
           <div class="section-title"><span class="num">2</span><span data-zh="邮箱密码登录" data-en="Email + password (registered)">邮箱密码登录</span></div>
-          <div class="section-desc" data-zh="仅限邮箱+密码注册的账号 第三方登录请用上面的按钮；支持单个登录或按「邮箱 密码」格式批量导入" data-en="Email/password registered accounts only — for OAuth use the buttons above. Single login or batch import with «email password» per line.">仅限邮箱+密码注册的账号 第三方登录请用上面的按钮；支持单个登录或按「邮箱 密码」格式批量导入</div>
+          <div class="section-desc" data-zh="仅限邮箱密码账号。支持单个登录或按「邮箱 密码」格式批量导入" data-en="Email/password registered accounts only. Single login or batch import with one email and password per line.">仅限邮箱密码账号。支持单个登录或按「邮箱 密码」格式批量导入</div>
         </div>
       </div>
       <div class="frame">
@@ -1673,19 +1641,20 @@ window._firebaseOAuth = async function(provider) {
       <div class="section-head">
         <div>
           <div class="section-title"><span class="num">3</span><span data-zh="批量导入" data-en="Batch import">批量导入</span></div>
-          <div class="section-desc" data-zh="每行一组：email password [proxy]。proxy 可省略；格式 type://[user:pass@]host:port，例 socks5://127.0.0.1:7890 或 http://u:p@1.2.3.4:8080。空白行忽略。" data-en="One per line: email password [proxy]. Proxy is optional; format type://[user:pass@]host:port (e.g. socks5://127.0.0.1:7890 or http://u:p@1.2.3.4:8080). Blank lines ignored.">每行一组：email password [proxy]。proxy 可省略；格式 type://[user:pass@]host:port，例 socks5://127.0.0.1:7890 或 http://u:p@1.2.3.4:8080。空白行忽略。</div>
+          <div class="section-desc" data-zh="每行粘贴一个 Token 或一组 [代理] 邮箱 密码。也可粘贴 JSON 账号列表。" data-en="Paste one token or [proxy] email password per line, or a JSON list of accounts.">每行粘贴一个 Token 或一组 [代理] 邮箱 密码。也可粘贴 JSON 账号列表。</div>
         </div>
         <button class="btn btn-ghost btn-sm" onclick="App.pasteWindsurfBatch()"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg> paste</button>
       </div>
       <div class="frame">
         <textarea class="textarea input" id="wl-batch-input" rows="6" style="font-family:'JetBrains Mono',monospace;resize:vertical;width:100%" placeholder="alice@example.com  hunter2&#10;bob@example.com  letme1n"></textarea>
         <div class="field-row-actions">
-          <button class="btn btn-primary" id="wl-batch-btn" onclick="App.windsurfLoginBatch()" data-zh="批量导入" data-en="Batch import">批量导入</button>
+          <button type="button" class="btn btn-ghost" id="wl-batch-preview-btn" onclick="App.windsurfLoginBatch(true)" data-zh="预览格式" data-en="Preview formats">预览格式</button>
+          <button class="btn btn-primary" id="wl-batch-btn" onclick="App.windsurfLoginBatch()" data-zh="处理此批次" data-en="Process batch">处理此批次</button>
         </div>
       </div>
     </div>
 
-    <div id="wl-result" class="frame hidden" style="margin-bottom:24px"></div>
+    <div id="wl-result" class="frame hidden" style="margin-bottom:24px" aria-live="polite"></div>
 
     <div class="section">
       <div class="section-head">
@@ -1754,7 +1723,7 @@ window._firebaseOAuth = async function(provider) {
     <div class="section">
       <div class="section-head">
         <div><div class="section-title"><span class="num">+</span><span data-zh="添加账号" data-en="Add an account">添加账号</span></div>
-          <div class="section-desc" data-zh="粘贴 API Key 或 Token（来自 windsurf.com/show-auth-token）" data-en="Paste an API Key or auth token (from windsurf.com/show-auth-token)">粘贴 API Key 或 Token</div>
+          <div class="section-desc" data-zh="粘贴已签发给此集成的 API Key 或 Token" data-en="Paste an API key or auth token issued for this integration">粘贴 API Key 或 Token</div>
         </div>
       </div>
       <div class="frame">
@@ -2203,7 +2172,7 @@ const App = {
     if (loaders[panel]) this[loaders[panel]]();
   },
 
-  async api(method, path, body) {
+  async api(method, path, body, options) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (this.password) opts.headers['X-Dashboard-Password'] = this.password;
     if (body) opts.body = JSON.stringify(body);
@@ -2235,7 +2204,7 @@ const App = {
       }
       return data;
     } catch (e) {
-      this.toast(e.message, 'error');
+      if (options?.notify !== false) this.toast(e.message, 'error');
       return { success: false, error: e.message || 'network_error' };
     }
   },
@@ -2252,10 +2221,29 @@ const App = {
   systemPromptDomId(key) {
     return `sp-${encodeURIComponent(String(key == null ? '' : key)).replace(/%/g, '_')}`;
   },
-  escAttr(s) { return this.esc(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); },
+  // For values interpolated into an inline onclick JS string
+  // (onclick="App.f('...')"): the HTML attribute parser decodes &#39; back to
+  // ' BEFORE the JS engine sees it, so HTML-escaping alone — the previous
+  // escAttr helper composed esc() first, which consumed every ' into &#39;
+  // and left its .replace(/'/g,"\\'") no target — handed the JS string a
+  // live quote. Escape for the JS string instead: the output below contains
+  // no raw ' " < > & at all, which makes it simultaneously safe inside the
+  // double-quoted attribute. Same helper contract as index.html's escJsAttr.
+  escJsAttr(s) {
+    // U+2028 / U+2029 are expressed as escape sequences below — a raw one is
+    // a JS line terminator and inside this regex literal would break the
+    // whole source file.
+    const map = {
+      "\\": "\\\\", "'": "\\'", "\"": "\\\"",
+      "<": "\\x3c", ">": "\\x3e", "&": "\\x26",
+      "\r": "\\r", "\n": "\\n",
+      "\u2028": "\\u2028", "\u2029": "\\u2029",
+    };
+    return String(s == null ? "" : s).replace(/[\\'"<>&\r\n\u2028\u2029]/g, c => map[c]);
+  },
 
   /* ── toast ── */
-  toast(msg, type = 'success') {
+  toast(msg, type = 'success', duration = 3000) {
     const t = document.createElement('div');
     t.className = 'toast ' + type;
     const icon = type === 'success' ? `<svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><polyline points="20 6 9 17 4 12"/></svg>` : type === 'error' ? `<svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>` : 'i';
@@ -2264,7 +2252,7 @@ const App = {
     setTimeout(() => {
       t.style.opacity = '0'; t.style.transform = 'translateX(20px)'; t.style.transition = 'all .2s';
       setTimeout(() => t.remove(), 200);
-    }, 3000);
+    }, duration);
   },
 
   /* ── modal helpers ── */
@@ -2416,6 +2404,9 @@ const App = {
     const uptime = d.uptime ? this.fmtDuration(d.uptime) : '-';
     const ls = d.langServer || {};
     const poolCount = (ls.instances || []).length || (ls.running ? 1 : 0);
+    const cacheHits = d.cache?.hits ?? 0;
+    const cacheLookups = d.cache?.eligibleLookups ?? (cacheHits + (d.cache?.misses ?? 0));
+    const cacheRate = cacheLookups ? (100 * cacheHits / cacheLookups).toFixed(1) + '%' : (I18n.locale === 'en' ? 'No samples' : '暂无样本');
     const totalAccts = d.accounts?.total || 0;
     const navAcct = document.getElementById('nav-accounts-count');
     if (navAcct) navAcct.textContent = totalAccts;
@@ -2425,7 +2416,7 @@ const App = {
       ${this.metric({ label: 'total requests', value: d.totalRequests || 0, sub: `${d.successRate || 0}% success`, kind: 'accent' })}
       ${this.metric({ label: 'uptime', value: uptime, sub: d.startedAt ? new Date(d.startedAt).toLocaleString() : '—', valueSize: 22 })}
       ${this.metric({ label: 'language server', value: ls.running ? 'running' : 'stopped', sub: `${poolCount} inst · :${ls.port || '-'}`, kind: ls.running ? 'good' : 'error', valueSize: 22 })}
-      ${this.metric({ label: 'response cache', value: (d.cache?.hitRate || '0.0') + '%', sub: `${d.cache?.hits || 0} / ${d.cache?.misses || 0} · ${d.cache?.size || 0}/${d.cache?.maxSize || 0}` })}
+      ${this.metric({ label: 'response cache', value: cacheRate, sub: `${cacheHits} / ${cacheLookups} · ${d.cache?.size || 0}/${d.cache?.maxSize || 0}` })}
     `;
     const instances = ls.instances || [];
     if (instances.length > 0) {
@@ -2461,42 +2452,6 @@ const App = {
   /* ── windsurf-login ── */
   loadWindsurfLogin() { this.renderLoginHistory(); },
 
-  isFirebaseOAuthOriginBlocked(err) {
-    const msg = String(err?.message || err || '');
-    return /auth\/(?:requests-from-referer-.*are-blocked|unauthorized-domain)|requests-from-referer-.*are-blocked|unauthorized-domain/i.test(msg);
-  },
-
-  async oauthLogin(provider) {
-    const btn = document.getElementById(`oauth-${provider}-btn`);
-    const status = document.getElementById('oauth-status');
-    const label = provider === 'google' ? 'Google' : 'GitHub';
-    if (btn) btn.disabled = true;
-    status.textContent = `signing in via ${label} …`;
-    status.style.color = 'var(--ink-mute)';
-    try {
-      if (!window._firebaseOAuth) throw new Error('firebase not loaded');
-      const cred = await window._firebaseOAuth(provider);
-      status.textContent = `registering with codeium … (${label})`;
-      const r = await this.api('POST', '/oauth-login', { idToken: cred.idToken, refreshToken: cred.refreshToken, email: cred.email, provider: cred.provider, autoAdd: true });
-      if (r.error) throw new Error(r.error);
-      status.style.color = 'var(--good)';
-      status.innerHTML = `<svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><polyline points="20 6 9 17 4 12"/></svg> logged in as ${r.email || label}`;
-      this.toast(`${label} login OK`, 'success');
-      this.loadAccounts();
-      this.pushLoginHistory({ time: new Date().toISOString(), email: r.email || label, proxy: 'direct', status: 'success', method: label });
-    } catch (err) {
-      const rawError = err?.message || String(err);
-      const originBlocked = this.isFirebaseOAuthOriginBlocked(err);
-      const fallback = I18n.locale === 'en'
-        ? `${label} OAuth is blocked for this dashboard origin by Firebase. Use Auth Token from windsurf.com/show-auth-token and add it in Account Management.`
-        : `${label} OAuth 被 Firebase 拒绝了当前 Dashboard 来源。请从 windsurf.com/show-auth-token 复制 Auth Token 后在账号管理里添加。`;
-      const message = originBlocked ? fallback : rawError;
-      status.style.color = 'var(--error)';
-      status.innerHTML = `<svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg> ${this.esc(message)}`;
-      this.toast(originBlocked ? message : `${label} login failed: ${rawError}`, 'error');
-    } finally { if (btn) btn.disabled = false; }
-  },
-
   getWindsurfLoginProxy() {
     const proxyHost = document.getElementById('wl-proxy-host').value.trim();
     return proxyHost ? {
@@ -2527,15 +2482,15 @@ const App = {
   getWindsurfLoginFailActions(r, email) {
     if (!r.isAuthFail) return '';
     const inlineId = 'inline-token-' + Math.random().toString(36).slice(2, 8);
-    const emailAttr = this.esc(email || r.email || '');
+    // The address lands inside an inline onclick JS string below — esc() is
+    // the wrong context (its &#39; decodes back to a live quote).
+    const emailAttr = this.escJsAttr(email || r.email || '');
     const en = I18n.locale === 'en';
     const t = {
       tryOther: en ? 'Try another way' : '换种方式登录',
-      google: en ? 'Sign in with Google' : 'Google 登录',
-      github: en ? 'Sign in with GitHub' : 'GitHub 登录',
-      title: en ? 'Or paste Auth Token directly (recommended for OAuth-only accounts)' : '或者直接粘贴 Auth Token（推荐 OAuth-only 账号用这个）',
-      desc: en ? 'Click the button to open windsurf.com signin page, copy the token shown after login, paste it back here.' : '点按钮打开 windsurf.com 登录页，复制登录完成后显示的 token，粘回这里。',
-      open: en ? 'Open windsurf.com Token' : '打开 windsurf.com 拿 Token',
+      portal: en ? 'Open Devin' : '打开 Devin 官网',
+      title: en ? 'Paste an existing credential' : '粘贴已有凭证',
+      desc: en ? 'Use a credential issued for this gateway integration.' : '请使用已签发给此网关集成的凭证。',
       placeholder: en ? 'Paste Auth Token here…' : '粘贴 Auth Token …',
       add: en ? 'Add via Token' : '用 Token 添加',
     };
@@ -2543,31 +2498,17 @@ const App = {
       <div style="margin-top:14px;padding:14px;background:var(--paper-2,rgba(0,0,0,.03));border-radius:8px;border-left:3px solid var(--accent,#c89c5c)">
         <div style="font-weight:600;margin-bottom:8px">${t.tryOther}</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
-          <button class="btn btn-sm" style="background:#4285F4;color:#fff" onclick="App.oauthLogin('google')">${t.google}</button>
-          <button class="btn btn-sm" style="background:#24292e;color:#fff" onclick="App.oauthLogin('github')">${t.github}</button>
+          <a class="btn btn-sm" href="https://app.devin.ai/" target="_blank" rel="noopener noreferrer">${t.portal}</a>
         </div>
         <div style="border-top:1px dashed var(--ink-mute,#999);padding-top:12px">
           <div style="font-weight:600;margin-bottom:6px">${t.title}</div>
           <div class="text-sm text-mute" style="margin-bottom:10px">${t.desc}</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-            <button class="btn btn-sm btn-ghost" onclick="App.openWindsurfTokenUrl('${inlineId}')">${t.open}</button>
-            <input id="${inlineId}" type="text" class="input" style="flex:1;min-width:240px" placeholder="${t.placeholder}">
+            <input id="${inlineId}" type="password" autocomplete="off" spellcheck="false" class="input" style="flex:1;min-width:240px" placeholder="${t.placeholder}">
             <button class="btn btn-sm btn-primary" onclick="App.addAccountFromInlineToken('${inlineId}','${emailAttr}')">${t.add}</button>
           </div>
         </div>
       </div>`;
-  },
-
-  openWindsurfTokenUrl(inputId) {
-    // Editor backup-token signin URL extracted from real Windsurf editor 2.0.67
-    // (extension.js getLoginUrl with forceShowAuthToken:true). The public client_id
-    // is the canonical Windsurf editor identifier.
-    const state = (crypto.getRandomValues
-      ? Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('')
-      : Math.random().toString(36).slice(2));
-    const url = 'https://windsurf.com/windsurf/signin?response_type=token&client_id=3GUryQ7ldAeKEuD2obYnppsnmj58eP5u&redirect_uri=show-auth-token&state=' + state + '&prompt=login&redirect_parameters_type=query&workflow=';
-    window.open(url, '_blank');
-    setTimeout(() => document.getElementById(inputId)?.focus(), 100);
   },
 
   async addAccountFromInlineToken(inputId, label) {
@@ -2671,29 +2612,93 @@ const App = {
     } catch (err) { this.toast('clipboard error: ' + err.message, 'error'); }
   },
 
-  async windsurfLoginBatch() {
+  batchImportMessage(code) {
+    const english = I18n.locale === 'en';
+    const messages = {
+      email_password: ['Email and password', '邮箱和密码'],
+      token: ['Token', 'Token'],
+      api_key: ['API key', 'API Key'],
+      added: ['Added to pool', '已加入账号池'],
+      existing: ['Already in pool', '已在账号池'],
+      login_only: ['Signed in — not added', '登录成功，未加入账号池'],
+      ERR_AUTO_ADD_DISABLED: ['Adding to the pool is off', '未启用加入账号池'],
+      ERR_FORMAT_INVALID: ['Unrecognized input', '无法识别的输入'],
+      ERR_UNSUPPORTED_IMPORT_ITEM: ['Unrecognized input', '无法识别的输入'],
+      ERR_PROXY_FORMAT_INVALID: ['Invalid proxy format', '代理格式错误'],
+      ERR_PROXY_PRIVATE_IP: ['Proxy host rejected', '代理地址被拒绝'],
+      ERR_PROXY_PRIVATE_HOST: ['Proxy host rejected', '代理地址被拒绝'],
+      ERR_AUTH1_NOT_A_POOL_KEY: ['Auth1 cannot be used as a pool key', 'Auth1 无法用作账号池密钥'],
+      ERR_JSON_INVALID: ['Invalid JSON', 'JSON 格式错误'],
+      ERR_NO_VALID_LINES: ['No input entries found', '没有可处理的输入项'],
+      ERR_LOGIN_FAILED: ['Sign-in failed', '登录失败'],
+    };
+    const copy = Object.hasOwn(messages, code) ? messages[code] : ['Import failed', '导入失败'];
+    return copy[english ? 0 : 1];
+  },
+
+  batchImportSuccess(disposition) {
+    if (['added', 'existing', 'login_only'].includes(disposition)) return this.batchImportMessage(disposition);
+    return I18n.locale === 'en' ? 'Success' : '成功';
+  },
+
+  batchImportPosition(mode, line) {
+    if (!Number.isInteger(line) || line < 1) return '—';
+    return I18n.locale === 'en'
+      ? `${mode === 'json' ? 'Item' : 'Line'} ${line}`
+      : `第 ${line} ${mode === 'json' ? '项' : '行'}`;
+  },
+
+  async windsurfLoginBatch(preview = false) {
     const input = document.getElementById('wl-batch-input').value;
     if (!input.trim()) return this.toast('paste accounts first', 'error');
     const autoAdd = document.getElementById('wl-auto-add').checked;
+    const previewOnly = preview === true;
     const btn = document.getElementById('wl-batch-btn');
-    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> importing …';
+    const previewBtn = document.getElementById('wl-batch-preview-btn');
+    const english = I18n.locale === 'en';
+    btn.disabled = previewBtn.disabled = true;
     try {
-      const r = await this.api('POST', '/batch-import', { text: input, autoAdd });
+      const route = previewOnly ? '/batch-import/preview' : '/batch-import';
+      const request = previewOnly ? { text: input } : { text: input, autoAdd };
+      const r = await this.api('POST', route, request);
       if (!r.success || !Array.isArray(r.results)) {
-        this.toast(r.error || 'batch failed', 'error'); return;
+        this.toast(this.batchImportMessage(r.error), 'error');
+        return;
       }
-      this.showWLResult(`<div class="anno" style="font-size:20px">batch · ${r.successCount || 0} ok / ${r.failCount || 0} fail</div>
+      const position = line => this.batchImportPosition(r.mode, line);
+      if (previewOnly || r.preview === true) {
+        const note = english ? 'Format check only. No sign-ins were attempted and no accounts were changed.' : '仅检查格式。未尝试登录，未改动账号。';
+        this.showWLResult(`<div class="anno" style="font-size:20px">${note}</div>
+          <ul class="text-sm">${r.results.map(row => `<li>${this.esc(position(row.lineNumber))} · ${this.esc(this.batchImportMessage(row.error || row.importKind))}</li>`).join('')}</ul>`);
+        return;
+      }
+      const skipped = english ? 'Skipped' : '跳过';
+      const failed = english ? 'Failed' : '失败';
+      const summary = english
+        ? `${r.successCount} successful · ${r.skippedCount} skipped · ${r.failCount} failed`
+        : `成功 ${r.successCount} · 跳过 ${r.skippedCount} · 失败 ${r.failCount}`;
+      this.showWLResult(`<div class="anno" style="font-size:20px">${summary}</div>
         <div class="table-wrap" style="margin-top:12px"><table>
-          <thead><tr><th>email</th><th>status</th><th>note</th></tr></thead>
-          <tbody>${r.results.map(x => `<tr><td>${this.esc(x.email || '-')}</td>
-            <td><span class="badge ${x.success ? 'active' : 'error'}">${x.success ? 'ok' : 'fail'}</span></td>
-            <td class="text-sm">${x.success ? `<code class="break-all">${this.esc(x.apiKey_masked || x.apiKey?.slice(0,16) + '…' || '-')}</code>` : `<span style="color:var(--error)">${this.esc(x.error || 'unknown')}</span>`}</td></tr>`).join('')}</tbody>
+          <thead><tr><th>${english ? 'Input' : '输入'}</th><th>${english ? 'Status' : '状态'}</th><th>${english ? 'Note' : '说明'}</th></tr></thead>
+          <tbody>${r.results.map(x => `<tr><td>${this.esc(position(x.lineNumber))}${x.importKind === 'email_password' && x.email ? ` · ${this.esc(x.email)}` : ''}</td>
+            <td><span class="badge ${x.success ? 'active' : (x.skipped ? 'warn' : 'error')}">${x.success ? this.batchImportSuccess(x.poolDisposition) : (x.skipped ? skipped : failed)}</span></td>
+            <td class="text-sm">${x.success ? this.esc(x.account?.id || '—') : this.esc(this.batchImportMessage(x.error))}</td></tr>`).join('')}</tbody>
         </table></div>`);
-      this.pushLoginHistoryEntries(r.results.map(x => ({ time: new Date().toISOString(), email: x.email, proxy: 'batch', status: x.success ? 'success' : 'error: ' + (x.error || 'unknown'), apiKey: x.success ? x.apiKey_masked : undefined })));
-      this.toast(`batch · ${r.successCount || 0} ok / ${r.failCount || 0} fail`);
-      if ((r.successCount || 0) > 0) { this.loadAccounts(); document.getElementById('wl-batch-input').value = ''; }
-    } catch (err) { this.toast(err.message, 'error'); }
-    finally { btn.disabled = false; btn.textContent = '批量导入'; }
+      this.pushLoginHistoryEntries(r.results.map(x => ({
+        time: new Date().toISOString(),
+        email: x.importKind === 'email_password' && x.email ? x.email : position(x.lineNumber),
+        proxy: 'batch',
+        status: x.success ? 'success' : `${x.skipped ? 'skipped' : 'error'}: ${x.error || 'ERR_IMPORT_ITEM_FAILED'}`,
+        poolDisposition: x.poolDisposition,
+      })));
+      this.toast(summary);
+      if ((r.successCount || 0) > 0) {
+        this.loadAccounts();
+        const field = document.getElementById('wl-batch-input');
+        if (r.results.every(item => item.success) && field.value === input) field.value = '';
+      }
+    } catch (err) { this.toast(this.batchImportMessage(err.message), 'error'); }
+    finally { btn.disabled = previewBtn.disabled = false; }
   },
 
   renderLoginHistory() {
@@ -2701,10 +2706,12 @@ const App = {
     if (!tbody) return;
     tbody.innerHTML = this.loginHistory.map((h, i) => {
       const ok = h.status === 'success';
+      const skipped = String(h.status || '').startsWith('skipped: ');
+      const error = String(h.status || '').replace(/^(skipped|error): /, '');
       return `<tr>
         <td class="text-sm nowrap">${new Date(h.time).toLocaleString()}</td>
         <td><span style="display:inline-flex;align-items:center;gap:8px"><span class="avatar-letter">${this.esc((h.email || '?')[0].toUpperCase())}</span>${this.esc(h.email)}</span></td>
-        <td><span class="badge ${ok ? 'active' : 'error'}">${ok ? 'ok' : 'fail'}</span>${!ok ? `<div class="text-xs" style="color:var(--error);margin-top:3px">${this.esc((h.status||'').replace('error: ',''))}</div>` : ''}</td>
+        <td><span class="badge ${ok ? 'active' : (skipped ? 'warn' : 'error')}">${ok ? this.batchImportSuccess(h.poolDisposition) : (skipped ? 'skipped' : 'fail')}</span>${!ok ? `<div class="text-xs" style="color:var(--${skipped ? 'warn' : 'error'});margin-top:3px">${this.esc(h.proxy === 'batch' ? this.batchImportMessage(error) : error)}</div>` : ''}</td>
         <td class="text-sm">${this.esc(h.proxy || '-')}</td>
         <td><button class="btn btn-ghost btn-xs" onclick="App.removeLoginHistory(${i})">×</button></td>
       </tr>`;
@@ -2777,7 +2784,7 @@ const App = {
       const blockedCount = (a.blockedModels || []).length;
       const availCount = tierModels.length - blockedCount;
       const capsHtml = tierModels.length
-        ? `<button class="btn btn-ghost btn-xs" onclick="App.openBlockedModal('${this.escAttr(a.id)}')" title="edit">
+        ? `<button class="btn btn-ghost btn-xs" onclick="App.openBlockedModal('${this.escJsAttr(a.id)}')" title="edit">
              <span style="color:var(--good);font-weight:600">${availCount}</span><span class="text-mute">/${tierModels.length}</span>
              ${blockedCount > 0 ? `<span class="badge warn" style="margin-left:4px">−${blockedCount}</span>` : ''}
            </button>`
@@ -2812,25 +2819,28 @@ const App = {
         creditCell = `<div style="min-width:130px"><div class="text-xs" style="margin-bottom:3px"><b>${this.esc(planName.slice(0,12))}</b> <span class="text-mute">${fetchedAgo}</span></div>${renderBar('D', cr.dailyPercent)}${renderBar('W', cr.weeklyPercent)}</div>`;
       }
       const isExpanded = this._expandedAccounts.has(a.id);
+      const catalog = a.connectCatalog;
+      const catalogText = catalog?.state === 'observed' ? 'Connect catalog observed'
+        : catalog?.state === 'stale' ? 'Connect catalog stale' : 'Connect catalog unverified';
       return `<tr${isExpanded ? ' class="expanded"' : ''}>
-        <td><button class="expand-chev ${isExpanded ? 'open' : ''}" onclick="App.toggleAccountDetail('${this.escAttr(a.id)}')"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><polyline points="9 18 15 12 9 6"/></svg></button><code>${this.esc((a.id||'').slice(0,12))}</code></td>
+        <td><button class="expand-chev ${isExpanded ? 'open' : ''}" onclick="App.toggleAccountDetail('${this.escJsAttr(a.id)}')"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><polyline points="9 18 15 12 9 6"/></svg></button><code>${this.esc((a.id||'').slice(0,12))}</code></td>
         <td>${this.esc(a.email)}</td>
-        <td><span class="tier ${this.esc(tier)}" onclick="App.overrideTier('${this.escAttr(a.id)}','${this.escAttr(tier)}')">${tierLabel[tier] || this.esc(tier)}${a.tierManual ? ' ' + `<svg class="ic" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>` : ''}</span></td>
+        <td><span class="tier ${this.esc(tier)}" onclick="App.overrideTier('${this.escJsAttr(a.id)}','${this.escJsAttr(tier)}')">${tierLabel[tier] || this.esc(tier)}${a.tierManual ? ' ' + `<svg class="ic" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>` : ''}</span></td>
         <td>${rpmCell}</td>
         <td>${creditCell}</td>
-        <td>${capsHtml}</td>
+        <td>${capsHtml}${catalog ? `<div class="text-xs text-mute">${this.esc(catalogText)}</div>` : ''}</td>
         <td><span class="badge ${a.status}">${a.status}</span>${rateLimitBadge}</td>
         <td style="color:${a.errorCount > 0 ? 'var(--error)' : 'inherit'};font-family:'JetBrains Mono',monospace">${a.errorCount}</td>
         <td class="text-sm nowrap">${a.lastUsed ? new Date(a.lastUsed).toLocaleString() : '—'}</td>
-        <td class="nowrap"><code title="reveal & copy" style="cursor:pointer" onclick="App.revealAndCopyKey('${this.escAttr(a.id)}')">${this.esc(a.apiKey_masked || a.id || '')}</code></td>
+        <td class="nowrap"><code title="reveal & copy" style="cursor:pointer" onclick="App.revealAndCopyKey('${this.escJsAttr(a.id)}')">${this.esc(a.apiKey_masked || a.id || '')}</code></td>
         <td class="nowrap"><div class="btn-group">
-          <button class="btn btn-ghost btn-xs" onclick="App.probeAccount('${this.escAttr(a.id)}')">probe</button>
-          <button class="btn btn-ghost btn-xs" onclick="App.refreshCredits('${this.escAttr(a.id)}')"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
+          <button class="btn btn-ghost btn-xs" onclick="App.probeAccount('${this.escJsAttr(a.id)}')">probe</button>
+          <button class="btn btn-ghost btn-xs" onclick="App.refreshCredits('${this.escJsAttr(a.id)}')"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-2px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
           ${a.status === 'active'
-            ? `<button class="btn btn-ghost btn-xs" onclick="App.toggleAccount('${this.escAttr(a.id)}','disabled')">disable</button>`
-            : `<button class="btn btn-good btn-xs" onclick="App.toggleAccount('${this.escAttr(a.id)}','active')">enable</button>`}
-          <button class="btn btn-ghost btn-xs" onclick="App.resetErrors('${this.escAttr(a.id)}')">reset</button>
-          <button class="btn btn-ghost btn-xs" style="color:var(--error)" onclick="App.deleteAccount('${this.escAttr(a.id)}')">×</button>
+            ? `<button class="btn btn-ghost btn-xs" onclick="App.toggleAccount('${this.escJsAttr(a.id)}','disabled')">disable</button>`
+            : `<button class="btn btn-good btn-xs" onclick="App.toggleAccount('${this.escJsAttr(a.id)}','active')">enable</button>`}
+          <button class="btn btn-ghost btn-xs" onclick="App.resetErrors('${this.escJsAttr(a.id)}')">reset</button>
+          <button class="btn btn-ghost btn-xs" style="color:var(--error)" onclick="App.deleteAccount('${this.escJsAttr(a.id)}')">×</button>
         </div></td>
       </tr>${isExpanded ? `<tr class="detail-row"><td colspan="11">${this.renderAccountDetail(a)}</td></tr>` : ''}`;
     }).join('') || `<tr class="empty-row"><td colspan="11">no accounts yet · paste a key above ↑ or grab one from /windsurf-login</td></tr>`;
@@ -2910,7 +2920,7 @@ const App = {
         </div>
 
         <div class="detail-card" style="grid-column:1/-1">
-          <div class="detail-card-head"><span class="num-circle">M</span>models <span class="text-mute text-xs" style="font-style:normal;font-family:'JetBrains Mono',monospace">${availCount} / ${tierModels.length} available${blocked.size > 0 ? ` · ${blocked.size} blocked` : ''}</span><div style="margin-left:auto"><button class="btn btn-ghost btn-xs" onclick="App.openBlockedModal('${this.escAttr(a.id)}')">edit</button></div></div>
+          <div class="detail-card-head"><span class="num-circle">M</span>models <span class="text-mute text-xs" style="font-style:normal;font-family:'JetBrains Mono',monospace">${availCount} / ${tierModels.length} available${blocked.size > 0 ? ` · ${blocked.size} blocked` : ''}</span><div style="margin-left:auto"><button class="btn btn-ghost btn-xs" onclick="App.openBlockedModal('${this.escJsAttr(a.id)}')">edit</button></div></div>
           ${tierModels.length === 0 ? `<div class="text-mute italic" style="padding:6px 0">no allowed models — run probe</div>` : Object.entries(groups).map(([p, ms]) => {
             ms.sort((x,y) => (x.credit||0)-(y.credit||0));
             const blockedIn = ms.filter(m => blocked.has(m.id)).length;
@@ -2958,8 +2968,25 @@ const App = {
 
   async refreshCredits(id) { try { const r = await this.api('POST', `/accounts/${id}/refresh-credits`, {}); if (r.ok) { this.toast('credits refreshed'); this.loadAccounts(); } else this.toast(r.error || 'fail', 'error'); } catch (e) { this.toast(e.message, 'error'); } },
   async refreshAllCredits() { this.toast('refreshing all …', 'info'); try { const r = await this.api('POST', '/accounts/refresh-credits', {}); if (r.success) { this.toast(`${(r.results||[]).filter(x=>x.ok).length} refreshed`); this.loadAccounts(); } } catch (e) { this.toast(e.message, 'error'); } },
-  async probeAll() { this.toast('probing all …', 'info'); try { const r = await this.api('POST', '/accounts/probe-all', {}); if (r.success) { this.toast('probe done'); this.loadAccounts(); } } catch (e) { this.toast(e.message, 'error'); } },
-  async probeAccount(id) { this.toast('probing …', 'info'); try { const r = await this.api('POST', `/accounts/${id}/probe`, {}); if (r.success) { this.toast(`tier: ${r.tier}`); this.loadAccounts(); } } catch (e) { this.toast(e.message, 'error'); } },
+  async probeAll() {
+    const result = await this.api('POST', '/accounts/probe-all', {}, { notify: false });
+    if (!result?.success) return this.toast('Account checks failed', 'error');
+    const ok = Number(result.okCount) || 0;
+    const fail = Number(result.failCount) || 0;
+    const skipped = Number(result.skippedCount) || 0;
+    this.toast(`${ok} checked · ${fail} failed · ${skipped} skipped`, fail ? 'error' : ok ? 'success' : 'info');
+    this.loadAccounts();
+  },
+  async probeAccount(id) {
+    const result = await this.api('POST', `/accounts/${encodeURIComponent(id)}/probe`, {}, { notify: false });
+    if (result?.skipped) {
+      const cold = result.reason === 'can_start';
+      return this.toast(cold ? 'Check skipped. The language service has not started.' : 'Check skipped. Try again when the service is idle.', 'info');
+    }
+    if (!result?.success) return this.toast('Account check failed', 'error');
+    this.toast(`Tier checked: ${result.tier || 'unknown'}`);
+    this.loadAccounts();
+  },
 
   async openBlockedModal(id) {
     try {
@@ -3099,7 +3126,7 @@ const App = {
     const current = this.modelAccessConfig.list;
     const cont = document.getElementById('model-list-current');
     cont.innerHTML = current.length
-      ? `<div class="model-chips">${current.map(m => `<span class="model-chip selected">${this.esc(m)}<span class="remove" onclick="App.removeModelFromList('${this.escAttr(m)}')">×</span></span>`).join('')}</div>`
+      ? `<div class="model-chips">${current.map(m => `<span class="model-chip selected">${this.esc(m)}<span class="remove" onclick="App.removeModelFromList('${this.escJsAttr(m)}')">×</span></span>`).join('')}</div>`
       : `<div class="text-xs text-dim italic">empty</div>`;
     this.filterModels();
   },
@@ -3116,17 +3143,95 @@ const App = {
     document.getElementById('model-chips-container').innerHTML = Object.entries(grouped).map(([p, ms]) => `
       <div class="provider-group">
         <div class="provider-label">${this.esc(p)}</div>
-        <div class="model-chips">${ms.map(m => `<span class="model-chip ${list.includes(m.id) ? 'selected' : ''}" onclick="App.toggleModelInList('${this.escAttr(m.id)}')">${this.esc(m.name)}</span>`).join('')}</div>
+        <div class="model-chips">${ms.map(m => `<span class="model-chip ${list.includes(m.id) ? 'selected' : ''}" onclick="App.toggleModelInList('${this.escJsAttr(m.id)}')">${this.esc(m.name)}</span>`).join('')}</div>
       </div>`).join('') || '<div class="text-mute italic">no matches</div>';
   },
-  async setModelMode(mode) { await this.api('PUT', '/model-access', { mode }); this.modelAccessConfig.mode = mode; this.updateModelListUI(); this.toast('mode updated'); },
-  async toggleModelInList(id) {
-    const idx = this.modelAccessConfig.list.indexOf(id);
-    if (idx > -1) { await this.api('POST', '/model-access/remove', { model: id }); this.modelAccessConfig.list.splice(idx, 1); }
-    else { await this.api('POST', '/model-access/add', { model: id }); this.modelAccessConfig.list.push(id); }
+  // A receipt is the only evidence that a write was accepted. An empty 200
+  // body decoded to {}, a transport failure shape, or a self-contradictory
+  // envelope ({success:true,applied:false}) must never count as success and
+  // must never install a config the server did not vouch for.
+  modelAccessReceipt(r) {
+    const durabilities = ['durable', 'unconfirmed', 'unchanged', 'not-applied'];
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return null;
+    if (typeof r.success !== 'boolean' || typeof r.applied !== 'boolean') return null;
+    if (r.success !== r.applied) return null;
+    if (!durabilities.includes(r.durability)) return null;
+    if (r.applied && r.durability === 'not-applied') return null;
+    if (!r.applied && r.durability !== 'not-applied') return null;
+    const cfg = r.config;
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)
+        || !['all', 'allowlist', 'blocklist'].includes(cfg.mode)
+        || !Array.isArray(cfg.list) || typeof cfg.defaultModel !== 'string') return null;
+    return r;
+  },
+  // A real radio click changes the control BEFORE onchange runs, so a failure
+  // must put it back on the last accepted policy.
+  restoreModelAccessControls() {
+    const cfg = this.modelAccessConfig || { mode: 'all', list: [], defaultModel: '' };
+    const radio = document.querySelector(`input[name="model-mode"][value="${cfg.mode}"]`);
+    if (radio) radio.checked = true;
     this.updateModelListUI();
   },
-  async removeModelFromList(id) { await this.api('POST', '/model-access/remove', { model: id }); this.modelAccessConfig.list = this.modelAccessConfig.list.filter(x => x !== id); this.updateModelListUI(); },
+  // The server is authoritative for model access. Apply the snapshot it
+  // returns (the still-active one after a failure) instead of keeping an
+  // optimistic local edit the server rejected.
+  applyModelAccessResponse(r) {
+    const cfg = r?.config;
+    if (!cfg || typeof cfg !== 'object' || typeof cfg.mode !== 'string') return false;
+    this.modelAccessConfig = {
+      mode: cfg.mode,
+      list: Array.isArray(cfg.list) ? [...cfg.list] : [],
+      // Sketch has no default-model field, but the snapshot stays complete so
+      // state comparisons and later requests agree with the server.
+      defaultModel: typeof cfg.defaultModel === 'string' ? cfg.defaultModel : (this.modelAccessConfig.defaultModel || ''),
+    };
+    const radio = document.querySelector(`input[name="model-mode"][value="${cfg.mode}"]`);
+    if (radio) radio.checked = true;
+    this.updateModelListUI();
+    return true;
+  },
+  // Publication is separate from HTTP success: 'unconfirmed' means the policy
+  // is live and visible on disk but its directory entry was not proven.
+  modelAccessOutcome(r, successText) {
+    const en = I18n.locale === 'en';
+    const receipt = this.modelAccessReceipt(r);
+    if (!receipt) {
+      this.restoreModelAccessControls();
+      const error = typeof r?.error === 'string' ? r.error : (r?.error?.message || 'ERR_MODEL_ACCESS_INVALID_RECEIPT');
+      this.toast(en ? `Save failed: ${error}` : `保存失败：${error}`, 'error');
+      return false;
+    }
+    if (!receipt.applied) {
+      // Coherent rejection: the server's authoritative unchanged snapshot.
+      this.applyModelAccessResponse(receipt);
+      const error = typeof receipt.error === 'string' ? receipt.error : (receipt.error?.message || 'ERR_MODEL_ACCESS_NOT_APPLIED');
+      this.toast(en ? `Save failed: ${error}` : `保存失败：${error}`, 'error');
+      return false;
+    }
+    this.applyModelAccessResponse(receipt);
+    const warnings = Array.isArray(receipt.warnings) ? receipt.warnings : [];
+    if (receipt.durability === 'unconfirmed' || warnings.includes('ERR_MODEL_ACCESS_DURABILITY_UNCONFIRMED')) {
+      this.toast(en
+        ? 'Policy updated and active, but a safe disk save could not be confirmed. Check server storage.'
+        : '策略已更新并生效，但尚未确认已安全写入磁盘。请检查服务器存储。', 'error', 8000);
+      return true;
+    }
+    if (successText) this.toast(successText);
+    return true;
+  },
+  async setModelMode(mode) {
+    const r = await this.api('PUT', '/model-access', { mode });
+    this.modelAccessOutcome(r, 'mode updated');
+  },
+  async toggleModelInList(id) {
+    const inList = this.modelAccessConfig.list.includes(id);
+    const r = await this.api('POST', inList ? '/model-access/remove' : '/model-access/add', { model: id });
+    this.modelAccessOutcome(r);
+  },
+  async removeModelFromList(id) {
+    const r = await this.api('POST', '/model-access/remove', { model: id });
+    this.modelAccessOutcome(r);
+  },
 
   /* ── proxy ── */
   async loadProxy() {
@@ -3154,7 +3259,7 @@ const App = {
       return `<tr>
         <td>${this.esc(a.email)} <code class="text-xs">${this.esc(a.id)}</code></td>
         <td>${p ? `<code>${this.esc(p.type)}://${p.username ? this.esc(p.username) + '@' : ''}${this.esc(p.host)}:${this.esc(String(p.port))}</code>` : `<span class="text-sm text-dim italic">none</span>`}</td>
-        <td class="nowrap"><div class="btn-group"><button class="btn btn-ghost btn-xs" onclick="App.editAccountProxy('${this.escAttr(a.id)}','${this.escAttr(a.email)}')">configure</button>${p ? `<button class="btn btn-ghost btn-xs" style="color:var(--error)" onclick="App.clearAccountProxy('${this.escAttr(a.id)}')">clear</button>` : ''}</div></td>
+        <td class="nowrap"><div class="btn-group"><button class="btn btn-ghost btn-xs" onclick="App.editAccountProxy('${this.escJsAttr(a.id)}','${this.escJsAttr(a.email)}')">configure</button>${p ? `<button class="btn btn-ghost btn-xs" style="color:var(--error)" onclick="App.clearAccountProxy('${this.escJsAttr(a.id)}')">clear</button>` : ''}</div></td>
       </tr>`;
     }).join('') || `<tr class="empty-row"><td colspan="3">no accounts yet</td></tr>`;
   },
@@ -3381,8 +3486,8 @@ const App = {
         <td style="color:${(a.errorCount||0) > 0 ? 'var(--error)' : 'inherit'};font-family:'JetBrains Mono',monospace">${a.errorCount || 0}</td>
         <td class="text-sm">${a.lastUsed ? new Date(a.lastUsed).toLocaleString() : '—'}</td>
         <td><div class="btn-group">
-          ${(a.errorCount||0) > 0 ? `<button class="btn btn-ghost btn-xs" onclick="App.resetErrors('${this.escAttr(a.id)}')">reset</button>` : ''}
-          ${a.status === 'error' ? `<button class="btn btn-good btn-xs" onclick="App.toggleAccount('${this.escAttr(a.id)}','active')">enable</button>` : ''}
+          ${(a.errorCount||0) > 0 ? `<button class="btn btn-ghost btn-xs" onclick="App.resetErrors('${this.escJsAttr(a.id)}')">reset</button>` : ''}
+          ${a.status === 'error' ? `<button class="btn btn-good btn-xs" onclick="App.toggleAccount('${this.escJsAttr(a.id)}','active')">enable</button>` : ''}
         </div></td>
       </tr>`;
     }).join('') || `<tr class="empty-row"><td colspan="5">all healthy</td></tr>`;
@@ -3457,18 +3562,57 @@ const App = {
     const label = field === 'apiKey' ? 'API_KEY' : 'Dashboard 密码';
     const okConfirm = confirm(`${label}: ${cleared ? '清除运行时覆盖，回退 .env 值？' : '改完旧值立即失效，要继续吗？'}`);
     if (!okConfirm) return;
+    const en = I18n.locale === 'en';
+    const showSaveFailure = error => this.toast(en ? `Save failed: ${error}` : `保存失败：${error}`, 'error');
     try {
       const r = await this.api('PUT', '/settings/credentials', { [field]: value });
+      // The API wrapper returns failure envelopes as values. Publication is
+      // separate from HTTP success: a warning can describe already-live values.
+      const updatedFlag = field === 'apiKey' ? 'apiKeyUpdated' : 'dashboardPasswordUpdated';
+      const applied = r?.applied === true
+        || (r?.applied !== false && r?.success === true && r?.[updatedFlag] === true);
+      if (!applied) {
+        const error = typeof r?.error === 'string' ? r.error : (r?.error?.message || 'ERR_CREDENTIAL_NOT_APPLIED');
+        showSaveFailure(error);
+        return;
+      }
+
       el.value = '';
-      this.toast(r.success ? 'saved' : '保存失败');
-      if (field === 'dashboardPassword' && !cleared) {
-        sessionStorage.removeItem('dashboard_password');
-        setTimeout(() => location.reload(), 800);
+      const warnings = Array.isArray(r.warnings) ? r.warnings : [];
+      const notices = [];
+      if (r.durability === 'unconfirmed' || warnings.includes('ERR_CREDENTIAL_DURABILITY_UNCONFIRMED')) {
+        notices.push(en
+          ? 'New credentials are active, but a safe disk save could not be confirmed. Keep the new values and check server storage.'
+          : '新凭据已生效，但尚未确认已安全写入磁盘。请保留新值并检查服务器存储。');
+      }
+      if (r.protection === 'failed' || warnings.includes('ERR_CREDENTIAL_PROTECTION_FAILED')) {
+        notices.push(en
+          ? 'New credentials are active, but file access protection could not be confirmed. Check the server configuration file permissions.'
+          : '新凭据已生效，但未能确认文件访问保护。请检查服务器配置文件的权限。');
+      }
+      if (warnings.length && !notices.length) {
+        notices.push(en
+          ? 'New credentials are active, but the server reported a save warning. Check the server before restarting.'
+          : '新凭据已生效，但服务器报告了保存警告。请在重启前检查服务器状态。');
+      }
+      const warningDuration = 8000;
+      if (notices.length) this.toast(notices.join(' '), 'error', warningDuration);
+      else this.toast(en ? 'Saved' : '已保存');
+
+      // Clearing an override may also change the effective password. Invalidate
+      // the same credential store used by login, and stop polls before reload.
+      if (field === 'dashboardPassword') {
+        this.password = null;
+        try { localStorage.removeItem('dp'); } catch {}
+        Object.values(this.pollers || {}).forEach(clearInterval);
+        this.pollers = {};
+        // Let the operator read an applied-with-warning result before re-login.
+        setTimeout(() => location.reload(), notices.length ? warningDuration : 800);
         return;
       }
       this.loadCredentials();
     } catch (e) {
-      this.toast('保存失败: ' + (e.message || ''));
+      showSaveFailure(e.message || '');
     }
   },
   async toggleExperimental(key, val) {
@@ -3498,7 +3642,7 @@ const App = {
       return;
     }
     holder.innerHTML = keys.map(k => {
-      const keyArg = this.escAttr(k);
+      const keyArg = this.escJsAttr(k);
       const promptId = this.systemPromptDomId(k);
       return `
       <div style="border:1px dashed var(--rule-soft);padding:12px">

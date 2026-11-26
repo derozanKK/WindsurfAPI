@@ -59,7 +59,20 @@ function keyHarness({ baseline = false, singleTenant = false, enabled = '1', ali
   const inner = chat.match(/  const reuseOriginalCkey = [\s\S]*?  const ckey = [^\n]+;/)?.[0];
   assert(inner, 'The real inner key-selection statements must be loaded');
   const globals = { process: { env }, computeCacheKey: compute, cacheKey: compute,
-    isCacheEnabled: cache.isCacheEnabled };
+    isCacheEnabled: cache.isCacheEnabled,
+    // The real inner statement (and the real outer wrapper, below) derive the
+    // effective routed identity via chat.js cascadeCacheIdentity. This harness
+    // pins the GATE mechanics (hash-count, scope skip, H-3 capture) and the
+    // identity-less key format against the pinned 014204f cache — both are
+    // identity-neutral, so the routing identity itself is stubbed out here.
+    // Its derivation is behaviorally covered by cache-routing-identity.test.js.
+    cascadeCacheIdentity: () => undefined,
+    // The B1 additions to the real statement: `routingModelKey` is the routed
+    // generation the fresh key describes, `accessFallbackModel` says the
+    // access policy retargeted the request (so the original outer key no
+    // longer describes it). The sandbox pins gate mechanics, not routing, so
+    // both stay inert here.
+    routingModelKey: undefined, accessFallbackModel: false };
   const api = evaluate(singleTenantDeclaration + '\n' + scope + gated +
     '\nfunction innerKey(body, callerKey, context) {\n' + inner + '\nreturn ckey;\n}\n',
     ['cacheKey', 'hasPerUserScope', 'innerKey'], globals);
@@ -130,7 +143,7 @@ test('cache hits, misses, stores and payload bytes stay identical under the exis
   for (const enabled of ['0', '1']) {
     for (const caller of ['api:synthetic', 'session:synthetic']) {
       const pair = [keyHarness({ baseline: true, enabled }), keyHarness({ enabled })];
-      const results = pair.map(h => {
+      const results = pair.map((h, index) => {
         const key = h.cacheKey(body, caller);
         const shareable = h.hasPerUserScope(caller);
         const first = shareable ? h.cache.cacheGet(key) : null;
@@ -138,7 +151,14 @@ test('cache hits, misses, stores and payload bytes stay identical under the exis
         const second = shareable ? h.cache.cacheGet(key) : null;
         const otherKey = h.cacheKey(body, 'session:other');
         const other = h.cache.cacheGet(otherKey);
-        return JSON.stringify({ first, second, other, stats: h.cache.cacheStats() });
+        const stats = h.cache.cacheStats();
+        if (index === 1) {
+          const { eligibleLookups, hitRatePercent, ...legacyStats } = stats;
+          assert.equal(eligibleLookups, stats.hits + stats.misses);
+          assert.equal(hitRatePercent, eligibleLookups ? 100 * stats.hits / eligibleLookups : null);
+          return JSON.stringify({ first, second, other, stats: legacyStats });
+        }
+        return JSON.stringify({ first, second, other, stats });
       });
       assert.equal(results[1], results[0]);
     }
@@ -154,6 +174,7 @@ test('the actual outer wrapper captures the original key before the inner mutate
     ['handleChatCompletions'], {
       cacheKey: h.cacheKey, newTraceId: () => 'trace', traceEnabled: () => false,
       shouldAutoFallback: () => false,
+      cascadeCacheIdentity: () => undefined,
       _handleChatCompletionsInner: async (b, context) => {
         captured = context.__originalCkey;
         b.model = 'mutated-after-key';

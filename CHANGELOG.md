@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="#最近的版本">最近的版本</a> ·
-  <a href="docs/releases/">全部 218 份发布说明</a> ·
+  <a href="docs/releases/">全部 226 份发布说明</a> ·
   <a href="README.md">← 主 README</a>
 </p>
 
@@ -19,9 +19,9 @@
 
 | | |
 |---|---|
-| 发布说明 | **218** 份,v2.0.6 → v3.141.592658（生成：`node scripts/sync-changelog-counts.mjs`；口径 `ls docs/releases/RELEASE_NOTES_*.md \| wc -l`） |
-| git tag | 228 个（生成：`node scripts/sync-changelog-counts.mjs`；口径 `git tag \| wc -l`） |
-| 当前 | **v3.141.592658**(2026-10-30) |
+| 发布说明 | **226** 份,v2.0.6 → v4.0.2（生成：`node scripts/sync-changelog-counts.mjs`；口径 `ls docs/releases/RELEASE_NOTES_*.md \| wc -l`） |
+| git tag | 234 个（生成：`node scripts/sync-changelog-counts.mjs`；口径 `git tag \| wc -l` 减去 `docs/releases/UNPUBLISHED-TAGS.txt` 里本 checkout 存在的未发布 tag，再减去 `package.json` 版本的 tag——本次发布自己的 tag，创建前后都不计数，所以三种 checkout 同值） |
+| 当前 | **v4.0.2** (2026-11-26) |
 | 运行时依赖 | **0** —— 从第一个版本保持到现在 |
 
 ```mermaid
@@ -41,6 +41,81 @@ flowchart LR
 ## 最近的版本
 
 下面是 3.9.x 全系。更早的版本请直接翻 [`docs/releases/`](docs/releases/)。
+
+### [v4.0.2](docs/releases/RELEASE_NOTES_4.0.2.md) · 2026-11-26
+
+- Align the release workflow test with the measured 30-minute job budget.
+- Include the 4.0 account login, request diagnostics and native tool compatibility changes.
+
+### [v4.0.1](docs/releases/RELEASE_NOTES_4.0.1.md) · 2026-11-26
+
+- Publish the 4.0 routing, dashboard diagnostics and local Devin browser sign-in.
+- Allow 30 minutes for the measured full release suite after v4.0.0 exceeded the
+  job's previous 20-minute budget at 673/685 files.
+
+### [v4.0.0](docs/releases/RELEASE_NOTES_4.0.0.md) · 2026-11-22
+
+破坏兼容升主版本：未知模型报错不降级；限流不偷换变体；池级不可用返回不可重试 403；快照刷新至 306 模型；creditMultiplier 只认数字。
+
+### [v3.2.11](docs/releases/RELEASE_NOTES_3.2.11.md) · 2026-11-21
+
+Keeps free-only Connect requests on eligible accounts, fixes dashboard token
+import and request history, and improves ACP, language-server and TLS stream
+lifecycles. Follow the signed upgrade procedure to select this release
+explicitly from the legacy updater.
+
+### [v3.2.10](docs/releases/RELEASE_NOTES_3.2.10.md) · 2026-11-21
+
+Verified credential and model-access publication, direct Connect instruction
+projection, Gemini response ordering, and generation-bound request cleanup.
+The `3.2.10` number sorts below `3.141.592661`. Existing Git-source auto-update
+continues to select the higher reachable tag. Use the signed migration in
+the release notes to select this release explicitly.
+
+### [v3.141.592661](docs/releases/RELEASE_NOTES_3.141.592661.md) · 2026-11-11
+
+首个真正公开发布的修复版（fix release）。`v3.141.592660` 的 tag 公开但 Release/CI 失败、
+零资产：docs guard 的 tag 行写 230，而 `fetch-depth: 0` 的 CI checkout 只有 229，差值正是
+本地冻结、从未 push 的 `v3.141.592659`。本版把 tag 行改为「本 checkout 的 tag 数减去
+`docs/releases/UNPUBLISHED-TAGS.txt` 里本 checkout 存在的未发布 tag，再减去
+`package.json` 版本的 tag（本次发布自己的 tag，创建前后都不计数）」：作者主机
+231−1−1、master CI 229−0−0、Release CI 230−0−1 都得 229；登记册只登记
+`v3.141.592659`（`.592660` 远端可见，不能登记）。同时把
+`test/auth-warning.test.js` 的 SYNTHETIC 旧 blob 收入 history secret scan 基线，恢复
+0 unbaselined。`src/` 与 3.141.592660 逐字节相同（`babafeef`），无运行时变化；全量
+`test:release`、99 spec / 878 mutation sweep、wire 270/270、POSIX 门、HMC 与真实客户端仍
+`[UNVERIFIED]`，见发布说明 §7 与验收附录。
+本版同时是**安全修复版**：两条 **CWE-1333**（event-loop 阻塞）公告 `GHSA-fx5f-49jr-fw6r`
+（身份中和器的二次正则扫描）与 `GHSA-r7v2-3h32-f5g6`（JSON Schema `pattern` 无界求值）
+已于 2026-11-11 发布（`state=published`、CVSS 6.5、致谢 fishfish、`patched_versions` 为
+`>= 3.141.592661`）；修复代码与 `.592660` 同树（`babafeef`），本版推进的是公告里的修复版本指针。
+
+### [v3.141.592660](docs/releases/RELEASE_NOTES_3.141.592660.md) · 2026-11-11
+
+公开发布版（Path B）。内容与 3.141.592659 草稿同树：`babafeef` 的 JSON Schema `pattern`
+50 ms 共享预算 + `valid|invalid|unable` 三态判定，加此前审计波对 `src/` 8 个文件的改动。
+本版只把版本号与发布指针改到 3.141.592660——`v3.141.592659` **从未发布**，它的本地 tag
+冻结在未修复的 `d5519da3` 上，不 push、不删除、不复用。默认路径 wire 对 `v3.141.592658`
+**270/270 逐字节一致**是在 `deeb2539` 上测的（距本树 87 个提交 / 34 个 `src/` 文件），
+**本树未复测**（本机 wire 门 inert，`skipped:1`）——这条对本版是 `[UNVERIFIED]`。
+身份中和器 WA-001/002/003、A4、CTX-01、S03、IMG-01、TRN-01 与 `pattern` 预算的机制见
+发布说明 §1.1–§1.8。本树门禁：docs-guard 47/47、unverified-register 7/7、JSON Schema
+38/38、spec-static `99 spec / 878 mutation` exit 0、secret-scan exit 0、`git diff --check` 0。
+**99 spec / 878 mutation 的全量 sweep 在这棵树上仍未跑（`[UNVERIFIED]`）**，合并与推送之前
+必须在 POSIX 上补跑。
+
+### [v3.141.592659](docs/releases/RELEASE_NOTES_3.141.592659.md) · 2026-11-09（**未发布**，升版为 v3.141.592660）
+
+审计收口补丁版，**默认路径 wire 对 v3.141.592658 270/270 逐字节一致**。身份中和器（`identity-neutralize.js`）从“连续空行上立方增长、能阻塞整个 event-loop”改为有界线性扫描（WA-001，CWE-1333；2,049 B 连续空行 1,140 ms → 2.57 ms，512 KiB 连续空行 >300 s → 26.88 ms），段落边界改用与 `\s` 等价的 24 个空白码元（WA-002，Unicode 分隔符下丢失调用方 `RULE` 的例数 85 → 17，且 17 例全部是设计上全局的 `b-security-line` 形状），`FREEFORM` 只在 apply_patch 描述行内改写（WA-003）；`a4-cli-line` / `a4-catalogue-line` 不再吃掉整行（A4：524,152 B 单行输入 42 B → 524,160 B；catalogue 锚点行无模型 ID 标记时只改短语、有 `claude-`/`model ids`/`fable`/`opus`/`sonnet` 正文时删到行尾）；CTX-01 把有限 `clear_thinking` 与签名回放的冲突改为按顺序判断（只拒绝真正会丢掉签名轮的 keep）；dashboard 写请求在 `readBody` 之前过门（S03）；Cascade 图片提取可取消（IMG-01）且 `</human>`/`</assistant>` 闭合标签在计量/渲染/插入三处统一转义（TRN-01）。release shard **605 文件 / 7,455 测试 / 7,352 pass / 0 fail / 103 skip**，身份 147、CTX 28、Cascade 39、transport 22、docs guard 47、spec 97/863 全绿；Node 22 全量后补实测 **605 文件 / 7,455 测试 / 7,352 pass / 0 fail / 103 skip**（`node22-release-2.log`），mutation sweep 已由 HMC 在 `c4931c40` 完成 **97/97 spec、0 mismatch**（最终树 99 spec 基线重钉与 POSIX 复跑仍 `[UNVERIFIED]`，见发布附录 §7）；托管 CI 与 HMC 部署仍 `[UNVERIFIED]`，逐项见发布附录。
+
+**Post-release hardening + review fixes (2026-11-09/10, still untagged — `c4931c40`, `0aea4ea3`, and the 20-commit review range `04503830`–`4b061af1`; 24 commits total after `e0c5c715`).** User-visible changes on top of the paragraph above:
+
+- **Credential carriers are now surface-scoped (breaking for misused carriers):** `x-api-key` no longer authenticates `/v1/chat/completions`, `/v1/completions` or `/v1/responses` (Bearer only on those surfaces); `x-goog-api-key` and `?key=` work only on `/v1/models` and the Gemini surfaces; Bearer remains valid everywhere; a credential sent only through a mismatched carrier now gets 401. `/v1/messages` 401s use the Anthropic error envelope and Gemini-surface 401s use the Gemini `UNAUTHENTICATED` envelope; compressed request bodies get a per-surface 415 `unsupported_content_encoding` instead of a confusing 400.
+- **Responses:** `include:["reasoning.encrypted_content"]` is emitted and replayed; `text.verbosity` passes through to the chat boundary; custom-tool calls stream `response.custom_tool_call_input.delta`/`.done`; turns closed by `finish_reason:"error"` or an unterminated marker end as `response.failed` (the `error` finish reason is latched over later chunks) with their tool-call items marked `incomplete`, and items still open at `finish()` are sealed `incomplete` inside the failed envelope just like the non-stream path; the responses capture shim now disposes its bounded writer and SSE framer on client disconnect; a replayed signature is dropped when unsigned text shares the turn; blob-only reasoning no longer emits an empty `summary_text.done`.
+- **Gemini:** `googleSearch`, `googleSearchRetrieval`, `codeExecution` and `urlContext` are refused with 400 `unsupported_server_side_tool` — falsy declarations like `{googleSearch:false}` are refused by key presence; unlisted server-side tools (`googleMaps`, `fileSearch`, `computerUse`, `mcpServers`) are dropped with a per-request warn instead of vanishing silently.
+- **Messages:** every `clear_thinking` edit is validated; an absent `keep` resolves per model class (keep-all families vs conservative keep-1, never under-rejecting); `redacted_thinking` counts in the keep window; `{keep:{type:'all'}}` is accepted; a non-string `model` returns 400 and translator-thrown 400s carry `type:'error'`.
+- **Streaming / connect:** concatenated SSE JSON is repaired; the SSE queue byte budget counts line overhead only, so the documented 64 MB frame cap applies again; drain waits count only unacknowledged bytes, the fixed floor is anchored at wait start, and the proportional backlog term is capped at 4 MiB (`MAX_DRAIN_BUDGETED_BYTES`) so a half-open dead client cannot bank unlimited stall time; the history budget measures `messages` plus `tools[]`; new `WINDSURFAPI_MIN_CLIENT_RATE_BPS` (default 8 KiB/s) floors the per-byte backpressure rate; an explicit error stop reason now beats a decodable tool call on all four protocol surfaces; Chat tool names are sanitized and truncation is signalled on every surface.
+- **Identity / client / image:** the catalogue fallback scan is bounded per line (512 KiB single line 3,439 ms → ~21 ms) with a closed `claude-` ID grammar; `</human>`/`</assistant>` closers are escaped in the system prompt prepended to Cascade history; `extractImages` refuses a turn cancelled after its last block; the translator SSE framer is disposed on client disconnect.
 
 ### [v3.141.592658](docs/releases/RELEASE_NOTES_3.141.592658.md) · 2026-10-30
 

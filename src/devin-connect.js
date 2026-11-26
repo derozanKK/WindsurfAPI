@@ -1,3 +1,4 @@
+import { parseGoResetMs } from './reset-hints.js';
 /**
  * DEVIN_CONNECT — direct cloud GetChatMessage adapter (pure HTTP egress).
  *
@@ -44,7 +45,8 @@ import { wrapRequest, wrapEnvelope, StreamingFrameParser, connectHeaders, tryGun
 import { recordSchemaNormalized } from './handlers/cc-compat.js';
 // Observability only, same rationale as recordSchemaNormalized above: the
 // metrics module has no imports of its own, so it cannot create a cycle.
-import { bumpConnect } from './devin-connect-metrics.js';
+import { bumpConnect, CACHE_READ_UNREPORTED } from './devin-connect-metrics.js';
+import { markReportedUsage } from './reported-usage.js';
 // Bounded remote-image fetch (deadline, byte cap, MIME allowlist, per-hop SSRF
 // lookup hook). image.js imports only config/pdf/net-safety/vendor codecs, so this
 // cannot create a cycle back into the connect pipeline.
@@ -167,11 +169,19 @@ function validatedAccountConnectHost(host) {
 // defaults to <cwd>/.wire-dump. Filenames carry a timestamp + model + kind. This
 // is a temporary self-use debug aid, never a served endpoint.
 let _wireSeq = 0;
+let _wireDumpWarned = false;
 function dumpWire(kind, bytes, meta = {}) {
   const wireDump = String(process.env.DEVIN_CONNECT_WIRE_DUMP || '') === '1';
   const traced = String(process.env.WINDSURFAPI_TRACE || '') === '1' && meta.traceId;
   if (!wireDump && !traced) return;
   if (!bytes || !bytes.length) return;
+  // S6-F2: the dumped request protobuf carries the live account session token
+  // (metadata field #3) in cleartext. The dirs are gitignored, but say so once
+  // so an operator who greps a dump later knows what they are holding.
+  if (!_wireDumpWarned) {
+    _wireDumpWarned = true;
+    log.warn('wire-dump/trace active: dumped protobufs carry the live account session token — treat .wire-dump/.trace as credential material and delete after use');
+  }
   try {
     // Full-chain trace mode: drop the raw bytes into this request's trace dir
     // under the fixed leg name (03=req, 04=res) the manifest expects, so the
@@ -1295,6 +1305,10 @@ function postConnectUnary(host, path, framed, sessionToken, signal, timeoutMs) {
           const flags = body[0];
           const len = body.readUInt32BE(1);
           if (flags & 0x02) return done(null);
+          // subarray CLAMPS an over-long declared length; refuse explicitly
+          // like the streaming path does instead of feeding a truncated
+          // payload to the decoder (S4-D8).
+          if (5 + len > body.length) return done(null);
           const payload = body.subarray(5, 5 + len);
           done((flags & 0x01) ? tryGunzip(payload) : payload);
         });
@@ -2488,7 +2502,7 @@ export function decodeFrame(payload, opts = {}) {
     // completion_tokens only rides the final metadata frame; treat the pair as
     // usage only when the completion count is present.
     if (completion) {
-      usage = { prompt: prompt ? prompt.value : 0, completion: completion.value };
+      usage = { prompt: prompt?.value, completion: completion.value };
     }
     // Billing/usage passthrough: opt-in, only when an operator has pinned the
     // tags. Each is a varint; absent fields (free tier / un-billed / un-cached)
@@ -2511,7 +2525,7 @@ export function decodeFrame(payload, opts = {}) {
         const value = readNumericProtoField(mf, tag);
         if (value == null) continue;
         if (key === 'cache_read_tokens' || key === 'cache_write_tokens') {
-          (usage ||= { prompt: prompt ? prompt.value : 0, completion: completion ? completion.value : 0 })[key] = value;
+          (usage ||= { prompt: prompt?.value, completion: completion?.value })[key] = value;
         } else {
           (billing ||= {})[key] = value;
         }
@@ -2546,8 +2560,8 @@ export function decodeFrame(payload, opts = {}) {
         // prompt_tokens_details.cached_tokens out of usage and silently zero the
         // dashboard's cache split — the exact mis-attribution #220 was about.
         // prompt/completion live inside the `if (meta)` block above, so recompute
-        // the usage defaults here rather than reference block-scoped locals.
-        (usage ||= { prompt: Number(getField(fields, 2, 0)?.value ?? 0), completion: Number(getField(fields, 3, 0)?.value ?? 0) })[key] = value;
+        // their presence here rather than reference block-scoped locals.
+        (usage ||= { prompt: getField(fields, 2, 0)?.value, completion: getField(fields, 3, 0)?.value })[key] = value;
       } else {
         (billing ||= {})[key] = value;
       }
@@ -2654,20 +2668,7 @@ export function decodeFrame(payload, opts = {}) {
  * can't cool an account down for days.
  */
 export function parseResetDuration(text) {
-  const m = /resets? in[:\s]+((?:\d+h)?(?:\d+m)?(?:\d+(?:\.\d+)?s)?)/i.exec(String(text || ''));
-  if (!m || !m[1]) return null;
-  const dur = m[1];
-  const h = /(\d+)h/.exec(dur);
-  const min = /(\d+)m(?!s)/.exec(dur); // m not followed by s (avoid matching "ms")
-  const s = /(\d+(?:\.\d+)?)s/.exec(dur);
-  if (!h && !min && !s) return null;
-  let ms = 0;
-  if (h) ms += Number(h[1]) * 3600_000;
-  if (min) ms += Number(min[1]) * 60_000;
-  if (s) ms += Number(s[1]) * 1000;
-  if (ms <= 0) return null;
-  // Ceiling at 6h — the observed window is 3h; guard against a garbage value.
-  return Math.min(ms, 6 * 3600_000);
+  return parseGoResetMs(text);
 }
 
 // gRPC 4xx-class statuses that mean "the REQUEST itself is invalid" — the
@@ -2810,7 +2811,10 @@ export function classifyUpstreamError(text, code = null, status = null) {
       || /(credit|quota|balance|allowance|usage)[\s\w-]{0,40}?(exceeded|exhausted|depleted|used up)/i.test(lc)
       || /on.?demand[^.]{0,60}(exhausted|exceeded|depleted|out of|insufficient)/i.test(lc)
       || /run(?:ning)? out of (credit|quota|balance|funds|usage)/i.test(lc)) {
-    return { code: 'QUOTA_EXHAUSTED', message: body || 'DEVIN_CONNECT: account out of credit/quota' };
+    const periods = [...lc.matchAll(/\b(daily|weekly)\s+(?:usage\s+)?quota\s+(?:has\s+been\s+|is\s+)?exhausted\b/g)].map(match => match[1]);
+    const quotaPeriod = periods.includes('weekly') ? 'weekly' : periods[0];
+    return { code: 'QUOTA_EXHAUSTED', message: body || 'DEVIN_CONNECT: account out of credit/quota',
+      ...(quotaPeriod ? { quotaPeriod } : {}) };
   }
   // ── MODEL-LEVEL rejection scoped to (ACCOUNT, SELECTOR) ──────────────────
   // Measured body: "This model is no longer available for your account",
@@ -2994,7 +2998,7 @@ const _unknownStopReasonsLogged = new Set();
 function noteUnknownStopReason(n) {
   if (_unknownStopReasonsLogged.has(n) || _unknownStopReasonsLogged.size >= MAX_UNKNOWN_STOP_REASON_LOGS) return;
   _unknownStopReasonsLogged.add(n);
-  log.warn(`devin-connect: unknown StopReason ${String(n)}; reporting finish_reason 'stop'`);
+  log.warn(`devin-connect: unknown StopReason ${String(n)}`);
 }
 
 let _stopReasonMapCache = null;
@@ -3067,7 +3071,7 @@ export function normalizeConnectUsage(lastUsage) {
   // a no-op here — the OpenAI identity already holds (asserted in
   // test/strict-usage-total.test.js so a future re-split has to revisit it).
   const promptTokens = fresh + cacheRead + cacheWrite;
-  return {
+  const normalized = {
     prompt_tokens: promptTokens,
     completion_tokens: completion,
     total_tokens: promptTokens + completion,
@@ -3077,6 +3081,15 @@ export function normalizeConnectUsage(lastUsage) {
       ? { cache_creation_input_tokens: cacheWrite }
       : {}),
   };
+  if (!Number.isSafeInteger(lastUsage.cache_read_tokens) || lastUsage.cache_read_tokens < 0) {
+    Object.defineProperty(normalized, CACHE_READ_UNREPORTED, { value: true });
+  }
+  return markReportedUsage(normalized, {
+    fresh_input_tokens: lastUsage.prompt,
+    output_tokens: lastUsage.completion,
+    cache_read_input_tokens: lastUsage.cache_read_tokens,
+    cache_creation_input_tokens: lastUsage.cache_write_tokens,
+  });
 }
 
 export function mapFinishReason(finish, env = process.env) {
@@ -3153,15 +3166,20 @@ export function applyOutputCap(finishReason, usage, maxTokens) {
  * @param {number|null} maxTokens     output cap the caller requested, if any
  */
 export function resolveFinishReason(finish, usage, maxTokens, env = process.env) {
-  const mapped = mapFinishReason(finish, env);
+  const { map, overrides } = stopReasonMapAndOverrides(env);
+  const key = typeof finish === 'bigint' ? Number(finish) : finish;
+  // An unrecognized reason does not prove successful turn completion.
+  if (finish != null && !Object.hasOwn(map, key)) {
+    noteUnknownStopReason(key);
+    return 'error';
+  }
+  const mapped = finish == null ? null : map[key];
   // A calibrated override for THIS value takes precedence over the inference.
   //
   // It must consult the keys the operator actually PINNED, not the built-in table:
   // the defaults already cover 0..6, so an `Object.hasOwn(map, n)` test made any
   // single unrelated override (e.g. "7=length") read as "value 2 is calibrated" and
   // silently disabled the usage-based truncation inference for every real turn.
-  const { overrides } = stopReasonMapAndOverrides(env);
-  const key = typeof finish === 'bigint' ? Number(finish) : finish;
   if (finish != null && overrides.has(key)) return mapped;
   return applyOutputCap(mapped, usage, maxTokens);
 }
@@ -3193,6 +3211,7 @@ export async function* streamChat({
   messages, model, sessionId, completion, tools,
   token, signal, timeoutMs, deadlineMs, host, env = process.env, nativeToolCall = false, traceId = null,
   deviceSeed, sessionModelConfig, continuityTrail, toolChoice, parallelToolCalls,
+  onTransportObservation,
 } = {}) {
   if (signal?.aborted) {
     const err = new Error('The operation was aborted');
@@ -3323,9 +3342,28 @@ export async function* streamChat({
   // answer was reported as a finished turn — on /v1/responses closing the turn as
   // `response.completed` and entering the response store as the next turn's context.
   let sawEndOfStream = false;
+  // Did ANY frame carry the terminal stopReason (#5)? The end-of-stream frame
+  // proves the RPC completed; it says nothing about whether the TURN completed.
+  // Live evidence (Q1 audit §3 S01, docs/upstream-protocol.md:106): every provider
+  // observed so far (STOP_PATTERN / MIN_LOG_PROB / UNSPECIFIED) reports a value on
+  // a clean finish, and "clean EOF with no stopReason IS truncation, not a normal
+  // end" — their decoder raises a stream error instead of synthesizing end_turn.
+  // Without this flag the two shapes were indistinguishable: lastFinish stayed
+  // null, and null defaults to 'stop' at every consumer, so a truncated turn was
+  // reported as a completed one.
+  let sawStopReason = false;
+  // Was any answer payload delivered? A stream that ends with nothing on it and no
+  // stopReason is the EMPTY-turn shape (the adapter's empty/rescue retry owns it),
+  // not a truncated answer — it must keep its null reason so that machinery is
+  // untouched.
+  let sawPayload = false;
   let lastFinish = null;
   let lastUsage = null;
   let lastBilling = null;
+  let transportAbortObserved = false;
+  const timing = onTransportObservation
+    ? { sentAt: null, firstContentAt: null, firstToolAt: null, terminalAt: null }
+    : null;
   let lastActualModel = null;
   let lastSignature = null;
   const nativeToolCalls = [];
@@ -3382,6 +3420,7 @@ export async function* streamChat({
         streamError = Object.assign(new Error(classified.message), {
           code: classified.code,
           status: res.statusCode,
+          ...(classified.quotaPeriod ? { quotaPeriod: classified.quotaPeriod } : {}),
           ...(classified.resetMs != null ? { resetMs: classified.resetMs } : {}),
         });
         done = true;
@@ -3455,6 +3494,7 @@ export async function* streamChat({
       for (const frame of frames) {
         if (queueOverflowed) break;
         if (frame.isEndStream) {
+          if (timing) timing.terminalAt ??= performance.now();
           sawEndOfStream = true;
           // Trailer is JSON: {} on success, {"error":{...}} on failure.
           const text = frame.payload.toString('utf8').trim();
@@ -3473,6 +3513,7 @@ export async function* streamChat({
                 streamError = Object.assign(new Error(classified.message), {
                   code: classified.code,
                   upstream: parsed.error,
+                  ...(classified.quotaPeriod ? { quotaPeriod: classified.quotaPeriod } : {}),
                   ...(classified.resetMs != null ? { resetMs: classified.resetMs } : {}),
                 });
               }
@@ -3487,6 +3528,10 @@ export async function* streamChat({
         // wire-01: decode across frame boundaries so split multi-byte chars survive.
         const content = contentBytes ? contentDecoder.write(contentBytes) : '';
         const reasoning = reasoningBytes ? reasoningDecoder.write(reasoningBytes) : '';
+        if (timing && timing.firstContentAt === null && content.trim()) timing.firstContentAt = performance.now();
+        if (timing && timing.firstToolAt === null && toolCalls?.some(call => call.id || call.arguments || call.invalidJson)) {
+          timing.firstToolAt = performance.now();
+        }
         // Calibration (DEBUG-gated, default OFF): emit the raw frame payload hex
         // so a probe can re-decode it WIDE — the production frameDump/metaDump
         // only collect wireType 0/2 and miss wt1(double)/wt5(float), which is
@@ -3526,10 +3571,14 @@ export async function* streamChat({
         }
         if (reasoning) { pushEvent({ type: 'reasoning', text: reasoning }); }
         if (content) { pushEvent({ type: 'content', text: content }); }
-        if (finish != null) lastFinish = finish;
+        if (finish != null) { lastFinish = finish; sawStopReason = true; }
+        if (content || reasoning || signature) sawPayload = true;
         if (usage) lastUsage = usage;
         if (billing) lastBilling = { ...lastBilling, ...billing };
-        if (toolCalls) { for (const tc of toolCalls) mergeToolCallFragment(nativeToolCalls, tc); }
+        if (toolCalls) {
+          for (const tc of toolCalls) mergeToolCallFragment(nativeToolCalls, tc);
+          sawPayload = true;
+        }
         if (reasoning || content || frameDump || metaDump || signature) pump();
       }
     });
@@ -3537,7 +3586,13 @@ export async function* streamChat({
     res.on('error', (err) => { streamError = err; done = true; pump(); });
   });
 
+  // ClientRequest finish records the handoff of the request body to the local
+  // transport. Only decoded wire fields below can record the first payload.
+  if (timing) req.on('finish', () => { timing.sentAt ??= performance.now(); });
   req.on('error', (err) => {
+    if (signal?.aborted && (err?.name === 'AbortError' || err?.code === 'ABORT_ERR')) {
+      transportAbortObserved = true;
+    }
     if (!streamError) streamError = err;
     done = true;
     pump();
@@ -3593,8 +3648,8 @@ export async function* streamChat({
         // the invariant that all received bytes are emitted.
         const tailContent = contentDecoder.end();
         const tailReasoning = reasoningDecoder.end();
-        if (tailReasoning) yield { type: 'reasoning', text: tailReasoning };
-        if (tailContent) yield { type: 'content', text: tailContent };
+        if (tailReasoning) { sawPayload = true; yield { type: 'reasoning', text: tailReasoning }; }
+        if (tailContent) { sawPayload = true; yield { type: 'content', text: tailContent }; }
         // The socket ended without the mandatory end-of-stream frame: the answer is
         // TRUNCATED, not finished. Throwing here (rather than yielding a finish
         // event) is what keeps a partial answer out of every "completed turn"
@@ -3612,6 +3667,24 @@ export async function* streamChat({
         // One terminal event carrying finish_reason + usage for the caller to
         // close out an OpenAI-shaped response.
         const finishUsage = normalizeConnectUsage(lastUsage);
+        // G3 (Q1 audit §7): an end-of-stream frame with an ANSWER on it but NO
+        // stopReason is a truncated turn, not a finished one (S01
+        // docs/upstream-protocol.md:106: "缺 stopReason 的干净 EOF = 截断不是正常结束",
+        // measured on a real incident where a coding agent marked the task complete
+        // on a half answer). `lastFinish === null` therefore cannot be allowed to
+        // reach a consumer as "no reason yet", because every consumer defaults a
+        // null reason to 'stop' (devin-connect-openai.js: `if (ev.reason)`).
+        //
+        // Reported as the finish_reason 'error' — the vocabulary entry the enum's
+        // own ERROR value (13) already uses — instead of throwing: the bytes are
+        // already on the client's wire by this point, and the missing end-of-stream
+        // frame above is the case that genuinely cannot be trusted at all. A stream
+        // that delivered NOTHING and named no reason keeps its null reason: that is
+        // the empty-turn shape the adapter's empty/rescue retry exists for.
+        const unterminated = !sawStopReason && sawPayload;
+        const terminalReason = unterminated
+          ? 'error'
+          : resolveFinishReason(lastFinish, finishUsage, completion?.maxTokens ?? WIRE_DEFAULT_MAX_TOKENS, env);
         yield {
           type: 'finish',
           // Truncation is inferred from completion_tokens hitting the cap that was
@@ -3622,7 +3695,11 @@ export async function* streamChat({
           // no cap, so reading the caller's (absent) value here would leave every
           // defaulted call's truncation undetectable — the stream would stop at the
           // wire cap and still report a clean 'stop'.
-          reason: resolveFinishReason(lastFinish, finishUsage, completion?.maxTokens ?? WIRE_DEFAULT_MAX_TOKENS, env),
+          reason: terminalReason,
+          // Additive, and only for the shape above: a consumer that wants to tell
+          // "the model errored" from "the upstream never said how the turn ended"
+          // does not have to infer it from a missing enum.
+          ...(unterminated ? { unterminated: true } : {}),
           // Normalized at the birth point, so all four protocol routes read one
           // object: prompt_tokens is the FULL input (fresh + cache_read +
           // cache_write), cached_tokens is its SUBSET detail, and total_tokens is
@@ -3674,6 +3751,17 @@ export async function* streamChat({
     // request or leaks. The idle timer is cleared by req.destroy below.
     clearTimeout(deadlineTimer);
     if (!req.destroyed) req.destroy();
+    // This records what the gateway received before closing the HTTP stream.
+    // The local transport's abort event carries no provider cancel receipt.
+    onTransportObservation?.({
+      transportAbortObserved,
+      upstreamTerminal: sawEndOfStream ? 'end_frame' : sawStopReason ? 'finish_marker' : 'not_observed',
+      upstreamUsageReported: lastUsage != null,
+      upstreamBillingReported: lastBilling != null ? true : null,
+      usage: normalizeConnectUsage(lastUsage),
+      billing: lastBilling,
+      timing,
+    });
   }
 }
 
