@@ -3949,7 +3949,7 @@ export function acquireAccountByKey(apiKey, modelKey = null, connectSelector = n
   if (!a) return null;
   if (a.status !== 'active') return null;
   if (isAccountInMaintenance(a)) return null;
-  if (isRateLimitedForModel(a, modelKey, now)) return null;
+  if (isRateLimitedForModel(a, modelKey, now, { skipQuota: isQuotaFreeSelectorForAccount(a, connectSelector) })) return null;
   const limit = rpmLimitFor(a);
   if (limit <= 0) return null;
   const used = pruneRpmHistory(a, now);
@@ -4324,7 +4324,7 @@ function isLastUsableAccount(account, now = Date.now(), selector = null) {
   for (const a of accounts) {
     if (a === account) continue;
     if (a.status !== 'active') continue;
-    if (isRateLimitedForModel(a, null, now)) continue;
+    if (isRateLimitedForModel(a, null, now, { skipQuota: isQuotaFreeSelectorForAccount(a, selector) })) continue;
     // Selector scope: a peer that cannot serve the selector in question is not a
     // fallback for it (see the SELECTOR-AWARE note above). `selector == null`
     // keeps every existing caller's account-wide meaning byte-identical.
@@ -4594,10 +4594,25 @@ function maybeRecoverErrorAccount(account, now) {
  * for RATE_LIMITED. Checking both keys makes a selector-scoped cooldown actually
  * gate connect selection while keeping the account healthy for every other model.
  */
+// A quota cooldown (account.quotaResetAt) guards the weekly quota bucket. A
+// selector that costs nothing on THIS account — the hardcoded DROUGHT_SAFE
+// class (paid-plan selectors verified quota-free upstream) or the live
+// per-account pricing arms inside isConnectSelectorFreeForAccount (rate-table
+// zero / cost-tier FREE / creditMultiplier 0) — never spends the bucket the
+// cooldown exists to protect, so a dry-well account must still serve it.
+// Shared by the admission predicate, the pinned re-acquire, and the
+// all-limited views so they cannot drift apart on this exemption.
+function isQuotaFreeSelectorForAccount(account, connectSelector) {
+  if (!account || !connectSelector) return false;
+  return DROUGHT_SAFE_SELECTORS.has(connectSelector)
+    || isConnectSelectorFreeForAccount(account, connectSelector);
+}
+
 function isCooledForRequest(account, modelKey, connectSelector, now) {
-  if (isRateLimitedForModel(account, modelKey, now)) return true;
+  const skipQuota = isQuotaFreeSelectorForAccount(account, connectSelector);
+  if (isRateLimitedForModel(account, modelKey, now, { skipQuota })) return true;
   if (connectSelector && connectSelector !== modelKey
-      && isRateLimitedForModel(account, connectSelector, now)) return true;
+      && isRateLimitedForModel(account, connectSelector, now, { skipQuota })) return true;
   // Selector-scoped upstream verdict ("no longer available for your account"):
   // not a throttle, but for THIS selector the account is just as unusable, so
   // selection must skip it exactly like a cooled one while keeping it fully
@@ -4611,7 +4626,8 @@ function isCooledForRequest(account, modelKey, connectSelector, now) {
 // this peer serve the selector?" must not mutate the peer.
 function isCooledForRequestReadOnly(account, modelKey, connectSelector, now) {
   if ((account.rateLimitedUntil || 0) > now) return true;
-  if ((account.quotaResetAt || 0) > now) return true;
+  if (!isQuotaFreeSelectorForAccount(account, connectSelector)
+      && (account.quotaResetAt || 0) > now) return true;
   if (modelKey && (account._modelRateLimits?.[modelKey] || 0) > now) return true;
   if (connectSelector && connectSelector !== modelKey
       && (account._modelRateLimits?.[connectSelector] || 0) > now) return true;
@@ -4619,15 +4635,17 @@ function isCooledForRequestReadOnly(account, modelKey, connectSelector, now) {
   return false;
 }
 
-function isRateLimitedForModel(account, modelKey, now) {
+function isRateLimitedForModel(account, modelKey, now, { skipQuota = false } = {}) {
   // Global rate limit (transient dimension — short cooldowns)
   if (account.rateLimitedUntil && account.rateLimitedUntil > now) return true;
   // RB2/B6: quota dimension — a long, self-healing cooldown kept SEPARATE from
   // the transient rateLimitedUntil so the two never clobber one another. It
   // expires on its own and is cleared early when a refresh sees the balance
   // recover (applyQuotaSnapshot). Account-wide (quota refills per billing
-  // cycle, not per model), so it applies regardless of modelKey.
-  if (account.quotaResetAt && account.quotaResetAt > now) return true;
+  // cycle, not per model), so it applies regardless of modelKey. The caller
+  // passes skipQuota for a request the cooldown provably cannot gate: a
+  // selector that is free on THIS account (see isQuotaFreeSelectorForAccount).
+  if (!skipQuota && account.quotaResetAt && account.quotaResetAt > now) return true;
   // Per-model rate limit
   if (modelKey && account._modelRateLimits) {
     const until = account._modelRateLimits[modelKey];
@@ -5159,8 +5177,12 @@ export function isAllRateLimited(modelKey, connectSelector = null) {
     if (modelKey && !isModelAllowedForAccount(a, modelKey)) continue;
     if (connectSelector && !isConnectSelectorAllowedForAccount(a, connectSelector)) continue;
     anyEligible = true;
-    const cooled = isRateLimitedForModel(a, modelKey, now)
-      || (selectorKey ? isRateLimitedForModel(a, selectorKey, now) : false);
+    // A quota-cooled account is not "limited" for a selector that is free on
+    // it — the admission predicate would hand it this request right now, so
+    // the preflight must not 429 the pool (see isQuotaFreeSelectorForAccount).
+    const skipQuota = selectorKey ? isQuotaFreeSelectorForAccount(a, selectorKey) : false;
+    const cooled = isRateLimitedForModel(a, modelKey, now, { skipQuota })
+      || (selectorKey ? isRateLimitedForModel(a, selectorKey, now, { skipQuota }) : false);
     if (!cooled) return { allLimited: false };
     // Track the soonest expiry across both global and per-model limits
     if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
@@ -5212,8 +5234,11 @@ export function isAllTemporarilyUnavailable(modelKey, connectSelector = null) {
 
     // RB2/B2: a quota-cooled account is also unavailable for selection (getApiKey
     // filters it via isRateLimitedForModel) — treat it as such here too, else
-    // this would falsely report the account as available.
-    if (a.quotaResetAt && a.quotaResetAt > now) {
+    // this would falsely report the account as available. Except when the
+    // requested selector is free ON this account: selection would serve it, so
+    // the preflight must not call the account unavailable for that request.
+    if (a.quotaResetAt && a.quotaResetAt > now
+        && !(selectorKey && isQuotaFreeSelectorForAccount(a, selectorKey))) {
       soonestExpiry = Math.min(soonestExpiry, a.quotaResetAt);
       continue;
     }

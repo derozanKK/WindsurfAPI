@@ -48,7 +48,7 @@ const { __setStreamChatForTest } = await import('../src/devin-connect-openai.js'
 const sticky = await import('../src/account/sticky-session.js');
 
 const ids = [];
-const selector = 'swe-2-medium';
+const selector = 'gpt-5-5-low';
 const end = new Date(Date.now() + 86_400_000).toISOString();
 const config = (free) => ({
   modelUid: selector,
@@ -280,7 +280,7 @@ describe('connect drought free-only admission stays on the free account', () => 
     seed('nodata-A');
     seed('nodata-B');
     // Deliberately NO priceSnapshot: no account says this selector is free. The
-    // static FREE_REACHABLE floor must not be widened to swe-2-medium.
+    // static FREE_REACHABLE floor must not be widened to gpt-5-5-low.
     await __waitForModelCatalogSync();
 
     const adapter = recordingAdapter();

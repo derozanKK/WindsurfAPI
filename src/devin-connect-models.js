@@ -252,6 +252,13 @@ export const DROUGHT_SAFE_SELECTORS = new Set([
   'swe-1-7',
   'swe-1-7-medium',
   'glm-5-2',
+  // Max-plan probe (operator report 2026-11): the swe-2 family keeps serving on
+  // weeklyPercent=0 — SWE models are bundled into Max quota-free, same "does not
+  // debit the weekly bucket" class as the Pro-verified entries above. Canonical
+  // selectors only; `swe-2` and the dashed aliases resolve to these first.
+  'swe-2-medium',
+  'swe-2-high',
+  'swe-2-max',
 ]);
 
 // ── Live catalog (audit 2026-07-12: snapshot staleness fix) ──────────────
